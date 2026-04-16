@@ -88,7 +88,7 @@ fn generate_hierarchy(base_name: &str, frames_str: &str) {
         let child_name = format!("{}_{}", base_name, frame.name);
         info!("Aspiral creating child view '{}' from parent '{}'", child_name, current_parent);
         
-        let sql = rollup::derive_child_sql(&current_parent, frame.seconds);
+        let sql = rollup::derive_child_sql(&child_name, &current_parent, frame.seconds);
         
         match Spi::run(&sql) {
             Ok(_) => {

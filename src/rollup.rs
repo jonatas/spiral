@@ -35,7 +35,7 @@ pub fn expand_avg_in_sql(sql: &str) -> String {
     re.replace_all(sql, "sum($1) as $1_sum, count($1) as $1_count").to_string()
 }
 
-pub fn derive_child_sql(parent_name: &str, frame_seconds: i32) -> String {
+pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32) -> String {
     Spi::connect(|client| {
         let query = format!(
             "SELECT column_name FROM information_schema.columns WHERE table_name = '{}' AND table_schema NOT IN ('information_schema', 'pg_catalog')",
@@ -65,11 +65,12 @@ pub fn derive_child_sql(parent_name: &str, frame_seconds: i32) -> String {
         }
         
         let sql = format!(
-            "CREATE MATERIALIZED VIEW {parent_name}_{frame_seconds}s AS 
+            "CREATE MATERIALIZED VIEW {child_name} AS 
              SELECT (t / {frame_seconds}) * {frame_seconds} as t, {agg_cols} 
              FROM {parent_name}
              WHERE t < ((aspiral_now()::{aspiral_type} / {frame_seconds}) * {frame_seconds})
              GROUP BY 1",
+            child_name = child_name,
             agg_cols = agg_cols.join(", "), 
             parent_name = parent_name,
             frame_seconds = frame_seconds,
