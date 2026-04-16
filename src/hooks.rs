@@ -88,22 +88,8 @@ fn generate_hierarchy(base_name: &str, frames_str: &str) {
         let child_name = format!("{}_{}", base_name, frame.name);
         info!("Aspiral creating child view '{}' from parent '{}'", child_name, current_parent);
         
-        // In a real implementation, we would derive the SQL from the base view.
-        // For the POC, we'll use a template SQL.
-        let sql = format!(
-            "CREATE MATERIALIZED VIEW {} AS 
-             SELECT (t / {}) * {} as t, 
-                    sum(price_sum) as price_sum, 
-                    sum(price_count) as price_count,
-                    max(price_max) as price_max
-             FROM {}
-             GROUP BY 1",
-            child_name, frame.seconds, frame.seconds, current_parent
-        );
+        let sql = rollup::derive_child_sql(&current_parent, frame.seconds);
         
-        // We use Spi to create the child view
-        // Wait, creating matviews inside a hook might be risky if we are already in a transaction.
-        // But for POC, we'll try it.
         match Spi::run(&sql) {
             Ok(_) => {
                 catalog::insert_metadata(&child_name, &current_parent, frame.seconds, base_name);

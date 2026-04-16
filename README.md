@@ -2,61 +2,54 @@
 
 **Aspiral** is a PostgreSQL extension built with `pgrx` designed for massive-scale time-series data. It reimagines time as an evolving spiral starting from a fixed "point zero," optimizing for memory footprint and hierarchical statistical rollups.
 
-## The Core Concept: Aspiraling Time
-
-Time is traditionally handled as a complex `timestamptz` structure. **Aspiral** simplifies this by establishing a **Kickoff Date** (system day zero) and a **Pace** (minimal moment, e.g., 1 second).
-
-- **Integer-Based Representation**: Every moment is stored as a highly efficient integer offset from the kickoff date. This provides a "short number" that represents the exact position in the temporal spiral.
-- **Large Scale, Low Memory**: By using integer offsets (32-bit or 64-bit), we drastically reduce the index size and memory footprint compared to standard timestamps.
-- **Triangulation**: The constant pace allows for instantaneous calculation of time differences and "triangulation" of events across different time scales using simple arithmetic.
-- **Folding/Unfolding Statistics**: Time series are naturally hierarchical. Aspiral allows you to "fold" detailed second-level data into larger frames (minutes, hours, days) and "unfold" them back for deep analysis.
-
-## Technical Architecture
+## Features Implemented
 
 ### 1. The `aspiral` Custom Type
-Built with `pgrx`, the `aspiral` type maps standard PostgreSQL `timestamptz` to an optimized internal integer offset. 
-- **Automatic Conversion**: Seamlessly cast from `timestamptz` while respecting time zones.
-- **Efficient Indexing**: Native B-tree support for fast range scans on day-zero-based offsets.
+- **Memory Efficient**: Uses a 64-bit integer (`i64`) to store offsets from a kickoff date.
+- **GUC-Controlled Kickoff**: Configure the "Day Zero" via `aspiral.kickoff_date`.
+- **High Resolution**: Default pace is second-level precision.
 
-### 2. Native DDL Hooking
-Aspiral uses PostgreSQL's `ProcessUtility_hook` to intercept `CREATE MATERIALIZED VIEW` commands. This allows for a native SQL experience with custom extension parameters.
+### 2. Hierarchical Rollup Engine
+- **Automated View Creation**: Using `WITH (aspiral.frames = '1m,5m,1h')` automatically generates a chain of materialized views.
+- **Efficient Chaining**: Each view sources data from its immediate parent (e.g., `15m` views source from `5m` views), minimizing raw table scans.
+- **Mathematical Precision**: Special handling for averages. `avg(x)` is expanded into `sum(x)` and `count(x)` pairs to ensure precision during hierarchical aggregation.
+
+### 3. Metadata Catalog
+- **Tracking**: Internal `aspiral.metadata` table tracks the parent-child relationships and frame sizes.
+- **Schema Isolation**: All metadata resides in the `aspiral` schema.
+
+### 4. Reactive Refresh Sync
+- **Cascading Updates**: Refreshing a base view automatically triggers a sequential, ordered refresh of the entire dependent hierarchy.
+
+## How It Works (OHLCV Example)
 
 ```sql
-create table stocks (t timestamptz, price decimal, volume integer);
+SET aspiral.kickoff_date = '2026-04-15';
 
--- The hook intercepts this DDL and automatically expands it
-create materialized view ohlcv AS
-select 
-  aspiral(t) as t,
-  first(price) as o, 
-  max(price) as h, 
-  min(price) as l, 
-  last(price) as c,
-  sum(volume) as volume
-from stocks
-group by 1 
-order by 1
-with (
-  aspiral.frames = '1m,15m,1h,1d,1w',
-  aspiral.rollup_rules = 'max, min, last'
-);
+CREATE TABLE stock_ticks (t timestamptz, price decimal, volume int);
+
+-- Create base 1m view
+-- Aspiral will automatically expand this to include child views for 5m and 15m
+CREATE MATERIALIZED VIEW ohlcv_1m AS 
+SELECT 
+    (aspiral(t)/60)*60 as t, 
+    sum(price) as price_sum, 
+    count(price) as price_count, 
+    max(price) as price_max,
+    min(price) as price_min
+FROM stock_ticks 
+GROUP BY 1
+WITH (aspiral.frames = '5m,15m');
+
+-- Cascading refresh
+REFRESH MATERIALIZED VIEW ohlcv_1m;
+-- LOG: Aspiral cascading refresh to 'ohlcv_1m_5m'
+-- LOG: Aspiral cascading refresh to 'ohlcv_1m_15m'
 ```
 
-### 3. Hierarchical Rollup Engine
-When a view is created with `aspiral.frames`, the extension automatically:
-1. Creates the base materialized view (e.g., `ohlcv` at the default second pace).
-2. Generates dependent views for each frame: `ohlcv_1m`, `ohlcv_15m`, etc.
-3. **Smart Rollups**: Each subsequent view (e.g., `1h`) is computed from the nearest smaller frame (e.g., `15m`), minimizing the need to scan the raw `stocks` table.
+## Upcoming Scenarios
 
-## Configuration
-
-- `aspiral.kickoff_date`: The static date set as the center of the spiral (Default: current date of extension initialization).
-- `aspiral.default_pace`: The minimal moment resolution (Default: `1s`).
-
-## Roadmap
-
-1. [x] Deep research into `pgrx` custom types and structures.
-2. [x] Architectural design for DDL hooking and hierarchical rollups.
-3. [ ] Scaffold `pgrx` extension and implement `aspiral` integer-offset type.
-4. [ ] Implement `ProcessUtility_hook` for `CREATE MATERIALIZED VIEW` interception.
-5. [ ] Build the hierarchical view generation logic.
+- [ ] **OHLCV Candlesticks**: Implementation of `first()` and `last()` aggregates for Open/Close.
+- [ ] **Histograms**: Utilities for bucketed distribution analysis over time.
+- [ ] **Closed Frame Triggers**: Logic to only process "finalized" time buckets.
+- [ ] **SQL Parser**: Dynamic derivation of child SQL based on parent view column definitions.

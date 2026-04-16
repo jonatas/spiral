@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 use pgrx::guc::{GucRegistry, GucSetting, GucContext, GucFlags};
+use pgrx::datum::DatumWithOid;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::ffi::CStr;
@@ -57,42 +58,101 @@ fn to_timestamptz(a: Aspiral) -> TimestampWithTimeZone {
     unsafe { TimestampWithTimeZone::from_datum(pg_sys::Datum::from(micros_since_pg_epoch), false).unwrap() }
 }
 
+#[pg_extern(immutable, parallel_safe)]
+fn first_sfunc(state: Option<f64>, next: Option<f64>) -> Option<f64> {
+    state.or(next)
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn last_sfunc(_state: Option<f64>, next: Option<f64>) -> Option<f64> {
+    next
+}
+
+extension_sql!(
+    r#"
+    CREATE AGGREGATE first(f64) (
+        sfunc = first_sfunc,
+        stype = f64
+    );
+    CREATE AGGREGATE last(f64) (
+        sfunc = last_sfunc,
+        stype = f64
+    );
+    "#,
+    name = "create_first_last_aggregates",
+    requires = ["first_sfunc", "last_sfunc"]
+);
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_histogram(data: Vec<f64>, min: f64, max: f64, buckets: i32) -> pgrx::JsonB {
+    let mut counts = vec![0i64; buckets as usize];
+    let range = max - min;
+    if range <= 0.0 {
+        return pgrx::JsonB(serde_json::to_value(counts).unwrap());
+    }
+
+    for val in data {
+        if val >= min && val <= max {
+            let mut bucket = ((val - min) / range * buckets as f64) as usize;
+            if bucket >= buckets as usize {
+                bucket = buckets as usize - 1;
+            }
+            counts[bucket] += 1;
+        }
+    }
+    pgrx::JsonB(serde_json::to_value(counts).unwrap())
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
-    use pgrx::datum::DatumWithOid;
 
     #[pg_test]
-    fn test_aspiral_hierarchical_avg_precision() {
-        Spi::run("CREATE TABLE stock_ticks (t timestamptz, price decimal);").expect("Table failed");
+    fn test_aspiral_ohlcv_and_histograms() {
+        Spi::run("CREATE TABLE trades (t timestamptz, price f64, volume int);").expect("Table failed");
         
-        Spi::run("CREATE MATERIALIZED VIEW ohlcv_1m AS 
+        Spi::run("CREATE MATERIALIZED VIEW candles_1m AS 
                   SELECT (aspiral(t)/60)*60 as t, 
-                         sum(price) as price_sum, 
-                         count(price) as price_count, 
-                         max(price) as price_max
-                  FROM stock_ticks GROUP BY 1
-                  WITH (aspiral.frames='5m,15m');").expect("Base view failed");
+                         first(price) as o, 
+                         max(price) as h, 
+                         min(price) as l, 
+                         last(price) as c,
+                         sum(volume) as volume
+                  FROM trades GROUP BY 1
+                  WITH (aspiral.frames='5m,15m');").expect("Candles base view failed");
 
-        Spi::run("INSERT INTO stock_ticks VALUES ('2026-04-15 00:00:10Z', 100.0), ('2026-04-15 00:00:40Z', 110.0);").expect("Insert min 0");
-        Spi::run("INSERT INTO stock_ticks VALUES ('2026-04-15 00:01:20Z', 120.0);").expect("Insert min 1");
+        Spi::run("INSERT INTO trades VALUES 
+                  ('2026-04-15 00:00:10Z', 100.0, 10), 
+                  ('2026-04-15 00:00:30Z', 105.0, 5),
+                  ('2026-04-15 00:01:10Z', 102.0, 8),
+                  ('2026-04-15 00:01:50Z', 110.0, 12);").expect("Insert trades failed");
         
-        info!("--- Refreshing ohlcv_1m ---");
-        Spi::run("REFRESH MATERIALIZED VIEW ohlcv_1m;").expect("Refresh failed");
-        
+        Spi::run("REFRESH MATERIALIZED VIEW candles_1m;").expect("Refresh candles failed");
+
         let stats = Spi::connect(|client| {
-            // pgrx 0.17 client.select takes &[DatumWithOid] directly (no Some/Option)
-            let row = client.select("SELECT sum(price_sum), sum(price_count) FROM ohlcv_1m_5m", None, &[]).unwrap().first();
-            let sum = row.get::<f64>(1).unwrap().unwrap();
-            let count = row.get::<i64>(2).unwrap().unwrap();
-            Ok::<(f64, i64), spi::Error>((sum, count))
+            let row = client.select("SELECT o, h, l, c, volume FROM candles_1m_5m", None, &[]).unwrap().first();
+            let o = row.get::<f64>(1).unwrap().unwrap();
+            let h = row.get::<f64>(2).unwrap().unwrap();
+            let l = row.get::<f64>(3).unwrap().unwrap();
+            let c = row.get::<f64>(4).unwrap().unwrap();
+            let v = row.get::<i64>(5).unwrap().unwrap();
+            Ok::<(f64, f64, f64, f64, i64), spi::Error>((o, h, l, c, v))
         }).unwrap();
         
-        info!("Hierarchical Stats (5m): Sum={}, Count={}", stats.0, stats.1);
-        assert_eq!(stats.0, 330.0);
-        assert_eq!(stats.1, 3);
-        assert_eq!(stats.0 / stats.1 as f64, 110.0);
+        info!("5m Candle: O={}, H={}, L={}, C={}, V={}", stats.0, stats.1, stats.2, stats.3, stats.4);
+        assert_eq!(stats.0, 100.0);
+        assert_eq!(stats.1, 110.0);
+        assert_eq!(stats.2, 100.0);
+        assert_eq!(stats.3, 110.0);
+        assert_eq!(stats.4, 35);
+
+        let hist = Spi::connect(|client| {
+            let val = client.select("SELECT aspiral_histogram(ARRAY[1.0, 2.0, 5.0, 8.0, 10.0], 0.0, 10.0, 2)", None, &[]).unwrap().first();
+            let j = val.get::<pgrx::JsonB>(1).unwrap().unwrap();
+            Ok::<pgrx::JsonB, spi::Error>(j)
+        }).unwrap();
+        info!("Histogram: {:?}", hist.0);
     }
 }
 
