@@ -164,6 +164,42 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_aspiral_performance_ingest() {
+        // 1. Setup Table and Hierarchy
+        Spi::run("CREATE TABLE perf_ticks (t timestamptz, price f64, vol int);").expect("Table failed");
+        
+        // Base view (1m) -> 5m -> 15m -> 1h
+        Spi::run("CREATE MATERIALIZED VIEW stocks_ohlcv_1m AS 
+                  SELECT (aspiral(t)/60)*60 as t, 
+                         first(price) as o, max(price) as h, min(price) as l, last(price) as c,
+                         sum(vol) as volume
+                  FROM perf_ticks GROUP BY 1
+                  WITH (aspiral.frames='5m,15m,1h');").expect("Base view failed");
+
+        // 2. Generate 100,000 ticks (approx 27 hours of 1-second data)
+        info!("--- Starting Ingest of 100,000 rows ---");
+        let start_ingest = std::time::Instant::now();
+        Spi::run("INSERT INTO perf_ticks 
+                  SELECT '2026-04-10 00:00:00Z'::timestamptz + (i || ' seconds')::interval,
+                         random() * 100, (random() * 1000)::int
+                  FROM generate_series(1, 100000) s(i);").expect("Ingest failed");
+        let duration_ingest = start_ingest.elapsed();
+        info!("Ingest completed in: {:?}", duration_ingest);
+
+        // 3. Measure Refresh Time (Cascading 1m -> 5m -> 15m -> 1h)
+        info!("--- Starting Hierarchical Refresh (1m -> 5m -> 15m -> 1h) ---");
+        let start_refresh = std::time::Instant::now();
+        Spi::run("REFRESH MATERIALIZED VIEW stocks_ohlcv_1m;").expect("Refresh failed");
+        let duration_refresh = start_refresh.elapsed();
+        info!("Hierarchical Refresh completed in: {:?}", duration_refresh);
+
+        // 4. Verify data in the top-level (1h) view
+        let hours_count = Spi::get_one::<i64>("SELECT count(*) FROM stocks_ohlcv_1h").unwrap().unwrap();
+        info!("Total Hours Processed in 1h view: {}", hours_count);
+        assert!(hours_count > 0, "Should have processed several hours");
+    }
+
+    #[pg_test]
     fn test_aspiral_closed_frame_logic() {
         Spi::run("CREATE TABLE ticks_closed (t timestamptz, price f64);").expect("Table failed");
         
