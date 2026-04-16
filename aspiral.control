@@ -1,0 +1,6 @@
+comment = 'aspiral_tmp:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'aspiral_tmp'
+relocatable = false
+superuser = true
+trusted = false
