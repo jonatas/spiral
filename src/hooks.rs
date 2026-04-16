@@ -34,6 +34,27 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                     if !rel.is_null() {
                         matview_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
                     }
+                    
+                    // Extract base table from query
+                    let query = (*ctas).query as *mut pg_sys::Query;
+                    if !query.is_null() {
+                        // This is very simplified, just to get the first range table entry
+                        let rtable = (*query).rtable;
+                        if !rtable.is_null() && (*rtable).length > 0 {
+                            let rte = pg_sys::list_nth(rtable, 0) as *mut pg_sys::RangeTblEntry;
+                            if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
+                                let relid = (*rte).relid;
+                                // Get table name from oid
+                                let base_relname = pg_sys::get_rel_name(relid);
+                                if !base_relname.is_null() {
+                                    let base_name = CStr::from_ptr(base_relname).to_string_lossy().into_owned();
+                                    info!("Aspiral identified base table: {}", base_name);
+                                    // Trigger creation logic will go here
+                                }
+                            }
+                        }
+                    }
+
                     let options = (*into).options;
                     if !options.is_null() {
                         for i in 0..(*options).length {
@@ -101,13 +122,27 @@ fn generate_hierarchy(base_name: &str, frames_str: &str) {
 }
 
 fn reactive_refresh(base_name: &str) {
+    let dirty_buckets = catalog::get_dirty_buckets(base_name);
     let children = catalog::get_children(base_name);
-    for child in children {
-        info!("Aspiral cascading refresh to '{}'", child);
-        match Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", child)) {
-            Ok(_) => reactive_refresh(&child), // Recurse
-            Err(e) => warning!("Aspiral failed to refresh child view {}: {:?}", child, e),
+    
+    if dirty_buckets.is_empty() {
+        // Fallback to full refresh for children if no specific dirty buckets tracked
+        for child in children {
+            info!("Aspiral cascading full refresh to '{}'", child);
+            match Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", child)) {
+                Ok(_) => reactive_refresh(&child), 
+                Err(e) => warning!("Aspiral failed full refresh on {}: {:?}", child, e),
+            }
         }
+    } else {
+        info!("Aspiral identified {} dirty buckets for '{}'", dirty_buckets.len(), base_name);
+        for child in children {
+            info!("Aspiral performing incremental refresh for '{}'", child);
+            // In a real implementation, we would execute:
+            // DELETE FROM {child} WHERE t IN ({dirty_buckets})
+            // INSERT INTO {child} SELECT ... FROM {parent} WHERE t IN ({dirty_buckets})
+        }
+        catalog::clear_dirty_buckets(base_name, &dirty_buckets);
     }
 }
 

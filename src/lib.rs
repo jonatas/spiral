@@ -66,6 +66,36 @@ fn aspiral_now() -> Aspiral {
     Aspiral(unix_seconds - get_kickoff_epoch())
 }
 
+use pgrx::AllocatedByPostgres;
+
+#[pg_trigger]
+fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<PgHeapTuple<'a, AllocatedByPostgres>>, String> {
+    let base_view_name = trigger.extra_args()
+        .map_err(|e| format!("Failed to get trigger args: {}", e))?
+        .first()
+        .cloned()
+        .ok_or("Missing base_view_name in trigger arguments")?;
+    
+    let process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
+        if let Some(tuple) = row {
+            let t_val: TimestampWithTimeZone = tuple.get_by_name("t")
+                .map_err(|e| format!("Failed to get 't' column: {}", e))?
+                .ok_or("Column 't' is null")?;
+            
+            let a = aspiral(t_val);
+            let bucket_1m = (a.0 / 60) * 60;
+            catalog::mark_bucket_dirty(&base_view_name, bucket_1m);
+        }
+        Ok(())
+    };
+
+    process_row(trigger.old())?;
+    process_row(trigger.new())?;
+
+    Ok(trigger.new())
+}
+
+
 #[pg_extern(immutable, parallel_safe)]
 fn first_sfunc(state: Option<f64>, next: Option<f64>) -> Option<f64> {
     state.or(next)
@@ -220,6 +250,32 @@ mod tests {
         info!("Closed frame check: Count={}, Max={}", count, max_p);
         assert_eq!(count, 1, "Should only have one bucket (the closed one)");
         assert_eq!(max_p, 50.0, "Should not have picked up the 100.0 price from the open bucket");
+    }
+
+    #[pg_test]
+    fn test_aspiral_backfill_tracking() {
+        Spi::run("CREATE TABLE base_data (t timestamptz, val f64);").expect("Table failed");
+        
+        // Manual trigger setup for POC verification
+        // In the real hook, this is automated
+        Spi::run("CREATE TRIGGER aspiral_track AFTER INSERT OR UPDATE OR DELETE ON base_data
+                  FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('my_view');").expect("Trigger failed");
+
+        // 1. Insert data
+        Spi::run("INSERT INTO base_data VALUES ('2026-04-15 00:01:00Z', 10.0);").expect("Insert failed");
+        
+        // 2. Check changelog
+        let count = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.changelog WHERE base_view = 'my_view'").unwrap().unwrap();
+        assert_eq!(count, 1);
+        
+        // 3. Update data (backfill)
+        Spi::run("UPDATE base_data SET val = 20.0 WHERE t = '2026-04-15 00:01:00Z';").expect("Update failed");
+        
+        // Changelog should still have the entry (ON CONFLICT DO NOTHING)
+        let count2 = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.changelog WHERE base_view = 'my_view'").unwrap().unwrap();
+        assert_eq!(count2, 1);
+        
+        info!("Backfill tracking verified: Bucket is marked dirty");
     }
 }
 
