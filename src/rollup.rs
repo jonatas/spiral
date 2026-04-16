@@ -1,6 +1,5 @@
 use regex::Regex;
 use pgrx::prelude::*;
-use pgrx::datum::DatumWithOid;
 
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -49,7 +48,6 @@ pub fn derive_child_sql(parent_name: &str, frame_seconds: i32) -> String {
             let col = row.get::<String>(1)?.unwrap();
             if col == "t" { continue; }
             
-            // Intelligence: how to rollup based on name suffixes or patterns
             let agg = if col.ends_with("_max") || col == "h" {
                 format!("max({}) as {}", col, col)
             } else if col.ends_with("_min") || col == "l" {
@@ -61,14 +59,21 @@ pub fn derive_child_sql(parent_name: &str, frame_seconds: i32) -> String {
             } else if col.ends_with("_last") || col == "c" {
                 format!("last({}) as {}", col, col)
             } else {
-                format!("last({}) as {}", col, col) // Default fallback
+                format!("last({}) as {}", col, col)
             };
             agg_cols.push(agg);
         }
         
         let sql = format!(
-            "CREATE MATERIALIZED VIEW {}_{}s AS SELECT (t / {}) * {} as t, {} FROM {} GROUP BY 1",
-            parent_name, frame_seconds, frame_seconds, frame_seconds, agg_cols.join(", "), parent_name
+            "CREATE MATERIALIZED VIEW {parent_name}_{frame_seconds}s AS 
+             SELECT (t / {frame_seconds}) * {frame_seconds} as t, {agg_cols} 
+             FROM {parent_name}
+             WHERE t < ((aspiral_now()::{aspiral_type} / {frame_seconds}) * {frame_seconds})
+             GROUP BY 1",
+            agg_cols = agg_cols.join(", "), 
+            parent_name = parent_name,
+            frame_seconds = frame_seconds,
+            aspiral_type = "aspiral"
         );
         Ok::<String, spi::Error>(sql)
     }).unwrap_or_else(|e| {

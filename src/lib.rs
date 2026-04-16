@@ -59,6 +59,14 @@ fn to_timestamptz(a: Aspiral) -> TimestampWithTimeZone {
 }
 
 #[pg_extern(immutable, parallel_safe)]
+fn aspiral_now() -> Aspiral {
+    let now = unsafe { pgrx::pg_sys::GetCurrentTimestamp() }; // Postgres epoch micros
+    let pg_epoch_unix: i64 = 946684800;
+    let unix_seconds = pg_epoch_unix + (now / 1_000_000);
+    Aspiral(unix_seconds - get_kickoff_epoch())
+}
+
+#[pg_extern(immutable, parallel_safe)]
 fn first_sfunc(state: Option<f64>, next: Option<f64>) -> Option<f64> {
     state.or(next)
 }
@@ -153,6 +161,29 @@ mod tests {
             Ok::<pgrx::JsonB, spi::Error>(j)
         }).unwrap();
         info!("Histogram: {:?}", hist.0);
+    }
+
+    #[pg_test]
+    fn test_aspiral_closed_frame_logic() {
+        Spi::run("CREATE TABLE ticks_closed (t timestamptz, price f64);").expect("Table failed");
+        
+        Spi::run("CREATE MATERIALIZED VIEW base_1m AS 
+                  SELECT (aspiral(t)/60)*60 as t, 
+                         max(price) as price_max
+                  FROM ticks_closed GROUP BY 1
+                  WITH (aspiral.frames='5m');").expect("Base view failed");
+
+        Spi::run("INSERT INTO ticks_closed VALUES (now() - interval '1 hour', 50.0);").expect("Insert past failed");
+        Spi::run("INSERT INTO ticks_closed VALUES (now(), 100.0);").expect("Insert now failed");
+
+        Spi::run("REFRESH MATERIALIZED VIEW base_1m;").expect("Refresh base failed");
+
+        let count = Spi::get_one::<i64>("SELECT count(*) FROM base_1m_5m").unwrap().unwrap();
+        let max_p = Spi::get_one::<f64>("SELECT max(price_max) FROM base_1m_5m").unwrap().unwrap();
+        
+        info!("Closed frame check: Count={}, Max={}", count, max_p);
+        assert_eq!(count, 1, "Should only have one bucket (the closed one)");
+        assert_eq!(max_p, 50.0, "Should not have picked up the 100.0 price from the open bucket");
     }
 }
 
