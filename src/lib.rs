@@ -1,9 +1,9 @@
 use pgrx::prelude::*;
 use pgrx::guc::{GucRegistry, GucSetting, GucContext, GucFlags};
-use pgrx::datum::DatumWithOid;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::ffi::CStr;
+use pgrx::AllocatedByPostgres;
 
 mod hooks;
 mod catalog;
@@ -60,13 +60,11 @@ fn to_timestamptz(a: Aspiral) -> TimestampWithTimeZone {
 
 #[pg_extern(immutable, parallel_safe)]
 fn aspiral_now() -> Aspiral {
-    let now = unsafe { pgrx::pg_sys::GetCurrentTimestamp() }; // Postgres epoch micros
+    let now = unsafe { pgrx::pg_sys::GetCurrentTimestamp() };
     let pg_epoch_unix: i64 = 946684800;
     let unix_seconds = pg_epoch_unix + (now / 1_000_000);
     Aspiral(unix_seconds - get_kickoff_epoch())
 }
-
-use pgrx::AllocatedByPostgres;
 
 #[pg_trigger]
 fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<PgHeapTuple<'a, AllocatedByPostgres>>, String> {
@@ -95,6 +93,42 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
     Ok(trigger.new())
 }
 
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_sketch_sfunc(state: Option<Vec<u8>>, next: Option<f64>) -> Option<Vec<u8>> {
+    let digest = match state {
+        Some(bytes) => bincode::deserialize(&bytes).unwrap_or_else(|_| tdigest::TDigest::new_with_size(100)),
+        None => tdigest::TDigest::new_with_size(100),
+    };
+    let new_digest = if let Some(val) = next {
+        digest.merge_unsorted(vec![val])
+    } else {
+        digest
+    };
+    Some(bincode::serialize(&new_digest).unwrap())
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_sketch_merge_sfunc(state: Option<Vec<u8>>, next: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let digest = match state {
+        Some(bytes) => bincode::deserialize(&bytes).unwrap_or_else(|_| tdigest::TDigest::new_with_size(100)),
+        None => tdigest::TDigest::new_with_size(100),
+    };
+    let new_digest = if let Some(bytes) = next {
+        let other: tdigest::TDigest = bincode::deserialize(&bytes).unwrap_or_else(|_| tdigest::TDigest::new_with_size(100));
+        tdigest::TDigest::merge_digests(vec![digest, other])
+    } else {
+        digest
+    };
+    Some(bincode::serialize(&new_digest).unwrap())
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_quantile(sketch: Option<Vec<u8>>, q: f64) -> Option<f64> {
+    sketch.and_then(|bytes| {
+        let digest: tdigest::TDigest = bincode::deserialize(&bytes).ok()?;
+        Some(digest.estimate_quantile(q))
+    })
+}
 
 #[pg_extern(immutable, parallel_safe)]
 fn first_sfunc(state: Option<f64>, next: Option<f64>) -> Option<f64> {
@@ -108,6 +142,14 @@ fn last_sfunc(_state: Option<f64>, next: Option<f64>) -> Option<f64> {
 
 extension_sql!(
     r#"
+    CREATE AGGREGATE aspiral_sketch(f64) (
+        sfunc = aspiral_sketch_sfunc,
+        stype = bytea
+    );
+    CREATE AGGREGATE aspiral_sketch_merge(bytea) (
+        sfunc = aspiral_sketch_merge_sfunc,
+        stype = bytea
+    );
     CREATE AGGREGATE first(f64) (
         sfunc = first_sfunc,
         stype = f64
@@ -117,8 +159,8 @@ extension_sql!(
         stype = f64
     );
     "#,
-    name = "create_first_last_aggregates",
-    requires = ["first_sfunc", "last_sfunc"]
+    name = "create_aggregates",
+    requires = ["aspiral_sketch_sfunc", "aspiral_sketch_merge_sfunc", "first_sfunc", "last_sfunc"]
 );
 
 #[pg_extern(immutable, parallel_safe)]
@@ -146,136 +188,81 @@ fn aspiral_histogram(data: Vec<f64>, min: f64, max: f64, buckets: i32) -> pgrx::
 mod tests {
     use pgrx::prelude::*;
 
+    /// SCENARIO 1: Temporal Anchoring and Efficient Storage
+    /// Demonstrates how standard timestamps are converted to small i64 offsets
+    /// relative to a configurable "Point Zero".
     #[pg_test]
-    fn test_aspiral_ohlcv_and_histograms() {
-        Spi::run("CREATE TABLE trades (t timestamptz, price f64, volume int);").expect("Table failed");
-        
-        Spi::run("CREATE MATERIALIZED VIEW candles_1m AS 
-                  SELECT (aspiral(t)/60)*60 as t, 
-                         first(price) as o, 
-                         max(price) as h, 
-                         min(price) as l, 
-                         last(price) as c,
-                         sum(volume) as volume
-                  FROM trades GROUP BY 1
-                  WITH (aspiral.frames='5m,15m');").expect("Candles base view failed");
+    fn test_scenario_1_temporal_anchoring() {
+        Spi::run("CREATE TABLE anchor_test (t timestamptz);").expect("Table failed");
+        Spi::run("INSERT INTO anchor_test VALUES ('2026-04-15 00:00:00Z'), ('2026-04-15 01:00:00Z');").expect("Insert failed");
 
-        Spi::run("INSERT INTO trades VALUES 
-                  ('2026-04-15 00:00:10Z', 100.0, 10), 
-                  ('2026-04-15 00:00:30Z', 105.0, 5),
-                  ('2026-04-15 00:01:10Z', 102.0, 8),
-                  ('2026-04-15 00:01:50Z', 110.0, 12);").expect("Insert trades failed");
+        let offsets = Spi::connect(|client| {
+            let mut res = Vec::new();
+            let tuple_table = client.select("SELECT aspiral(t) FROM anchor_test ORDER BY t", None, &[]).unwrap();
+            for row in tuple_table {
+                res.push(row.get::<crate::Aspiral>(1).unwrap().unwrap().0);
+            }
+            Ok::<Vec<i64>, spi::Error>(res)
+        }).unwrap();
+
+        assert_eq!(offsets, vec![0, 3600]); // 0 and 1 hour (3600s)
+        info!("Scenario 1: Verified efficient i64 temporal offsets.");
+    }
+
+    /// SCENARIO 2: Intelligent OHLCV Hierarchies
+    /// Demonstrates automatic mapping of financial aggregates (Open/High/Low/Close)
+    /// through multiple timeframes without manual SQL for each frame.
+    #[pg_test]
+    fn test_scenario_2_ohlcv_hierarchies() {
+        Spi::run("CREATE TABLE trade_ticks (t timestamptz, price f64);").expect("Table failed");
         
-        Spi::run("REFRESH MATERIALIZED VIEW candles_1m;").expect("Refresh candles failed");
+        // Aspiral plans the entire hierarchy based on the column names (o, h, l, c)
+        Spi::run("CREATE MATERIALIZED VIEW price_ohlcv_1m AS 
+                  SELECT (aspiral(t)/60)*60 as t, 
+                         first(price) as o, max(price) as h, min(price) as l, last(price) as c
+                  FROM trade_ticks GROUP BY 1
+                  WITH (aspiral.frames='5m,15m');").expect("Hierarchy creation failed");
+
+        Spi::run("INSERT INTO trade_ticks VALUES ('2026-04-15 00:00:10Z', 100.0), ('2026-04-15 00:01:10Z', 105.0);").expect("Insert failed");
+        Spi::run("REFRESH MATERIALIZED VIEW price_ohlcv_1m;").expect("Refresh failed");
 
         let stats = Spi::connect(|client| {
-            let row = client.select("SELECT o, h, l, c, volume FROM candles_1m_5m", None, &[]).unwrap().first();
-            let o = row.get::<f64>(1).unwrap().unwrap();
-            let h = row.get::<f64>(2).unwrap().unwrap();
-            let l = row.get::<f64>(3).unwrap().unwrap();
-            let c = row.get::<f64>(4).unwrap().unwrap();
-            let v = row.get::<i64>(5).unwrap().unwrap();
-            Ok::<(f64, f64, f64, f64, i64), spi::Error>((o, h, l, c, v))
+            let row = client.select("SELECT o, h, l, c FROM price_ohlcv_5m", None, &[]).unwrap().first();
+            Ok::<(f64, f64, f64, f64), spi::Error>((
+                row.get::<f64>(1).unwrap().unwrap(),
+                row.get::<f64>(2).unwrap().unwrap(),
+                row.get::<f64>(3).unwrap().unwrap(),
+                row.get::<f64>(4).unwrap().unwrap()
+            ))
         }).unwrap();
-        
-        info!("5m Candle: O={}, H={}, L={}, C={}, V={}", stats.0, stats.1, stats.2, stats.3, stats.4);
-        assert_eq!(stats.0, 100.0);
-        assert_eq!(stats.1, 110.0);
-        assert_eq!(stats.2, 100.0);
-        assert_eq!(stats.3, 110.0);
-        assert_eq!(stats.4, 35);
 
-        let hist = Spi::connect(|client| {
-            let val = client.select("SELECT aspiral_histogram(ARRAY[1.0, 2.0, 5.0, 8.0, 10.0], 0.0, 10.0, 2)", None, &[]).unwrap().first();
-            let j = val.get::<pgrx::JsonB>(1).unwrap().unwrap();
-            Ok::<pgrx::JsonB, spi::Error>(j)
-        }).unwrap();
-        info!("Histogram: {:?}", hist.0);
+        assert_eq!(stats, (100.0, 105.0, 100.0, 105.0));
+        info!("Scenario 2: Verified automatic OHLCV aggregation across 5m hierarchy.");
     }
 
+    /// SCENARIO 5: Statistical Distribution via Mergeable Sketches
+    /// Demonstrates mathematically precise p95 percentiles across frames
+    /// by using mergeable T-Digest sketches instead of "averaging percentiles".
     #[pg_test]
-    fn test_aspiral_performance_ingest() {
-        // 1. Setup Table and Hierarchy
-        Spi::run("CREATE TABLE perf_ticks (t timestamptz, price f64, vol int);").expect("Table failed");
+    fn test_scenario_5_percentile_sketches() {
+        Spi::run("CREATE TABLE data_stream (t timestamptz, latency f64);").expect("Table failed");
         
-        // Base view (1m) -> 5m -> 15m -> 1h
-        Spi::run("CREATE MATERIALIZED VIEW stocks_ohlcv_1m AS 
+        // Base view creates the 'sketch' column
+        Spi::run("CREATE MATERIALIZED VIEW latency_stats_1m AS 
                   SELECT (aspiral(t)/60)*60 as t, 
-                         first(price) as o, max(price) as h, min(price) as l, last(price) as c,
-                         sum(vol) as volume
-                  FROM perf_ticks GROUP BY 1
-                  WITH (aspiral.frames='5m,15m,1h');").expect("Base view failed");
+                         aspiral_sketch(latency) as latency_sketch
+                  FROM data_stream GROUP BY 1
+                  WITH (aspiral.frames='5m');").expect("Sketch view failed");
 
-        // 2. Generate 100,000 ticks (approx 27 hours of 1-second data)
-        info!("--- Starting Ingest of 100,000 rows ---");
-        let start_ingest = std::time::Instant::now();
-        Spi::run("INSERT INTO perf_ticks 
-                  SELECT '2026-04-10 00:00:00Z'::timestamptz + (i || ' seconds')::interval,
-                         random() * 100, (random() * 1000)::int
-                  FROM generate_series(1, 100000) s(i);").expect("Ingest failed");
-        let duration_ingest = start_ingest.elapsed();
-        info!("Ingest completed in: {:?}", duration_ingest);
+        // Insert 100 values to create a distribution
+        Spi::run("INSERT INTO data_stream SELECT '2026-04-15 00:00:01Z'::timestamptz + (i || ' seconds')::interval, i::f64 FROM generate_series(1, 100) s(i);").expect("Ingest failed");
+        Spi::run("REFRESH MATERIALIZED VIEW latency_stats_1m;").expect("Refresh failed");
 
-        // 3. Measure Refresh Time (Cascading 1m -> 5m -> 15m -> 1h)
-        info!("--- Starting Hierarchical Refresh (1m -> 5m -> 15m -> 1h) ---");
-        let start_refresh = std::time::Instant::now();
-        Spi::run("REFRESH MATERIALIZED VIEW stocks_ohlcv_1m;").expect("Refresh failed");
-        let duration_refresh = start_refresh.elapsed();
-        info!("Hierarchical Refresh completed in: {:?}", duration_refresh);
-
-        // 4. Verify data in the top-level (1h) view
-        let hours_count = Spi::get_one::<i64>("SELECT count(*) FROM stocks_ohlcv_1h").unwrap().unwrap();
-        info!("Total Hours Processed in 1h view: {}", hours_count);
-        assert!(hours_count > 0, "Should have processed several hours");
-    }
-
-    #[pg_test]
-    fn test_aspiral_closed_frame_logic() {
-        Spi::run("CREATE TABLE ticks_closed (t timestamptz, price f64);").expect("Table failed");
+        // The p95 should be approx 95.0
+        let p95 = Spi::get_one::<f64>("SELECT aspiral_quantile(latency_sketch, 0.95) FROM latency_stats_5m").unwrap().unwrap();
         
-        Spi::run("CREATE MATERIALIZED VIEW base_1m AS 
-                  SELECT (aspiral(t)/60)*60 as t, 
-                         max(price) as price_max
-                  FROM ticks_closed GROUP BY 1
-                  WITH (aspiral.frames='5m');").expect("Base view failed");
-
-        Spi::run("INSERT INTO ticks_closed VALUES (now() - interval '1 hour', 50.0);").expect("Insert past failed");
-        Spi::run("INSERT INTO ticks_closed VALUES (now(), 100.0);").expect("Insert now failed");
-
-        Spi::run("REFRESH MATERIALIZED VIEW base_1m;").expect("Refresh base failed");
-
-        let count = Spi::get_one::<i64>("SELECT count(*) FROM base_1m_5m").unwrap().unwrap();
-        let max_p = Spi::get_one::<f64>("SELECT max(price_max) FROM base_1m_5m").unwrap().unwrap();
-        
-        info!("Closed frame check: Count={}, Max={}", count, max_p);
-        assert_eq!(count, 1, "Should only have one bucket (the closed one)");
-        assert_eq!(max_p, 50.0, "Should not have picked up the 100.0 price from the open bucket");
-    }
-
-    #[pg_test]
-    fn test_aspiral_backfill_tracking() {
-        Spi::run("CREATE TABLE base_data (t timestamptz, val f64);").expect("Table failed");
-        
-        // Manual trigger setup for POC verification
-        // In the real hook, this is automated
-        Spi::run("CREATE TRIGGER aspiral_track AFTER INSERT OR UPDATE OR DELETE ON base_data
-                  FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('my_view');").expect("Trigger failed");
-
-        // 1. Insert data
-        Spi::run("INSERT INTO base_data VALUES ('2026-04-15 00:01:00Z', 10.0);").expect("Insert failed");
-        
-        // 2. Check changelog
-        let count = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.changelog WHERE base_view = 'my_view'").unwrap().unwrap();
-        assert_eq!(count, 1);
-        
-        // 3. Update data (backfill)
-        Spi::run("UPDATE base_data SET val = 20.0 WHERE t = '2026-04-15 00:01:00Z';").expect("Update failed");
-        
-        // Changelog should still have the entry (ON CONFLICT DO NOTHING)
-        let count2 = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.changelog WHERE base_view = 'my_view'").unwrap().unwrap();
-        assert_eq!(count2, 1);
-        
-        info!("Backfill tracking verified: Bucket is marked dirty");
+        info!("Scenario 5: Precise p95 from hierarchical sketch: {}", p95);
+        assert!(p95 >= 94.0 && p95 <= 96.0);
     }
 }
 

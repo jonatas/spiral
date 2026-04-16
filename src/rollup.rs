@@ -58,6 +58,8 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32)
                 format!("first({}) as {}", col, col)
             } else if col.ends_with("_last") || col == "c" {
                 format!("last({}) as {}", col, col)
+            } else if col.ends_with("_sketch") {
+                format!("aspiral_sketch_merge({}) as {}", col, col)
             } else {
                 format!("last({}) as {}", col, col)
             };
