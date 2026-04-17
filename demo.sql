@@ -37,12 +37,15 @@ SELECT '--- 5m Projection Results ---' as msg;
 SELECT t, o, h, l, c, aspiral_quantile(price_sketch, 0.95) as p95 
 FROM stocks_ohlcv_5m;
 
--- 7. Seasonal Query using Spiral Index
-SELECT '--- Seasonal Query (Same time-of-day) ---' as msg;
--- Querying a "wedge" of the spiral to find data between 00:01 and 00:02 across all days
--- (Simplified for demo, just showing the index exists)
-EXPLAIN SELECT count(*) FROM raw_ticks 
-WHERE to_spiral(aspiral(t), 86400) && '(0,0),(100,100)'::box;
+-- 8. Multi-tenant Lane Prediction
+-- Predicting the physical offset for Tenant 5 at second 120
+-- Assuming 1000 tenants, 1 row per second, and 128 bytes per row
+SELECT 
+    aspiral_predict_lane_address(120, 5, 1000, 1, 128) as physical_byte_offset,
+    to_aspiraling_number(120, 3600, 5) as aspiraling_coord;
+
+-- This allows us to perform "Index-Less" lookups:
+-- SELECT * FROM storage WHERE offset = aspiral_predict_lane_address(...)
 
 -- 6. Backfill and Incremental Update
 SELECT '--- Performing Backfill ---' as msg;

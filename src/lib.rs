@@ -76,7 +76,7 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
     // Get scope columns for this view
     let (scope_cols, _) = catalog::get_metadata(&base_view_name).unwrap_or((vec![], 0));
 
-    let mut process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
+    let process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
         if let Some(tuple) = row {
             let t_val: TimestampWithTimeZone = tuple.get_by_name("t")
                 .map_err(|e| format!("Failed to get 't' column: {}", e))?
@@ -174,10 +174,44 @@ fn aspiral_create_partition(table_name: &str, cycle_seconds: i64, cycle_id: i64)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn aspiral_predict_ctid(a: i64, rows_per_page: i32) -> String {
-    let page = a / rows_per_page as i64;
-    let offset = (a % rows_per_page as i64) + 1;
-    format!("({},{})", page, offset)
+fn aspiral_predict_lane_address(
+    a: i64, 
+    tenant_id: i32, 
+    max_tenants: i32, 
+    rows_per_slot: i32,
+    row_size: i32
+) -> i64 {
+    // The "Aspiraling" physical address calculation:
+    // Every second (a) has a "Master Bundle" containing all lanes.
+    let bundle_size = max_tenants as i64 * rows_per_slot as i64 * row_size as i64;
+    let time_offset = a * bundle_size;
+    
+    // Within the bundle, each tenant has a reserved "Lane"
+    let lane_offset = tenant_id as i64 * rows_per_slot as i64 * row_size as i64;
+    
+    time_offset + lane_offset
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_master_clock_ptr(a: i64, entry_size: i32) -> i64 {
+    // Direct array-like access to a pointer file
+    a * entry_size as i64
+}
+
+#[derive(Serialize, Deserialize, PostgresType, Copy, Clone, Debug)]
+pub struct AspiralingNumber {
+    pub cycle_id: i64,
+    pub lane_id: i32,
+    pub offset: i32,
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn to_aspiraling_number(a: i64, cycle_duration: i64, lane_id: i32) -> AspiralingNumber {
+    AspiralingNumber {
+        cycle_id: a / cycle_duration,
+        lane_id,
+        offset: (a % cycle_duration) as i32,
+    }
 }
 
 #[derive(Serialize, Deserialize, PostgresType, Copy, Clone)]
@@ -356,6 +390,68 @@ mod tests {
         
         info!("Scenario 5: Precise p95 from hierarchical sketch: {}", p95);
         assert!(p95 >= 94.0 && p95 <= 96.0);
+    }
+
+    /// SCENARIO 7: Storage Efficiency
+    /// Measures the disk space savings of using i64 offsets (aspiral) vs standard timestamptz.
+    #[pg_test]
+    fn test_scenario_7_storage_efficiency() {
+        Spi::run("CREATE TABLE bench_std (t timestamptz NOT NULL, val f64);").expect("Table failed");
+        Spi::run("CREATE TABLE bench_asp (t bigint NOT NULL, val f64);").expect("Table failed");
+
+        // Index both time columns
+        Spi::run("CREATE INDEX idx_std ON bench_std(t);").expect("Index failed");
+        Spi::run("CREATE INDEX idx_asp ON bench_asp(t);").expect("Index failed");
+
+        // Insert 100,000 rows
+        info!("--- Inserting 100,000 rows for storage comparison ---");
+        Spi::run("INSERT INTO bench_std SELECT '2026-04-15 00:00:00Z'::timestamptz + (i || ' seconds')::interval, random() FROM generate_series(1, 100000) s(i);").unwrap();
+        Spi::run("INSERT INTO bench_asp SELECT i, random() FROM generate_series(1, 100000) s(i);").unwrap();
+
+        let sizes = Spi::connect(|client| {
+            let row = client.select("
+                SELECT 
+                    pg_indexes_size('bench_std') as std_idx,
+                    pg_indexes_size('bench_asp') as asp_idx,
+                    pg_total_relation_size('bench_std') as std_total,
+                    pg_total_relation_size('bench_asp') as asp_total
+            ", None, &[]).unwrap().first();
+            
+            Ok::<(i64, i64, i64, i64), spi::Error>((
+                row.get::<i64>(1).unwrap().unwrap(),
+                row.get::<i64>(2).unwrap().unwrap(),
+                row.get::<i64>(3).unwrap().unwrap(),
+                row.get::<i64>(4).unwrap().unwrap()
+            ))
+        }).unwrap();
+
+        info!("Storage Benchmark Results (100k rows):");
+        info!("  Standard INDEX size: {} bytes", sizes.0);
+        info!("  Aspiral  INDEX size: {} bytes", sizes.1);
+        info!("  Standard TOTAL size: {} bytes", sizes.2);
+        info!("  Aspiral  TOTAL size: {} bytes", sizes.3);
+        
+        let saving = (1.0 - (sizes.1 as f64 / sizes.0 as f64)) * 100.0;
+        info!("  Index Space Saving: {:.2}%", saving);
+    }
+
+    /// SCENARIO 8: Automatic Query Routing
+    /// Demonstrates how the extension intercepts queries on high-resolution views
+    /// and detects optimization opportunities to route them to lower-resolution frames.
+    #[pg_test]
+    fn test_scenario_8_query_routing() {
+        Spi::run("CREATE TABLE routing_ticks (t timestamptz, price f64);").expect("Table failed");
+        
+        // Base view (1m) -> 1h frame
+        Spi::run("CREATE MATERIALIZED VIEW routing_ohlcv_1m AS 
+                  SELECT (aspiral(t)/60)*60 as t, max(price) as h
+                  FROM routing_ticks GROUP BY 1
+                  WITH (aspiral.frames='1h');").expect("Hierarchy failed");
+
+        // Query the 1m view for a long range.
+        // The planner_hook should see this and log an optimization detection.
+        info!("--- Querying 1m view (Expect Optimization Log) ---");
+        Spi::run("SELECT sum(h) FROM routing_ohlcv_1m WHERE t > 0 AND t < 1000000;").unwrap();
     }
 }
 
