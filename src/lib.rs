@@ -73,15 +73,29 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
         .cloned()
         .ok_or("Missing base_view_name in trigger arguments")?;
     
-    let process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
+    // Get scope columns for this view
+    let (scope_cols, _) = catalog::get_metadata(&base_view_name).unwrap_or((vec![], 0));
+
+    let mut process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
         if let Some(tuple) = row {
             let t_val: TimestampWithTimeZone = tuple.get_by_name("t")
                 .map_err(|e| format!("Failed to get 't' column: {}", e))?
                 .ok_or("Column 't' is null")?;
             
+            // Extract scope values into JSON
+            let mut scope_map = serde_json::Map::new();
+            for col in &scope_cols {
+                // For simplicity in the POC, we treat all scope values as strings
+                let val: Option<String> = tuple.get_by_name(col).unwrap_or(None);
+                if let Some(v) = val {
+                    scope_map.insert(col.clone(), serde_json::Value::String(v));
+                }
+            }
+            let scope_json = pgrx::JsonB(serde_json::Value::Object(scope_map));
+
             let a = aspiral(t_val);
             let bucket_1m = (a / 60) * 60;
-            catalog::mark_bucket_dirty(&base_view_name, bucket_1m);
+            catalog::mark_bucket_dirty(&base_view_name, bucket_1m, scope_json);
         }
         Ok(())
     };
@@ -130,13 +144,80 @@ fn aspiral_quantile(sketch: Option<Vec<u8>>, q: f64) -> Option<f64> {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn first_sfunc(state: Option<f64>, next: Option<f64>) -> Option<f64> {
-    state.or(next)
+fn to_spiral(a: i64, cycle: i64) -> pgrx::pg_sys::Point {
+    let r = a as f64;
+    let theta = if cycle > 0 {
+        (a % cycle) as f64 / cycle as f64 * 2.0 * std::f64::consts::PI
+    } else {
+        0.0
+    };
+    pgrx::pg_sys::Point { x: r * theta.cos(), y: r * theta.sin() }
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn last_sfunc(_state: Option<f64>, next: Option<f64>) -> Option<f64> {
-    next
+fn aspiral_cycle(a: i64, cycle: i64) -> i64 {
+    if cycle <= 0 { return 0; }
+    a / cycle
+}
+
+#[pg_extern]
+fn aspiral_create_partition(table_name: &str, cycle_seconds: i64, cycle_id: i64) {
+    let start = cycle_id * cycle_seconds;
+    let end = (cycle_id + 1) * cycle_seconds;
+    let p_name = format!("{}_p{}", table_name, cycle_id);
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} FOR VALUES FROM ({}) TO ({})",
+        p_name, table_name, start, end
+    );
+    let _ = Spi::run(&sql);
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_predict_ctid(a: i64, rows_per_page: i32) -> String {
+    let page = a / rows_per_page as i64;
+    let offset = (a % rows_per_page as i64) + 1;
+    format!("({},{})", page, offset)
+}
+
+#[derive(Serialize, Deserialize, PostgresType, Copy, Clone)]
+pub struct TimeValue {
+    pub value: f64,
+    pub time: i64,
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn first_sfunc(state: Option<TimeValue>, next_val: Option<f64>, next_time: Option<i64>) -> Option<TimeValue> {
+    match (state, next_val, next_time) {
+        (None, Some(v), Some(t)) => Some(TimeValue { value: v, time: t }),
+        (Some(s), Some(v), Some(t)) => {
+            if t < s.time {
+                Some(TimeValue { value: v, time: t })
+            } else {
+                Some(s)
+            }
+        }
+        (s, _, _) => s,
+    }
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn last_sfunc(state: Option<TimeValue>, next_val: Option<f64>, next_time: Option<i64>) -> Option<TimeValue> {
+    match (state, next_val, next_time) {
+        (None, Some(v), Some(t)) => Some(TimeValue { value: v, time: t }),
+        (Some(s), Some(v), Some(t)) => {
+            if t >= s.time {
+                Some(TimeValue { value: v, time: t })
+            } else {
+                Some(s)
+            }
+        }
+        (s, _, _) => s,
+    }
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn time_value_final(state: Option<TimeValue>) -> Option<f64> {
+    state.map(|s| s.value)
 }
 
 extension_sql!(
@@ -149,17 +230,19 @@ extension_sql!(
         sfunc = aspiral_sketch_merge_sfunc,
         stype = bytea
     );
-    CREATE AGGREGATE first(f64) (
+    CREATE AGGREGATE first(f64, i64) (
         sfunc = first_sfunc,
-        stype = f64
+        stype = TimeValue,
+        finalfunc = time_value_final
     );
-    CREATE AGGREGATE last(f64) (
+    CREATE AGGREGATE last(f64, i64) (
         sfunc = last_sfunc,
-        stype = f64
+        stype = TimeValue,
+        finalfunc = time_value_final
     );
     "#,
     name = "create_aggregates",
-    requires = ["aspiral_sketch_sfunc", "aspiral_sketch_merge_sfunc", "first_sfunc", "last_sfunc"]
+    requires = ["aspiral_sketch_sfunc", "aspiral_sketch_merge_sfunc", "first_sfunc", "last_sfunc", "time_value_final"]
 );
 
 #[pg_extern(immutable, parallel_safe)]
@@ -228,7 +311,7 @@ mod tests {
         // Aspiral plans the entire hierarchy based on the column names (o, h, l, c)
         Spi::run("CREATE MATERIALIZED VIEW price_ohlcv_1m AS 
                   SELECT (aspiral(t)/60)*60 as t, 
-                         first(price) as o, max(price) as h, min(price) as l, last(price) as c
+                         first(price, aspiral(t)) as o, max(price) as h, min(price) as l, last(price, aspiral(t)) as c
                   FROM trade_ticks GROUP BY 1
                   WITH (aspiral.frames='5m,15m');").expect("Hierarchy creation failed");
 

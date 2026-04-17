@@ -11,7 +11,7 @@ CREATE TABLE raw_ticks (t timestamptz NOT NULL, price f64, vol int);
 CREATE MATERIALIZED VIEW stocks_ohlcv_1m AS 
 SELECT 
     (aspiral(t)::bigint / 60) * 60 as t, 
-    first(price) as o, max(price) as h, min(price) as l, last(price) as c,
+    first(price, aspiral(t)) as o, max(price) as h, min(price) as l, last(price, aspiral(t)) as c,
     sum(vol) as volume,
     aspiral_sketch(price) as price_sketch 
 FROM raw_ticks GROUP BY 1
@@ -25,13 +25,24 @@ SELECT
     (random() * 100)::int
 FROM generate_series(1, 300) s(i);
 
--- 4. Reactive Refresh
+-- 4. Aspiraling Index (Seasonal Index)
+-- Create a GiST index on the 2D spiral coordinates (1 day cycle)
+CREATE INDEX idx_spiral_1d ON raw_ticks USING gist (to_spiral(aspiral(t), 86400));
+
+-- 5. Reactive Refresh
 REFRESH MATERIALIZED VIEW stocks_ohlcv_1m;
 
--- 5. Query Results
+-- 6. Query Results
 SELECT '--- 5m Projection Results ---' as msg;
 SELECT t, o, h, l, c, aspiral_quantile(price_sketch, 0.95) as p95 
 FROM stocks_ohlcv_5m;
+
+-- 7. Seasonal Query using Spiral Index
+SELECT '--- Seasonal Query (Same time-of-day) ---' as msg;
+-- Querying a "wedge" of the spiral to find data between 00:01 and 00:02 across all days
+-- (Simplified for demo, just showing the index exists)
+EXPLAIN SELECT count(*) FROM raw_ticks 
+WHERE to_spiral(aspiral(t), 86400) && '(0,0),(100,100)'::box;
 
 -- 6. Backfill and Incremental Update
 SELECT '--- Performing Backfill ---' as msg;

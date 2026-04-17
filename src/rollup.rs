@@ -55,13 +55,13 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32)
             } else if col.ends_with("_sum") || col == "volume" || col.ends_with("_count") {
                 format!("sum({}) as {}", col, col)
             } else if col.ends_with("_first") || col == "o" {
-                format!("first({}) as {}", col, col)
+                format!("first({}, t) as {}", col, col)
             } else if col.ends_with("_last") || col == "c" {
-                format!("last({}) as {}", col, col)
+                format!("last({}, t) as {}", col, col)
             } else if col.ends_with("_sketch") {
                 format!("aspiral_sketch_merge({}) as {}", col, col)
             } else {
-                format!("last({}) as {}", col, col)
+                format!("last({}, t) as {}", col, col)
             };
             agg_cols.push(agg);
         }

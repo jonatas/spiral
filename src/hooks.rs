@@ -35,20 +35,21 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                         matview_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
                     }
                     
-                    // Extract base table from query
+                    // Extract base table and grouping columns from query
+                    let mut scope_columns = Vec::new();
                     let query = (*ctas).query as *mut pg_sys::Query;
                     if !query.is_null() {
-                        // This is very simplified, just to get the first range table entry
+                        scope_columns = get_grouping_columns(query);
+                        
                         let rtable = (*query).rtable;
                         if !rtable.is_null() && (*rtable).length > 0 {
                             let rte = pg_sys::list_nth(rtable, 0) as *mut pg_sys::RangeTblEntry;
                             if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                                 let relid = (*rte).relid;
-                                // Get table name from oid
                                 let base_relname = pg_sys::get_rel_name(relid);
                                 if !base_relname.is_null() {
                                     let base_name = CStr::from_ptr(base_relname).to_string_lossy().into_owned();
-                                    info!("Aspiral identified base table: {}", base_name);
+                                    info!("Aspiral identified base table: {} with scopes: {:?}", base_name, scope_columns);
                                     
                                     if let Some(ref view_name) = matview_name {
                                         let trigger_sql = format!(
@@ -57,8 +58,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                              FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{}')",
                                             view_name, base_name, view_name
                                         );
-                                        // Execute in the reaction phase after standard_ProcessUtility
-                                        // Store for later
                                         let _ = Spi::run(&trigger_sql); 
                                     }
                                 }
@@ -81,6 +80,10 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                 }
                             }
                         }
+                    }
+
+                    if let (Some(name), Some(frames_str)) = (matview_name.clone(), frames_opt.clone()) {
+                        generate_hierarchy(&name, &frames_str, scope_columns);
                     }
                 }
             }
@@ -111,7 +114,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     }
 }
 
-fn generate_hierarchy(base_name: &str, frames_str: &str) {
+fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<String>) {
     let mut frames = rollup::parse_frames(frames_str);
     frames.sort_by_key(|f| f.seconds);
 
@@ -124,12 +127,41 @@ fn generate_hierarchy(base_name: &str, frames_str: &str) {
         
         match Spi::run(&sql) {
             Ok(_) => {
-                catalog::insert_metadata(&child_name, &current_parent, frame.seconds, base_name);
+                catalog::insert_metadata(&child_name, &current_parent, frame.seconds, base_name, scope_columns.clone());
                 current_parent = child_name;
             },
             Err(e) => warning!("Aspiral failed to create child view {}: {:?}", child_name, e),
         }
     }
+}
+
+unsafe fn get_grouping_columns(query: *mut pg_sys::Query) -> Vec<String> {
+    let mut names = Vec::new();
+    let query_ref = &*query;
+
+    if !query_ref.groupClause.is_null() {
+        let group_clause = query_ref.groupClause;
+        for i in 0..(*group_clause).length {
+            let sg_clause = pg_sys::list_nth(group_clause, i) as *mut pg_sys::SortGroupClause;
+            let ref_id = (*sg_clause).tleSortGroupRef;
+
+            let target_list = query_ref.targetList;
+            for j in 0..(*target_list).length {
+                let tle = pg_sys::list_nth(target_list, j) as *mut pg_sys::TargetEntry;
+                if (*tle).ressortgroupref == ref_id {
+                    if !(*tle).resname.is_null() {
+                        let name = CStr::from_ptr((*tle).resname).to_string_lossy().into_owned();
+                        // Ignore the primary time column 't'
+                        if name != "t" {
+                            names.push(name);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    names
 }
 
 fn reactive_refresh(base_name: &str) {
