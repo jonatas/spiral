@@ -109,7 +109,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
         if is_refresh {
             reactive_refresh(&name);
         } else if let Some(frames_str) = frames_opt {
-            generate_hierarchy(&name, &frames_str);
+            generate_hierarchy(&name, &frames_str, Vec::new());
         }
     }
 }

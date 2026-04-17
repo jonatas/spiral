@@ -65,7 +65,7 @@ pub fn clear_dirty_buckets(base_view: &str, buckets: &[(i64, pgrx::JsonB)]) {
                 &[
                     DatumWithOid::new(base_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
                     DatumWithOid::new(t.into_datum(), PgBuiltInOids::INT8OID.value()),
-                    DatumWithOid::new(sv.0.clone().into_datum(), PgBuiltInOids::JSONBOID.value()),
+                    DatumWithOid::new(pgrx::JsonB(sv.0.clone()).into_datum(), PgBuiltInOids::JSONBOID.value()),
                 ]
             ).unwrap();
         }
@@ -98,7 +98,7 @@ pub fn get_metadata(view_name: &str) -> Option<(Vec<String>, i32)> {
                 &[DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value())]
             ).unwrap().first()
         };
-        if row.is_empty() { return Ok(None); }
+        if row.is_empty() { return Ok::<Option<(Vec<String>, i32)>, spi::Error>(None); }
         let cols = row.get::<Vec<String>>(1).unwrap().unwrap();
         let frame = row.get::<i32>(2).unwrap().unwrap();
         Ok(Some((cols, frame)))

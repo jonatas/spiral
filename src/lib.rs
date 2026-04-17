@@ -96,6 +96,7 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
             let a = aspiral(t_val);
             let bucket_1m = (a / 60) * 60;
             catalog::mark_bucket_dirty(&base_view_name, bucket_1m, scope_json);
+
         }
         Ok(())
     };
