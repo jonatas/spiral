@@ -70,13 +70,12 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32)
             "CREATE MATERIALIZED VIEW {child_name} AS 
              SELECT (t / {frame_seconds}) * {frame_seconds} as t, {agg_cols} 
              FROM {parent_name}
-             WHERE t < ((aspiral_now()::{aspiral_type} / {frame_seconds}) * {frame_seconds})
+             WHERE t < ((aspiral_now()::bigint / {frame_seconds}) * {frame_seconds})
              GROUP BY 1",
             child_name = child_name,
             agg_cols = agg_cols.join(", "), 
             parent_name = parent_name,
-            frame_seconds = frame_seconds,
-            aspiral_type = "aspiral"
+            frame_seconds = frame_seconds
         );
         Ok::<String, spi::Error>(sql)
     }).unwrap_or_else(|e| {

@@ -49,7 +49,18 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                 if !base_relname.is_null() {
                                     let base_name = CStr::from_ptr(base_relname).to_string_lossy().into_owned();
                                     info!("Aspiral identified base table: {}", base_name);
-                                    // Trigger creation logic will go here
+                                    
+                                    if let Some(ref view_name) = matview_name {
+                                        let trigger_sql = format!(
+                                            "CREATE TRIGGER aspiral_track_{} 
+                                             AFTER INSERT OR UPDATE OR DELETE ON {}
+                                             FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{}')",
+                                            view_name, base_name, view_name
+                                        );
+                                        // Execute in the reaction phase after standard_ProcessUtility
+                                        // Store for later
+                                        let _ = Spi::run(&trigger_sql); 
+                                    }
                                 }
                             }
                         }

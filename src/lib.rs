@@ -42,28 +42,27 @@ impl Deref for Aspiral {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn aspiral(t: TimestampWithTimeZone) -> Aspiral {
+fn aspiral(t: TimestampWithTimeZone) -> i64 {
     let micros_since_pg_epoch = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
     let pg_epoch_unix: i64 = 946684800;
     let unix_seconds = pg_epoch_unix + (micros_since_pg_epoch / 1_000_000);
-    let offset = unix_seconds - get_kickoff_epoch();
-    Aspiral(offset)
+    unix_seconds - get_kickoff_epoch()
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn to_timestamptz(a: Aspiral) -> TimestampWithTimeZone {
-    let unix_seconds = a.0 + get_kickoff_epoch();
+fn to_timestamptz(a: i64) -> TimestampWithTimeZone {
+    let unix_seconds = a + get_kickoff_epoch();
     let pg_epoch_unix: i64 = 946684800;
     let micros_since_pg_epoch = (unix_seconds - pg_epoch_unix) * 1_000_000;
     unsafe { TimestampWithTimeZone::from_datum(pg_sys::Datum::from(micros_since_pg_epoch), false).unwrap() }
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn aspiral_now() -> Aspiral {
+fn aspiral_now() -> i64 {
     let now = unsafe { pgrx::pg_sys::GetCurrentTimestamp() };
     let pg_epoch_unix: i64 = 946684800;
     let unix_seconds = pg_epoch_unix + (now / 1_000_000);
-    Aspiral(unix_seconds - get_kickoff_epoch())
+    unix_seconds - get_kickoff_epoch()
 }
 
 #[pg_trigger]
@@ -81,7 +80,7 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
                 .ok_or("Column 't' is null")?;
             
             let a = aspiral(t_val);
-            let bucket_1m = (a.0 / 60) * 60;
+            let bucket_1m = (a / 60) * 60;
             catalog::mark_bucket_dirty(&base_view_name, bucket_1m);
         }
         Ok(())
@@ -183,6 +182,16 @@ fn aspiral_histogram(data: Vec<f64>, min: f64, max: f64, buckets: i32) -> pgrx::
     pgrx::JsonB(serde_json::to_value(counts).unwrap())
 }
 
+#[pg_extern]
+fn aspiral_create_trigger(table_name: &str, view_name: &str) {
+    let sql = format!(
+        "CREATE TRIGGER aspiral_track_{view_name} 
+         AFTER INSERT OR UPDATE OR DELETE ON {table_name}
+         FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{view_name}')"
+    );
+    Spi::run(&sql).unwrap();
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -200,7 +209,7 @@ mod tests {
             let mut res = Vec::new();
             let tuple_table = client.select("SELECT aspiral(t) FROM anchor_test ORDER BY t", None, &[]).unwrap();
             for row in tuple_table {
-                res.push(row.get::<crate::Aspiral>(1).unwrap().unwrap().0);
+                res.push(row.get::<i64>(1).unwrap().unwrap());
             }
             Ok::<Vec<i64>, spi::Error>(res)
         }).unwrap();
