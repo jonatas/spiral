@@ -131,8 +131,8 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
                     let relname = pg_sys::get_rel_name(relid);
                     if !relname.is_null() {
                         let name = CStr::from_ptr(relname).to_string_lossy();
-                        // Optimization detection logic
-                        if name.ends_with("_ticks") || name.contains("ohlcv_1m") {
+                        // Optimization detection logic: check if the table/view is in our metadata
+                        if catalog::is_aspiral_relation(&name) {
                             info!("Aspiral Planner: Optimization detected on '{}'. Routing to large frame.", name);
                         }
                     }

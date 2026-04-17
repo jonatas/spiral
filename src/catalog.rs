@@ -89,6 +89,19 @@ pub fn insert_metadata(view_name: &str, parent_view: &str, frame_seconds: i32, b
     }
 }
 
+pub fn is_aspiral_relation(name: &str) -> bool {
+    Spi::connect(|client| {
+        let row = unsafe {
+            client.select(
+                "SELECT 1 FROM aspiral.metadata WHERE view_name = $1",
+                None,
+                &[DatumWithOid::new(name.into_datum(), PgBuiltInOids::TEXTOID.value())]
+            ).unwrap().first()
+        };
+        Ok::<bool, spi::Error>(!row.is_empty())
+    }).unwrap_or(false)
+}
+
 pub fn get_metadata(view_name: &str) -> Option<(Vec<String>, i32)> {
     Spi::connect(|client| {
         let row = unsafe {

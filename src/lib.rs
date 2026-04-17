@@ -8,6 +8,8 @@ use pgrx::AllocatedByPostgres;
 mod hooks;
 mod catalog;
 mod rollup;
+mod tam;
+
 
 ::pgrx::pg_module_magic!(name, version);
 
