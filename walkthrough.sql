@@ -2,21 +2,24 @@
 -- Sequential demonstration of storage, hierarchy, precision, and reactivity.
 
 -- 1. Setup Kickoff
+DROP EXTENSION IF EXISTS aspiral CASCADE;
+DROP SCHEMA IF EXISTS aspiral CASCADE;
+CREATE EXTENSION aspiral CASCADE;
 SET aspiral.kickoff_date = '2026-04-15';
-CREATE TABLE asset_ticks (t timestamptz NOT NULL, symbol text NOT NULL, price f64, vol int);
+DROP TABLE IF EXISTS asset_ticks CASCADE;
+CREATE TABLE asset_ticks (t timestamptz NOT NULL, symbol text NOT NULL, price double precision, vol int);
 
 -- 2. Create Intelligent Hierarchy
 -- This spawns asset_ohlcv_5m and asset_ohlcv_1h automatically.
-CREATE MATERIALIZED VIEW asset_ohlcv_1m AS 
+CREATE MATERIALIZED VIEW asset_ohlcv_1m WITH (aspiral.frames='5m,1h') AS 
 SELECT 
-    (aspiral(t)/60)*60 as t, 
+    to_timestamptz((aspiral(t)/60)*60) as t, 
     symbol,
-    first(price) as o, max(price) as h, min(price) as l, last(price) as c,
+    first(price, aspiral(t)) as o, max(price) as h, min(price) as l, last(price, aspiral(t)) as c,
     sum(vol) as volume,
     aspiral_sketch(price) as price_sketch 
 FROM asset_ticks 
-GROUP BY 1, 2
-WITH (aspiral.frames='5m,1h');
+GROUP BY 1, 2;
 
 -- 3. Ingest Data (3 historical rows, 1 "now" row)
 INSERT INTO asset_ticks VALUES 
@@ -53,4 +56,4 @@ SELECT h as max_after_backfill FROM asset_ohlcv_1h;
 
 -- 8. Planner Optimization Log
 SELECT '--- Triggering Planner Routing Hook ---' as msg;
-SELECT sum(h) FROM asset_ohlcv_1m WHERE t > 0 AND t < 1000000;
+SELECT sum(h) FROM asset_ohlcv_1m WHERE t > '2026-04-15 00:00:00Z' AND t < '2026-04-16 00:00:00Z';

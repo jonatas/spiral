@@ -1,61 +1,76 @@
--- Aspiral Extension Demo Suite
--- Documentation and scenarios for high-precision time-series
+-- ============================================================================
+-- ASPIRAL FULL COMPONENT PROOF & BENCHMARK
+-- ============================================================================
 
--- 1. Setup Kickoff
+-- 1. SETUP
+DROP EXTENSION IF EXISTS aspiral CASCADE;
+DROP SCHEMA IF EXISTS aspiral CASCADE;
+CREATE EXTENSION aspiral CASCADE;
+
 SET aspiral.kickoff_date = '2026-04-15';
 
-CREATE TABLE raw_ticks (t timestamptz NOT NULL, price f64, vol int);
-
--- 2. Create Intelligent Hierarchy
--- Open/High/Low/Close + Precise p95 Percentiles
-CREATE MATERIALIZED VIEW stocks_ohlcv_1m AS 
+-- 2. TEMPORAL ANCHORING PROOF
 SELECT 
-    (aspiral(t)::bigint / 60) * 60 as t, 
-    first(price, aspiral(t)) as o, max(price) as h, min(price) as l, last(price, aspiral(t)) as c,
-    sum(vol) as volume,
-    aspiral_sketch(price) as price_sketch 
-FROM raw_ticks GROUP BY 1
-WITH (aspiral.frames='5m,1h');
+    '2026-04-15 00:00:01Z'::timestamptz as original_time,
+    aspiral('2026-04-15 00:00:01Z'::timestamptz) as offset_seconds,
+    to_timestamptz(aspiral('2026-04-15 00:00:01Z'::timestamptz)) as roundtrip_time;
 
--- 3. Ingest Data
-INSERT INTO raw_ticks (t, price, vol)
+-- 3. ASPIRALING COORDINATE PROOF
 SELECT 
-    '2026-04-15 00:00:00Z'::timestamptz + (i || ' seconds')::interval,
-    100 + (random() * 10 - 5),
-    (random() * 100)::int
-FROM generate_series(1, 300) s(i);
+    t as aspiral_time,
+    to_aspiraling_number(t::bigint, 3600, 5) as coord_1h_cycle_lane_5
+FROM (SELECT generate_series(0, 7200, 1800) as t) s;
 
--- 4. Aspiraling Index (Seasonal Index)
--- Create a GiST index on the 2D spiral coordinates (1 day cycle)
-CREATE INDEX idx_spiral_1d ON raw_ticks USING gist (to_spiral(aspiral(t), 86400));
+-- 4. SPIRALING INDEX PROOF
+DROP TABLE IF EXISTS seasonal_data;
+CREATE TABLE seasonal_data (t timestamptz, val double precision);
+CREATE INDEX idx_seasonal_spiral ON seasonal_data USING gist (to_spiral(aspiral(t), 86400));
 
--- 5. Reactive Refresh
-REFRESH MATERIALIZED VIEW stocks_ohlcv_1m;
-
--- 6. Query Results
-SELECT '--- 5m Projection Results ---' as msg;
-SELECT t, o, h, l, c, aspiral_quantile(price_sketch, 0.95) as p95 
-FROM stocks_ohlcv_5m;
-
--- 8. Multi-tenant Lane Prediction
--- Predicting the physical offset for Tenant 5 at second 120
--- Assuming 1000 tenants, 1 row per second, and 128 bytes per row
+INSERT INTO seasonal_data (t, val)
 SELECT 
-    aspiral_predict_lane_address(120, 5, 1000, 1, 128) as physical_byte_offset,
-    to_aspiraling_number(120, 3600, 5) as aspiraling_coord;
+    '2026-04-15 00:00:00Z'::timestamptz + (i || ' hours')::interval,
+    random()
+FROM generate_series(1, 1000) s(i);
 
--- This allows us to perform "Index-Less" lookups:
--- SELECT * FROM storage WHERE offset = aspiral_predict_lane_address(...)
+EXPLAIN ANALYZE 
+SELECT count(*) FROM seasonal_data 
+WHERE to_spiral(aspiral(t), 86400) && '(-5000, 5000), (5000, 10000)'::box;
 
--- 6. Backfill and Incremental Update
-SELECT '--- Performing Backfill ---' as msg;
-UPDATE raw_ticks SET price = 999.9 WHERE t = '2026-04-15 00:01:30Z';
+-- 5. MASSIVE O(1) BENCHMARK
+DROP TABLE IF EXISTS benchmark_delta;
+CREATE TABLE benchmark_delta (t bigint, tenant_id bigint, price double precision);
+CREATE INDEX idx_delta_lookup ON benchmark_delta(t, tenant_id);
 
--- Check changelog (Internal tracking)
-SELECT * FROM aspiral.changelog;
+INSERT INTO benchmark_delta (t, tenant_id, price)
+SELECT 
+    (s.i / 1000) as t,
+    (s.i % 1000) as tenant_id,
+    (random() * 100)::double precision
+FROM generate_series(0, 99999) s(i);
 
--- Incrementally refresh the whole tree
-REFRESH MATERIALIZED VIEW stocks_ohlcv_1m;
+-- Physical packing
+SELECT aspiral_pack_delta('benchmark_delta', 777);
 
--- Verify 1h view was updated reactively
-SELECT t, h as max_price_after_backfill FROM stocks_ohlcv_1h;
+\timing on
+SELECT '--- [TEST 1] B-Tree Index Lookup ---' as benchmark;
+SELECT * FROM benchmark_delta WHERE t = 50 AND tenant_id = 500;
+
+SELECT '--- [TEST 2] Aspiraling O(1) Direct Read ---' as benchmark;
+SELECT aspiral_read_main(777, 50, 500) as o1_value;
+\timing off
+
+-- ACCURACY
+SELECT 
+    (SELECT price FROM benchmark_delta WHERE t = 50 AND tenant_id = 500) as btree_val,
+    (SELECT aspiral_read_main(777, 50, 500)) as o1_val,
+    CASE 
+        WHEN (SELECT price FROM benchmark_delta WHERE t = 50 AND tenant_id = 500) = (SELECT aspiral_read_main(777, 50, 500)) 
+        THEN 'PASSED' ELSE 'FAILED' 
+    END as status;
+
+-- 6. PARTITIONING
+DROP TABLE IF EXISTS partitioned_events;
+CREATE TABLE partitioned_events (t bigint, event_name text) PARTITION BY RANGE (t);
+SELECT aspiral_create_partition('partitioned_events', 86400, 0);
+SELECT aspiral_create_partition('partitioned_events', 86400, 1);
+\d+ partitioned_events

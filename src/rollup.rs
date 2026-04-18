@@ -1,4 +1,3 @@
-use regex::Regex;
 use pgrx::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -30,23 +29,26 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
         .collect()
 }
 
-pub fn expand_avg_in_sql(sql: &str) -> String {
-    let re = Regex::new(r"avg\(([^)]+)\)").unwrap();
-    re.replace_all(sql, "sum($1) as $1_sum, count($1) as $1_count").to_string()
-}
-
-pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32) -> String {
+pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32, scope_columns: &[String]) -> String {
     Spi::connect(|client| {
         let query = format!(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = '{}' AND table_schema NOT IN ('information_schema', 'pg_catalog')",
+            "SELECT attname::text FROM pg_attribute WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped",
             parent_name
         );
         let columns = client.select(&query, None, &[])?;
         
-        let mut agg_cols = Vec::new();
+        let mut select_cols = vec![format!("to_timestamptz((aspiral(t) / {0}) * {0}) as t", frame_seconds)];
+        let mut group_by = vec!["(aspiral(t) / {0}) * {0}".replace("{0}", &frame_seconds.to_string())];
+        
         for row in columns {
             let col = row.get::<String>(1)?.unwrap();
             if col == "t" { continue; }
+            
+            if scope_columns.contains(&col) {
+                select_cols.push(col.clone());
+                group_by.push(col.clone());
+                continue;
+            }
             
             let agg = if col.ends_with("_max") || col == "h" {
                 format!("max({}) as {}", col, col)
@@ -55,27 +57,28 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32)
             } else if col.ends_with("_sum") || col == "volume" || col.ends_with("_count") {
                 format!("sum({}) as {}", col, col)
             } else if col.ends_with("_first") || col == "o" {
-                format!("first({}, t) as {}", col, col)
+                format!("first({}, aspiral(t)) as {}", col, col)
             } else if col.ends_with("_last") || col == "c" {
-                format!("last({}, t) as {}", col, col)
+                format!("last({}, aspiral(t)) as {}", col, col)
             } else if col.ends_with("_sketch") {
                 format!("aspiral_sketch_merge({}) as {}", col, col)
             } else {
-                format!("last({}, t) as {}", col, col)
+                format!("last({}, aspiral(t)) as {}", col, col)
             };
-            agg_cols.push(agg);
+            select_cols.push(agg);
         }
         
         let sql = format!(
             "CREATE MATERIALIZED VIEW {child_name} AS 
-             SELECT (t / {frame_seconds}) * {frame_seconds} as t, {agg_cols} 
+             SELECT {select_cols} 
              FROM {parent_name}
-             WHERE t < ((aspiral_now()::bigint / {frame_seconds}) * {frame_seconds})
-             GROUP BY 1",
+             WHERE aspiral(t) < ((aspiral_now()::bigint / {frame_seconds}) * {frame_seconds})
+             GROUP BY {group_by}",
             child_name = child_name,
-            agg_cols = agg_cols.join(", "), 
+            select_cols = select_cols.join(", "), 
             parent_name = parent_name,
-            frame_seconds = frame_seconds
+            frame_seconds = frame_seconds,
+            group_by = group_by.join(", ")
         );
         Ok::<String, spi::Error>(sql)
     }).unwrap_or_else(|e| {
