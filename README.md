@@ -71,6 +71,23 @@ In multi-tenant systems, traditional composite indexes like `(tenant_id, time)` 
 | **Composite** `(org, t)` | Seq Scan (Index ignored) | 637 | 4.63 ms |
 | **Z-Order** `(t, org, u)` | **Index Scan** | 575 | **0.34 ms** |
 
+**Query Plan Detail (Z-Order):**
+```text
+Index Scan using idx_zorder on zorder_test
+  Index Cond: (aspiral_zorder_3d(...) BETWEEN 20582858897002561 AND 20582858898772424)
+  Buffers: shared hit=568 read=7
+  Execution Time: 0.344 ms
+```
+
+**Query Plan Detail (Composite):**
+```text
+Seq Scan on zorder_test
+  Filter: (org_id BETWEEN 0 AND 100 AND t BETWEEN ...)
+  Rows Removed by Filter: 99939
+  Buffers: shared hit=637
+  Execution Time: 4.635 ms
+```
+
 **Why it matters:**
 The Z-Order index achieves **~13x speedup** by weaving the bits of time and organization together. This ensures that even if you don't filter by a specific organization, the time-proximate data across all organizations remains physically clustered on disk.
 
