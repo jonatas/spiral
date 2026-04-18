@@ -5,28 +5,28 @@
 ## 🚀 Core Features
 
 ### 1. Magic Comments (Zero-Config Pipelines)
-Define your entire analytics pipeline directly within your `CREATE TABLE` statement. Aspiral parses SQL comments to automatically generate materialized view hierarchies.
+Define your entire analytics pipeline directly within your `CREATE TABLE` statement. Aspiral parses SQL comments and intelligently scans your schema to automatically generate materialized view hierarchies.
 
 ```sql
 CREATE TABLE sensor_readings (
     t timestamptz NOT NULL,
-    sensor_id int NOT NULL,
+    sensor_id int REFERENCES sensors(id), -- Auto-detected as tenant!
     voltage double precision, -- Aspiral: ohlc as v, stats as v_stats
     current double precision, -- Aspiral: stats
     status_code int           -- Aspiral: count as total_events
-) WITH (
-    aspiral.frames = '1m,5m,1h', 
-    aspiral.tenant = 'sensor_id'
-);
+); -- Hierarchy 1m -> 1d -> 1mon created automatically
 ```
 
 **What happens automatically:**
-- **Automated Hierarchy**: Views for `1m`, `5m`, and `1h` are created.
-- **Intelligent Naming**: 
-    - `voltage` gets `v_o, v_h, v_l, v_c` (from `ohlc as v`) and `v_stats`.
-    - `current` keeps its name `current` (single task, no alias).
-    - `status_code` becomes `total_events` (via custom alias).
-- **Z-Order Clustering**: An index is created to cluster data by `(t, sensor_id)` for high-performance range queries.
+- **Smart Defaults**:
+    - **Time Detection**: Automatically picks the first `timestamptz`, `timestamp`, `date`, or `bigint` column.
+    - **Tenant Detection**: Automatically identifies columns with **Foreign Key** constraints as tenant dimensions.
+    - **Default Frames**: If no frames are provided, Aspiral defaults to `1m, 1d, 1mon`.
+- **Automated Hierarchy**: Views for the detected frames are created and wired together.
+- **Intelligent Naming & Aliasing**: 
+    - Single-formula columns keep their original name.
+    - Use `as alias` in comments for custom column names.
+- **Background Worker**: A built-in worker periodically refreshes root views, ensuring your rollups stay up-to-date automatically.
 
 ---
 
@@ -57,6 +57,7 @@ WHERE risk_factor > 3.0; -- Instant detection of extreme anomalies
 Aspiral solves the "Composite Index Trap" by interleaving the bits of Time and Tenant IDs into a single dimension.
 
 - **Fair Performance**: Queries filtering only by Time, only by Tenant, or both, all benefit from the same index.
+- **Support for All Types**: Automatically hashes string-based dimensions (like `symbol`) for bit-interleaving.
 - **13x Speedup**: Benchmarks show significant I/O reduction for multi-tenant range queries compared to traditional `(tenant_id, time)` indexes.
 
 ---
@@ -65,7 +66,7 @@ Aspiral solves the "Composite Index Trap" by interleaving the bits of Time and T
 Aspiral tracks "dirty buckets" in a transactional changelog.
 
 - **ACID Compliance**: Metadata and rollups stay perfectly in sync even during transaction rollbacks.
-- **Self-Healing Dashboards**: Adding historical data (audits/corrections) automatically flags those buckets for re-aggregation in the next refresh cycle.
+- **Self-Healing Dashboards**: Adding historical data (audits/corrections) automatically flags those buckets for re-aggregation.
 - **Gap-Filling**: Easily generate continuous timelines for frontend charts using standard SQL joins against Aspiral rollups.
 
 ## 🛠 Supported Analytics Tasks
@@ -84,22 +85,19 @@ Running `short-walkthrough.sql` provides a complete, hands-on demonstration of t
 
 ```sql
 CREATE EXTENSION aspiral;
-...
+
 -- Set your "Day Zero"
 SET aspiral.kickoff_date = '2026-04-15';
 
--- Define your data
+-- Define your data (Smart Detection will handle the rest)
 CREATE TABLE ticks (
     t timestamptz NOT NULL,
-    symbol_id int NOT NULL,
+    symbol_id int REFERENCES symbols(id),
     price numeric, -- Aspiral: ohlc, stats
     vol int        -- Aspiral: sum
-) WITH (aspiral.frames='1m,5m,1h', aspiral.tenant='symbol_id');
+);
 
--- Ingest data...
-INSERT INTO ticks ... ;
-
--- Refresh the pipeline (cascades to all children)
+-- Background worker handles refreshes, or manual refresh:
 REFRESH MATERIALIZED VIEW ticks_ohlcv_1m;
 ```
 

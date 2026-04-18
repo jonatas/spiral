@@ -148,16 +148,21 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 (*stmt).options = new_options;
             }
 
+            // Apply Smart Defaults
             if time_col_opt.is_none() || time_col_opt == Some("t".to_string()) {
                 if let Some(dt) = detected_time { time_col_opt = Some(dt); }
             }
             if tenant_opt.is_none() && !detected_tenants.is_empty() {
                 tenant_opt = Some(detected_tenants.join(","));
             }
-            
+
             // MAGIC COMMENT PARSING
-            if frames_opt.is_some() {
-                let sql_text = CStr::from_ptr(query_string).to_string_lossy();
+            // Even if frames_opt is None, we check for magic comments and use defaults if found
+            let sql_text = CStr::from_ptr(query_string).to_string_lossy();
+            let has_magic = sql_text.contains("-- Aspiral:");
+            
+            if frames_opt.is_some() || has_magic {
+                let actual_frames = frames_opt.clone().unwrap_or_else(|| rollup::DEFAULT_FRAMES.to_string());
                 let table_name = target_name.as_ref().unwrap();
                 let time_col = time_col_opt.as_ref().unwrap();
                 let tenant_cols = tenant_opt.as_ref().map(|s| s.split(',').collect::<Vec<_>>()).unwrap_or_default();
@@ -222,19 +227,25 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 }
 
                 if projections.len() > 1 {
-                    let frames_str = frames_opt.as_ref().unwrap();
-                    let frames = rollup::parse_frames(frames_str);
+                    let frames = rollup::parse_frames(&actual_frames);
                     if !frames.is_empty() {
                         let root_frame = &frames[0];
                         let root_view = format!("\"{}_ohlcv_{}\"", table_name, root_frame.name);
                         let select = projections.join(", ").replace("{0}", &root_frame.seconds.to_string());
                         let group_by = groups.join(", ").replace("{0}", &root_frame.seconds.to_string());
+                        let scope_cols_str = tenant_cols.iter().map(|s| format!("\"{}\"", s.trim())).collect::<Vec<_>>().join(", ");
+                        let index_cols = if scope_cols_str.is_empty() { "t".to_string() } else { format!("t, {}", scope_cols_str) };
+                        
                         let root_sql = format!(
                             "CREATE MATERIALIZED VIEW {root_view} WITH (aspiral.frames='{orig_frames}') AS 
-                             SELECT {select} FROM \"{table_name}\" GROUP BY {group_by}",
+                             SELECT {select} FROM \"{table_name}\" GROUP BY {group_by};
+                             CREATE UNIQUE INDEX \"idx_u_{table_name}_root\" ON {root_view}({index_cols});",
                             root_view = root_view,
-                            orig_frames = frames_str.split(',').skip(1).collect::<Vec<_>>().join(","),
-                            select = select, table_name = table_name, group_by = group_by
+                            orig_frames = actual_frames.split(',').skip(1).collect::<Vec<_>>().join(","),
+                            select = select,
+                            table_name = table_name,
+                            group_by = group_by,
+                            index_cols = index_cols
                         );
                         frames_opt = Some(root_sql);
                     }

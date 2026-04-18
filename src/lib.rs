@@ -10,6 +10,7 @@ mod rollup;
 mod tam;
 mod storage;
 mod stats;
+mod bgworker;
 
 ::pgrx::pg_module_magic!(name, version);
 
@@ -18,6 +19,7 @@ static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option
 #[no_mangle]
 pub unsafe extern "C" fn _PG_init() {
     hooks::init_hooks();
+    bgworker::init_worker();
 
     GucRegistry::define_string_guc(
         CStr::from_bytes_with_nul(b"aspiral.kickoff_date\0").unwrap(),

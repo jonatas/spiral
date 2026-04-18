@@ -6,6 +6,8 @@ pub struct Frame {
     pub seconds: i32,
 }
 
+pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
+
 pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
     frames_str.split(',')
         .map(|s| {
@@ -20,10 +22,17 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
                 s[..s.len()-1].parse::<i32>().unwrap_or(0) * 86400
             } else if s.ends_with('w') {
                 s[..s.len()-1].parse::<i32>().unwrap_or(0) * 604800
+            } else if s.ends_with('M') {
+                s[..s.len()-1].parse::<i32>().unwrap_or(0) * 2592000 // 30 days
             } else {
                 s.parse::<i32>().unwrap_or(0)
             };
-            Frame { name: s.to_string(), seconds }
+            let name = if s.ends_with('M') {
+                format!("{}mon", &s[..s.len()-1])
+            } else {
+                s.to_string()
+            };
+            Frame { name, seconds }
         })
         .filter(|f| f.seconds > 0)
         .collect()
@@ -75,17 +84,22 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
             select_cols.push(agg);
         }
         
+        let scope_cols_str = scope_columns.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
+        let index_cols = if scope_cols_str.is_empty() { "t".to_string() } else { format!("t, {}", scope_cols_str) };
+
         let sql = format!(
             "CREATE MATERIALIZED VIEW {child_name} AS 
              SELECT {select_cols} 
              FROM {parent_name}
              WHERE aspiral(t) < ((aspiral_now()::bigint / {frame_seconds}) * {frame_seconds})
-             GROUP BY {group_by}",
+             GROUP BY {group_by};
+             CREATE UNIQUE INDEX idx_u_{child_name} ON {child_name}({index_cols});",
             child_name = child_name,
             select_cols = select_cols.join(", "), 
             parent_name = parent_name,
             frame_seconds = frame_seconds,
-            group_by = group_by.join(", ")
+            group_by = group_by.join(", "),
+            index_cols = index_cols
         );
         Ok::<String, spi::Error>(sql)
     }).unwrap_or_else(|e| {
