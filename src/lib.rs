@@ -256,10 +256,33 @@ fn aspiral_zorder(t: i64, ids: Vec<i32>) -> i64 {
     res as i64
 }
 
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_zorder_3d(t: i64, org_id: i32, user_id: i32) -> i64 {
-    // Legacy support for the 3D version
-    aspiral_zorder(t, vec![org_id, user_id])
+#[pg_extern(name = "aspiral_cluster_table")]
+fn aspiral_cluster_table(table_name: &str, time_col: &str, dimension_cols: Vec<String>) {
+    let index_name = format!("idx_aspiral_z_{}", table_name.replace(".", "_"));
+    
+    // Construct the dimensions array part
+    let dimensions_joined = dimension_cols.iter()
+        .map(|s| format!("\"{}\"", s))
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    let query = format!(
+        "CREATE INDEX \"{}\" ON \"{}\" (
+            aspiral_zorder(
+                EXTRACT(EPOCH FROM (\"{time_col}\" AT TIME ZONE 'UTC'))::bigint, 
+                ARRAY[{dimensions_joined}]::integer[]
+            )
+        )",
+        index_name, table_name
+    );
+
+    pgrx::notice!("Creating Z-Order index: {}", index_name);
+    
+    let result = pgrx::spi::Spi::run(&query);
+    match result {
+        Ok(_) => pgrx::notice!("Successfully created Z-Order clustering index on {}", table_name),
+        Err(e) => pgrx::error!("Failed to create Z-Order index: {}", e),
+    }
 }
 
 #[pg_extern]
