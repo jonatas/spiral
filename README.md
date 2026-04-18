@@ -62,12 +62,13 @@ Aspiral solves the "Composite Index Trap" by interleaving the bits of Time and T
 
 ---
 
-### 4. Reactive Backfill Engine
-Aspiral tracks "dirty buckets" in a transactional changelog.
+### 4. Reactive Backfill Engine & IVM
+Aspiral tracks "dirty buckets" in a transactional changelog to provide **Incremental View Maintenance (IVM)**.
 
+- **Surgical Updates**: Instead of rebuilding entire views, Aspiral identifies exactly which time buckets changed and patches only those records. This provides massive performance gains for backfills or late-arriving data.
 - **ACID Compliance**: Metadata and rollups stay perfectly in sync even during transaction rollbacks.
-- **Self-Healing Dashboards**: Adding historical data (audits/corrections) automatically flags those buckets for re-aggregation.
-- **Gap-Filling**: Easily generate continuous timelines for frontend charts using standard SQL joins against Aspiral rollups.
+- **Cascading Logic**: Refreshing a parent view automatically triggers incremental updates for all downstream children.
+- **Self-Healing Dashboards**: Historical data corrections automatically flag those buckets for re-aggregation in the next refresh cycle.
 
 ## 🛠 Supported Analytics Tasks
 

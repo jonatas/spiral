@@ -20,10 +20,7 @@ pub unsafe extern "C-unwind" fn aspiral_worker_main(_arg: pg_sys::Datum) {
             for row in tuple_table {
                 if let Ok(Some(view_name)) = row.get::<String>(1) {
                     info!("Aspiral Worker: Auto-refreshing root view '{}'", view_name);
-                    // Use unsafe Spi::run for simple command execution
-                    unsafe {
-                        let _ = Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", view_name));
-                    }
+                    let _ = Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", view_name));
                 }
             }
             Ok::<(), spi::Error>(())

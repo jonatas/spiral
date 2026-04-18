@@ -285,6 +285,16 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 if magic_sql.starts_with("CREATE") {
                     info!("Aspiral executing Magic View: {}", magic_sql);
                     let _ = Spi::run(&magic_sql);
+                    
+                    // NEW: Also add trigger to base table for changelog tracking!
+                    let root_view_name = magic_sql.split("VIEW ").nth(1).unwrap().split(" WITH").next().unwrap().trim().trim_matches('"');
+                    let trigger_sql = format!(
+                        "CREATE TRIGGER aspiral_track_{} 
+                         AFTER INSERT OR UPDATE OR DELETE ON \"{}\"
+                         FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{}')",
+                        name, name, root_view_name
+                    );
+                    let _ = Spi::run(&trigger_sql);
                 }
             }
         }
@@ -402,6 +412,7 @@ unsafe fn get_grouping_columns(query: *mut pg_sys::Query) -> Vec<String> {
 fn reactive_refresh(base_name: &str) {
     let dirty_buckets = catalog::get_dirty_buckets(base_name);
     let children = catalog::get_children(base_name);
+    
     if dirty_buckets.is_empty() {
         for child in children {
             info!("Aspiral cascading full refresh to '{}'", child);
@@ -413,10 +424,18 @@ fn reactive_refresh(base_name: &str) {
     } else {
         info!("Aspiral identified {} dirty buckets for '{}'", dirty_buckets.len(), base_name);
         for child in children {
-            info!("Aspiral cascading refresh to '{}' due to dirty buckets", child);
-            match Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", child)) {
-                Ok(_) => (),
-                Err(e) => warning!("Aspiral failed cascading refresh on {}: {:?}", child, e),
+            info!("Aspiral attempting incremental refresh for '{}'", child);
+            // Try incremental first
+            if crate::refresh_incremental(&child) {
+                // Incremental succeeded, now trigger its children recursively
+                reactive_refresh(&child);
+            } else {
+                // Fallback to full refresh
+                info!("Aspiral falling back to full refresh for '{}'", child);
+                match Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", child)) {
+                    Ok(_) => (),
+                    Err(e) => warning!("Aspiral failed cascading refresh on {}: {:?}", child, e),
+                }
             }
         }
         catalog::clear_dirty_buckets(base_name, &dirty_buckets);

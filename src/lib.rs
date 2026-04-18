@@ -325,6 +325,68 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimension_cols: 
     }
 }
 
+pub fn refresh_incremental(view_name: &str) -> bool {
+    Spi::connect(|client| {
+        // 1. Get metadata for the view
+        let meta = client.select(
+            "SELECT parent_view, frame_seconds, scope_columns FROM aspiral.metadata WHERE view_name = $1::text",
+            None,
+            &[Some(view_name.into_datum()).into()]
+        ).unwrap().first();
+
+        if meta.is_empty() { return Ok::<bool, spi::Error>(false); }
+
+        let parent_view: String = meta.get::<String>(1).unwrap().unwrap();
+        let frame_seconds: i32 = meta.get::<i32>(2).unwrap().unwrap();
+        let scope_cols_raw: Vec<String> = meta.get::<Vec<String>>(3).unwrap().unwrap();
+        let scope_cols: Vec<String> = scope_cols_raw.iter().map(|s| format!("\"{}\"", s)).collect();
+
+        // 2. Fetch dirty buckets
+        let dirty = client.select(
+            "SELECT DISTINCT bucket_t, scope_values FROM aspiral.changelog WHERE base_view = $1",
+            None,
+            &[Some(view_name.into_datum()).into()]
+        ).unwrap();
+
+        if dirty.is_empty() { return Ok(true); }
+
+        info!("Aspiral: Performing incremental refresh for '{}' ({} dirty buckets)", view_name, dirty.len());
+
+        // 3. Construct the patch query
+        // We derive the SQL logic similarly to rollup.rs but scoped to the dirty buckets
+        let sql = rollup::derive_child_sql(view_name, &parent_view, frame_seconds, &scope_cols_raw);
+        
+        // Wrap the derived SQL in a patch mechanism
+        // For each dirty bucket, we re-run the aggregation and upsert
+        for row in dirty {
+            let bucket_t: i64 = row.get::<i64>(1).unwrap().unwrap();
+            let scope_vals: Vec<String> = row.get::<Vec<String>>(2).unwrap().unwrap();
+            
+            let mut where_clause = format!("WHERE aspiral(t) = {}", bucket_t);
+            for (i, col) in scope_cols.iter().enumerate() {
+                where_clause.push_str(&format!(" AND {} = '{}'", col, scope_vals[i].replace("'", "''")));
+            }
+
+            // Derive the single-bucket patch
+            let select_part = sql.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
+            
+            let delete_sql = format!("DELETE FROM {} {}", view_name, where_clause);
+            let insert_sql = format!("INSERT INTO {} SELECT {} FROM {} {} GROUP BY 1, {}", 
+                view_name, select_part, parent_view, where_clause, scope_cols.join(", "));
+            
+            unsafe {
+                let _ = Spi::run(&delete_sql);
+                let _ = Spi::run(&insert_sql);
+            }
+        }
+
+        // 4. Clear changelog for this view
+        let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", view_name.replace("'", "''")));
+
+        Ok::<bool, spi::Error>(true)
+    }).unwrap_or(false)
+}
+
 #[pg_extern]
 fn aspiral_create_partition(table_name: &str, cycle_seconds: i64, cycle_id: i64) {
     let start = cycle_id * cycle_seconds;
