@@ -328,6 +328,26 @@ mod tests {
         let val = Spi::get_one::<f64>("SELECT public.aspiral_read_main(999_999, 5, 50)").unwrap().unwrap();
         assert!(val >= 0.0 && val <= 100.0);
     }
+
+    #[pg_test]
+    fn test_walkthrough() {
+        // Run the walkthrough.sql script (ignoring DROP/CREATE EXTENSION)
+        let walkthrough = include_str!("../walkthrough.sql");
+        let lines: Vec<&str> = walkthrough.lines()
+            .filter(|line| !line.to_uppercase().contains("EXTENSION") && !line.to_uppercase().contains("SCHEMA"))
+            .collect();
+        let cleaned_sql = lines.join("\n");
+        
+        // Split by semicolon to run each statement individually
+        // Note: This is a simple splitter and might fail on complex SQL with semicolons in strings/blocks.
+        // But for walkthrough.sql it should be okay.
+        for statement in cleaned_sql.split(';') {
+            let stmt = statement.trim();
+            if !stmt.is_empty() {
+                Spi::run(stmt).expect(&format!("Failed to execute statement: {}", stmt));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
