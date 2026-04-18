@@ -148,28 +148,45 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                             let tasks_list: Vec<&str> = tasks.split(',').map(|t| t.trim()).collect();
                             let use_suffix = tasks_list.len() > 1 || tasks_list.contains(&"ohlc");
 
-                            for task in tasks_list {
-                                match task.to_lowercase().as_str() {
+                            for task_item in tasks_list {
+                                // Parse "task as alias"
+                                let mut parts = task_item.splitn(2, |c: char| c.is_whitespace());
+                                let task_type = parts.next().unwrap_or("").to_lowercase();
+                                
+                                // Look for "as" keyword
+                                let remainder = parts.next().unwrap_or("").trim();
+                                let custom_alias = if remainder.to_lowercase().starts_with("as ") {
+                                    Some(remainder[3..].trim().trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+                                } else {
+                                    None
+                                };
+
+                                match task_type.as_str() {
                                     "ohlc" => {
-                                        projections.push(format!("first({clean_col}, aspiral({time_col})) as {clean_col}_o"));
-                                        projections.push(format!("max({clean_col}) as {clean_col}_h"));
-                                        projections.push(format!("min({clean_col}) as {clean_col}_l"));
-                                        projections.push(format!("last({clean_col}, aspiral({time_col})) as {clean_col}_c"));
+                                        let prefix = custom_alias.unwrap_or(clean_col);
+                                        projections.push(format!("first({clean_col}, aspiral({time_col})) as {prefix}_o"));
+                                        projections.push(format!("max({clean_col}) as {prefix}_h"));
+                                        projections.push(format!("min({clean_col}) as {prefix}_l"));
+                                        projections.push(format!("last({clean_col}, aspiral({time_col})) as {prefix}_c"));
                                     },
                                     "stats" => {
-                                        let alias = if use_suffix { format!("{clean_col}_stats") } else { clean_col.to_string() };
+                                        let alias = custom_alias.map(|s| s.to_string())
+                                            .unwrap_or_else(|| if use_suffix { format!("{clean_col}_stats") } else { clean_col.to_string() });
                                         projections.push(format!("aspiral_stats({clean_col}) as {alias}"));
                                     },
                                     "sum" => {
-                                        let alias = if use_suffix { format!("{clean_col}_sum") } else { clean_col.to_string() };
+                                        let alias = custom_alias.map(|s| s.to_string())
+                                            .unwrap_or_else(|| if use_suffix { format!("{clean_col}_sum") } else { clean_col.to_string() });
                                         projections.push(format!("sum({clean_col}) as {alias}"));
                                     },
                                     "count" => {
-                                        let alias = if use_suffix { format!("{clean_col}_count") } else { clean_col.to_string() };
+                                        let alias = custom_alias.map(|s| s.to_string())
+                                            .unwrap_or_else(|| if use_suffix { format!("{clean_col}_count") } else { clean_col.to_string() });
                                         projections.push(format!("count(*) as {alias}"));
                                     },
                                     "sketch" => {
-                                        let alias = if use_suffix { format!("{clean_col}_sketch") } else { clean_col.to_string() };
+                                        let alias = custom_alias.map(|s| s.to_string())
+                                            .unwrap_or_else(|| if use_suffix { format!("{clean_col}_sketch") } else { clean_col.to_string() });
                                         projections.push(format!("aspiral_sketch({clean_col}) as {alias}"));
                                     },
                                     _ => {}

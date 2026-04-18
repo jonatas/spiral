@@ -15,15 +15,16 @@
   CREATE TABLE ticks (
       t timestamptz NOT NULL,
       symbol_id int NOT NULL,
-      price numeric(12,2), -- Aspiral: ohlc, stats
-      vol int              -- Aspiral: sum
+      price numeric(12,2), -- Aspiral: ohlc as p, stats as p_stats
+      vol int              -- Aspiral: sum as total_vol
   ) WITH (aspiral.frames='1m,5m,1h', aspiral.tenant='symbol_id');
   ```
   This automatically generates:
   - Materialized views for all frames (`_1m`, `_5m`, `_1h`).
-  - Optimized projections with **Intelligent Naming**:
-    - Single-formula columns keep their original name (e.g., `vol` remains `vol`).
-    - Multi-formula or multi-output columns (like `ohlc`) use descriptive suffixes (e.g., `price_o`, `price_stats`).
+  - Optimized projections with **Intelligent Naming** and **Custom Aliasing**:
+    - Use `as alias` in the comment to override the default naming.
+    - Multi-output columns like `ohlc as p` will use the alias as a prefix (`p_o`, `p_h`, etc.).
+    - Default names are preserved if no alias is provided and only one task exists.
   - Hierarchical rollup logic (merging 1m stats into 5m, etc.).
 
 - **Automated View Creation**: Using `WITH (aspiral.frames = '1m,5m,1h')` on a manual Materialized View also works for custom complex queries.
