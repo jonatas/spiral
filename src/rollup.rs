@@ -54,14 +54,19 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
                 format!("max({}) as {}", col, col)
             } else if col.ends_with("_min") || col == "l" {
                 format!("min({}) as {}", col, col)
-            } else if col.ends_with("_sum") || col == "volume" || col.ends_with("_count") {
+            } else if col.ends_with("_sum") || col == "volume" || col == "amount" || col.ends_with("_revenue") {
                 format!("sum({}) as {}", col, col)
+            } else if col.ends_with("_count") {
+                format!("sum({}) as {}", col, col) // sum of counts is total count
             } else if col.ends_with("_first") || col == "o" {
                 format!("first({}, aspiral(t)) as {}", col, col)
             } else if col.ends_with("_last") || col == "c" {
                 format!("last({}, aspiral(t)) as {}", col, col)
             } else if col.ends_with("_sketch") {
                 format!("aspiral_sketch_merge({}) as {}", col, col)
+            } else if col == "price" {
+                 // Special case for financial 'price' - usually we want OHLC
+                 continue; 
             } else {
                 format!("last({}, aspiral(t)) as {}", col, col)
             };
