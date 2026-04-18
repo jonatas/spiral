@@ -33,12 +33,17 @@ fn get_kickoff_epoch() -> i64 {
     1776211200 // 2026-04-15
 }
 
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(immutable, parallel_safe, name = "aspiral")]
 fn aspiral(t: TimestampWithTimeZone) -> i64 {
     let micros_since_pg_epoch = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
     let pg_epoch_unix: i64 = 946684800;
     let unix_seconds = pg_epoch_unix + (micros_since_pg_epoch / 1_000_000);
     unix_seconds - get_kickoff_epoch()
+}
+
+#[pg_extern(immutable, parallel_safe, name = "aspiral")]
+fn aspiral_i64(t: i64) -> i64 {
+    t
 }
 
 #[pg_extern(immutable, parallel_safe)]
@@ -271,10 +276,28 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimension_cols: 
         .collect::<Vec<String>>()
         .join(", ");
 
+    // Smart detection for time_col type to avoid AT TIME ZONE on bigints
+    let is_bigint = unsafe {
+        Spi::get_one_with_args::<bool>(
+            "SELECT atttypid = 'int8'::regtype OR atttypid = 'bigint'::regtype 
+             FROM pg_attribute WHERE attrelid = $1::regclass AND attname = $2",
+            &[
+                pgrx::datum::DatumWithOid::new(table_name.into_datum(), pg_sys::TEXTOID),
+                pgrx::datum::DatumWithOid::new(time_col.into_datum(), pg_sys::TEXTOID),
+            ]
+        ).unwrap_or(Some(false)).unwrap_or(false)
+    };
+
+    let time_expr = if is_bigint {
+        format!("\"{}\"", time_col)
+    } else {
+        format!("EXTRACT(EPOCH FROM (\"{time_col}\" AT TIME ZONE 'UTC'))::bigint")
+    };
+
     let query = format!(
         "CREATE INDEX \"{}\" ON \"{}\" (
             aspiral_zorder(
-                EXTRACT(EPOCH FROM (\"{time_col}\" AT TIME ZONE 'UTC'))::bigint, 
+                {time_expr}, 
                 ARRAY[{dimensions_joined}]::integer[]
             )
         )",
