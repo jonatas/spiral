@@ -15,9 +15,19 @@
 - **Mathematical Precision**: Special handling for averages. `avg(x)` is expanded into `sum(x)` and `count(x)` pairs to ensure precision during hierarchical aggregation.
 
 ### 3. Multi-Dimensional Clustering (Z-Order)
-- **Space-Filling Curves**: Implements Morton Encoding (Z-order curve) via `aspiral_zorder_3d(t, org_id, user_id)` to map 3D coordinates into a 1D linear space.
+- **Seamless Configuration**: Use the `WITH` clause during table or materialized view creation to automatically enable Z-order clustering.
+  ```sql
+  CREATE TABLE tenant_logs (
+      t timestamptz NOT NULL,
+      org_id int NOT NULL,
+      user_id int NOT NULL,
+      payload jsonb
+  ) WITH (
+      aspiral.tenant = 'org_id, user_id', -- Up to 3 dimensions
+      aspiral.time = 't'                 -- Optional, defaults to 't'
+  );
+  ```
 - **Fair Indexing**: Resolves the "Composite Index Trap" where an index on `(org_id, t)` is fast for specific Orgs but slow for global time-range queries. Z-order preserves spatial locality across all dimensions.
-- **Bit-Interleaving**: Uses a high-performance, loop-free bit-shuffling algorithm to interleave bits of time, tenant, and user IDs into a single `bigint` suitable for standard B-Tree indexing.
 
 ### 4. Metadata Catalog
 - **Tracking**: Internal `aspiral.metadata` table tracks the parent-child relationships and frame sizes.

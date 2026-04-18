@@ -258,6 +258,10 @@ fn aspiral_zorder(t: i64, ids: Vec<i32>) -> i64 {
 
 #[pg_extern(name = "aspiral_cluster_table")]
 fn aspiral_cluster_table(table_name: &str, time_col: &str, dimension_cols: Vec<String>) {
+    cluster_table_internal(table_name, time_col, dimension_cols);
+}
+
+pub fn cluster_table_internal(table_name: &str, time_col: &str, dimension_cols: Vec<String>) {
     let index_name = format!("idx_aspiral_z_{}", table_name.replace(".", "_"));
     
     // Construct the dimensions array part

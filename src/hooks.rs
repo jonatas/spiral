@@ -20,9 +20,12 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
 ) {
     let utility_stmt = (*pstmt).utilityStmt;
     let mut frames_opt: Option<String> = None;
-    let mut matview_name: Option<String> = None;
+    let mut tenant_opt: Option<String> = None;
+    let mut time_col_opt: Option<String> = Some("t".to_string());
+    let mut target_name: Option<String> = None;
     let mut scope_columns = Vec::new();
     let mut is_refresh = false;
+    let mut is_matview = false;
     
     if !utility_stmt.is_null() {
         let node_type = (*(utility_stmt as *mut pg_sys::Node)).type_;
@@ -30,11 +33,12 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
         if node_type == pg_sys::NodeTag::T_CreateTableAsStmt {
             let ctas = utility_stmt as *mut pg_sys::CreateTableAsStmt;
             if (*ctas).objtype == pg_sys::ObjectType::OBJECT_MATVIEW {
+                is_matview = true;
                 let into = (*ctas).into;
                 if !into.is_null() {
                     let rel = (*into).rel;
                     if !rel.is_null() {
-                        matview_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
+                        target_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
                     }
                     
                     // Extract base table and grouping columns from query
@@ -52,8 +56,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                     let base_name = CStr::from_ptr(base_relname).to_string_lossy().into_owned();
                                     info!("Aspiral identified base table: {} with scopes: {:?}", base_name, scope_columns);
                                     
-                                    if let Some(ref view_name) = matview_name {
-                                        // Only create triggers on regular tables. Materialized views don't support them.
+                                    if let Some(ref view_name) = target_name {
                                         let rel_kind = pg_sys::get_rel_relkind(relid);
                                         if rel_kind == pg_sys::RELKIND_RELATION as c_char {
                                             let trigger_sql = format!(
@@ -81,24 +84,67 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                 } else {
                                     CStr::from_ptr((*def_elem).defnamespace).to_string_lossy()
                                 };
-                                if defnamespace == "aspiral" && defname == "frames" {
+                                if defnamespace == "aspiral" {
                                     let arg = (*def_elem).arg as *mut pg_sys::Node;
                                     if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
-                                        let val = CStr::from_ptr((*(arg as *mut pg_sys::String)).sval).to_string_lossy();
-                                        frames_opt = Some(val.into_owned());
+                                        let val = CStr::from_ptr((*(arg as *mut pg_sys::String)).sval).to_string_lossy().into_owned();
+                                        match defname.as_ref() {
+                                            "frames" => frames_opt = Some(val),
+                                            "tenant" => tenant_opt = Some(val),
+                                            "time" => time_col_opt = Some(val),
+                                            _ => {}
+                                        }
                                     }
                                 }
                             }
                         }
+                        // Clear our custom options to avoid Postgres errors
                         (*into).options = std::ptr::null_mut();
                     }
                 }
+            }
+        } else if node_type == pg_sys::NodeTag::T_CreateStmt {
+            let stmt = utility_stmt as *mut pg_sys::CreateStmt;
+            let rel = (*stmt).relation;
+            if !rel.is_null() {
+                target_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
+            }
+            
+            let options = (*stmt).options;
+            if !options.is_null() {
+                let mut new_options = std::ptr::null_mut();
+                for i in 0..(*options).length {
+                    let def_elem = pg_sys::list_nth(options, i as i32) as *mut pg_sys::DefElem;
+                    if !def_elem.is_null() {
+                        let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
+                        let defnamespace = if (*def_elem).defnamespace.is_null() {
+                            std::borrow::Cow::Borrowed("")
+                        } else {
+                            CStr::from_ptr((*def_elem).defnamespace).to_string_lossy()
+                        };
+                        
+                        if defnamespace == "aspiral" {
+                            let arg = (*def_elem).arg as *mut pg_sys::Node;
+                            if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
+                                let val = CStr::from_ptr((*(arg as *mut pg_sys::String)).sval).to_string_lossy().into_owned();
+                                match defname.as_ref() {
+                                    "tenant" => tenant_opt = Some(val),
+                                    "time" => time_col_opt = Some(val),
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            new_options = pg_sys::lappend(new_options, def_elem as *mut std::ffi::c_void);
+                        }
+                    }
+                }
+                (*stmt).options = new_options;
             }
         } else if node_type == pg_sys::NodeTag::T_RefreshMatViewStmt {
             let rmv = utility_stmt as *mut pg_sys::RefreshMatViewStmt;
             let rel = (*rmv).relation;
             if !rel.is_null() {
-                matview_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
+                target_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
                 is_refresh = true;
             }
         }
@@ -112,13 +158,25 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     }
 
     // React
-    if let Some(name) = matview_name {
+    if let Some(name) = target_name {
         if is_refresh {
             reactive_refresh(&name);
-        } else if let Some(frames_str) = frames_opt {
-            // Register the base matview in metadata so children can find its scope
-            catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone());
-            generate_hierarchy(&name, &frames_str, scope_columns);
+        } else {
+            if let Some(tenant_str) = tenant_opt {
+                let dimensions: Vec<String> = tenant_str.split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+                let time_col = time_col_opt.unwrap_or_else(|| "t".to_string());
+                crate::cluster_table_internal(&name, &time_col, dimensions);
+            }
+            
+            if is_matview {
+                if let Some(frames_str) = frames_opt {
+                    // Register the base matview in metadata so children can find its scope
+                    catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone());
+                    generate_hierarchy(&name, &frames_str, scope_columns);
+                }
+            }
         }
     }
 }
