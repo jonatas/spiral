@@ -209,6 +209,30 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
     Ok(trigger.new())
 }
 
+fn split_by_3(a: u32) -> u64 {
+    let mut x = (a & 0x1fffff) as u64; // 21 bits
+    x = (x | x << 32) & 0x1f00000000ffff;
+    x = (x | x << 16) & 0x1f0000ff0000ff;
+    x = (x | x << 8)  & 0x100f00f00f00f00f;
+    x = (x | x << 4)  & 0x10c30c30c30c30c3;
+    x = (x | x << 2)  & 0x1249249249249249;
+    x
+}
+
+fn morton_encode_3d(x: u32, y: u32, z: u32) -> u64 {
+    split_by_3(x) | (split_by_3(y) << 1) | (split_by_3(z) << 2)
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_zorder_3d(t: i64, org_id: i32, user_id: i32) -> i64 {
+    // For time, we scale it down (e.g., to hours) so that 21 bits can cover ~239 years.
+    // This creates spatial locality for data within the same hour across tenants.
+    let t_scaled = (t / 3600) as u32; 
+    let morton = morton_encode_3d(t_scaled, org_id as u32, user_id as u32);
+    // Return as i64 (PG bigint) to be indexed via standard B-Tree
+    morton as i64
+}
+
 #[pg_extern]
 fn aspiral_create_partition(table_name: &str, cycle_seconds: i64, cycle_id: i64) {
     let start = cycle_id * cycle_seconds;

@@ -14,7 +14,12 @@
 - **Efficient Chaining**: Each view sources data from its immediate parent (e.g., `15m` views source from `5m` views), minimizing raw table scans.
 - **Mathematical Precision**: Special handling for averages. `avg(x)` is expanded into `sum(x)` and `count(x)` pairs to ensure precision during hierarchical aggregation.
 
-### 3. Metadata Catalog
+### 3. Multi-Dimensional Clustering (Z-Order)
+- **Space-Filling Curves**: Implements Morton Encoding (Z-order curve) via `aspiral_zorder_3d(t, org_id, user_id)` to map 3D coordinates into a 1D linear space.
+- **Fair Indexing**: Resolves the "Composite Index Trap" where an index on `(org_id, t)` is fast for specific Orgs but slow for global time-range queries. Z-order preserves spatial locality across all dimensions.
+- **Bit-Interleaving**: Uses a high-performance, loop-free bit-shuffling algorithm to interleave bits of time, tenant, and user IDs into a single `bigint` suitable for standard B-Tree indexing.
+
+### 4. Metadata Catalog
 - **Tracking**: Internal `aspiral.metadata` table tracks the parent-child relationships and frame sizes.
 - **Schema Isolation**: All metadata resides in the `aspiral` schema.
 
@@ -52,31 +57,24 @@ GROUP BY 1, 2;
 ```
 
 ### 2. See it in Action
-Running `walkthrough.sql` demonstrates the core capabilities:
+Running `walkthrough.sql` demonstrates the core capabilities.
 
-**Realistic Data Ingestion:**
-```text
-psql:walkthrough.sql:36: INFO:  Aspiral identified 120 dirty buckets for 'asset_ohlcv_1m'
-psql:walkthrough.sql:36: INFO:  Aspiral cascading refresh to 'asset_ohlcv_5m' due to dirty buckets
-psql:walkthrough.sql:36: INFO:  Aspiral cascading full refresh to 'asset_ohlcv_1h'
-```
+### 3. Z-Order vs. Composite Index (Performance)
+In multi-tenant systems, traditional composite indexes like `(tenant_id, time)` create a "data silo" problem: queries across all tenants for a specific time window are extremely slow because data is physically scattered.
 
-**OHLC Candlesticks (5m):**
-```text
-           t            | symbol |    o     |    h     |    l     |    c     | volume 
-------------------------+--------+----------+----------+----------+----------+--------
- 2026-04-14 21:00:00-03 | BTC    | 60002.52 | 60554.35 | 60002.52 | 60166.95 |    313
- 2026-04-14 21:05:00-03 | BTC    | 60156.88 | 60156.88 | 59538.11 | 59881.93 |    347
- ...
-```
+**Benchmark Scenario:**
+- 100,000 rows across 100 Organizations.
+- Query: "Select 1 hour of data across ALL organizations."
 
-**Hierarchical Percentiles (1h):**
-Using T-Digest sketches, we calculate precise quantiles across aggregated windows:
-```text
- symbol |  median  |   p95    |   p99    
---------+----------+----------+----------
- BTC    | 60073.32 | 60540.48 | 60582.94
-```
+| Index Type | Strategy | Buffers (8KB Pages) | Time |
+| :--- | :--- | :--- | :--- |
+| **Composite** `(org, t)` | Seq Scan (Index ignored) | 637 | 4.63 ms |
+| **Z-Order** `(t, org, u)` | **Index Scan** | 575 | **0.34 ms** |
+
+**Why it matters:**
+The Z-Order index achieves **~13x speedup** by weaving the bits of time and organization together. This ensures that even if you don't filter by a specific organization, the time-proximate data across all organizations remains physically clustered on disk.
+
+### 4. Hierarchical Percentiles (1h)
 
 **Reactive Backfills:**
 When you update historical data, Aspiral flags the specific "dirty buckets" and only refreshes what is necessary during the next cycle:
