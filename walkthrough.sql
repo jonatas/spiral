@@ -21,39 +21,52 @@ SELECT
 FROM asset_ticks 
 GROUP BY 1, 2;
 
--- 3. Ingest Data (3 historical rows, 1 "now" row)
-INSERT INTO asset_ticks VALUES 
-  ('2026-04-15 00:00:10Z', 'BTC', 60000.0, 1),
-  ('2026-04-15 00:01:10Z', 'BTC', 61000.0, 2),
-  ('2026-04-15 00:02:10Z', 'BTC', 62000.0, 1),
-  (now(), 'BTC', 65000.0, 10);
+-- 3. Ingest Realistic Data (2 hours of 10s ticks)
+SELECT '--- Ingesting 2 hours of BTC price data ---' as msg;
+INSERT INTO asset_ticks (t, symbol, price, vol) 
+SELECT 
+    '2026-04-15 00:00:00Z'::timestamptz + (i * interval '10 seconds'),
+    'BTC',
+    60000 + (sin(i::float/10) * 500) + (random() * 100), -- Oscillating price with noise
+    (random() * 20)::int + 1
+FROM generate_series(0, 719) s(i);
 
 -- 4. Reactive Refresh (Cascading)
 SELECT '--- Triggering Cascading Refresh ---' as msg;
 REFRESH MATERIALIZED VIEW asset_ohlcv_1m;
 
--- 5. Verify Closed-Frame Logic
--- h should be 62000 (The 65000 'now' bucket is still open and thus excluded)
-SELECT '--- 5m Max (Excludes Open Buckets) ---' as msg;
-SELECT t, symbol, h FROM asset_ohlcv_5m;
+-- 5. Verify OHLC Logic (5m frames)
+SELECT '--- BTC OHLC (First 5 periods of 5m) ---' as msg;
+SELECT t, symbol, round(o::numeric, 2) as o, round(h::numeric, 2) as h, round(l::numeric, 2) as l, round(c::numeric, 2) as c, volume 
+FROM asset_ohlcv_5m 
+ORDER BY t ASC LIMIT 5;
 
--- 6. Precise Hierarchical Percentiles
-SELECT '--- 1h p95 (From Merged T-Digest) ---' as msg;
-SELECT symbol, aspiral_quantile(price_sketch, 0.95) as p95 FROM asset_ohlcv_1h;
+-- 6. Precise Hierarchical Percentiles (1h frames)
+-- We calculate the p95 price for the entire hour from the T-Digest sketch.
+SELECT '--- BTC 1h Statistics (from Sketches) ---' as msg;
+SELECT 
+    symbol, 
+    round(aspiral_quantile(price_sketch, 0.5)::numeric, 2) as median,
+    round(aspiral_quantile(price_sketch, 0.95)::numeric, 2) as p95,
+    round(aspiral_quantile(price_sketch, 0.99)::numeric, 2) as p99
+FROM asset_ohlcv_1h;
 
--- 7. Surgical Backfill
-SELECT '--- Performing Backfill and Checking Changelog ---' as msg;
-UPDATE asset_ticks SET price = 99999.9 WHERE t = '2026-04-15 00:00:10Z' AND symbol = 'BTC';
+-- 7. Surgical Backfill & Reactivity
+SELECT '--- Simulating a data correction (backfill) ---' as msg;
+-- We find a specific bucket and "break" the high price
+UPDATE asset_ticks SET price = 85000.0 WHERE t = '2026-04-15 00:05:00Z' AND symbol = 'BTC';
 
--- Show the specific scope-bucket flagged as dirty
-SELECT * FROM aspiral.changelog;
+-- Show that Aspiral tracked exactly which bucket needs updating
+SELECT '--- Aspiral Changelog (Dirty Buckets) ---' as msg;
+SELECT base_view, to_timestamptz(bucket_t) as bucket_t, scope_values FROM aspiral.changelog;
 
--- Sync the backfill
+-- Sync the backfill (Cascades automatically)
 REFRESH MATERIALIZED VIEW asset_ohlcv_1m;
 
--- Verify the 1h max reflects the backfill
-SELECT h as max_after_backfill FROM asset_ohlcv_1h;
+-- Verify the 5m and 1h views reflect the new high price
+SELECT '--- Verification: 1h Max after backfill ---' as msg;
+SELECT round(h::numeric, 2) as h_max_after_backfill FROM asset_ohlcv_1h;
 
 -- 8. Planner Optimization Log
-SELECT '--- Triggering Planner Routing Hook ---' as msg;
-SELECT sum(h) FROM asset_ohlcv_1m WHERE t > '2026-04-15 00:00:00Z' AND t < '2026-04-16 00:00:00Z';
+SELECT '--- Planner Optimization ---' as msg;
+EXPLAIN (COSTS OFF) SELECT sum(h) FROM asset_ohlcv_1m WHERE t > '2026-04-15 00:00:00Z' AND t < '2026-04-15 01:00:00Z';

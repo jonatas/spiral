@@ -29,30 +29,63 @@
 ### 6. Dynamic SQL Parser
 - **Smart Derivation**: Dynamic derivation of child SQL based on parent view column definitions, correctly resolving aggregations (e.g. `first`, `last`, `max`, `min`, `sum`, `aspiral_sketch_merge`).
 
-## How It Works (OHLCV Example)
+## Quick Start & Walkthrough
+
+Aspiral handles the entire lifecycle of time-series data: from raw ingestion to hierarchical rollups and reactive backfills.
+
+### 1. Ingest & Rollup
+Define a base table and an intelligent hierarchy in one command:
 
 ```sql
-SET aspiral.kickoff_date = '2026-04-15';
-
 CREATE TABLE asset_ticks (t timestamptz NOT NULL, symbol text NOT NULL, price double precision, vol int);
 
--- Create base 1m view
--- Aspiral will automatically expand this to include child views for 5m and 1h
+-- Create base 1m view with 5m and 1h children
 CREATE MATERIALIZED VIEW asset_ohlcv_1m WITH (aspiral.frames='5m,1h') AS 
 SELECT 
     to_timestamptz((aspiral(t)/60)*60) as t, 
     symbol,
-    first(price, aspiral(t)) as o, 
-    max(price) as h, 
-    min(price) as l, 
-    last(price, aspiral(t)) as c,
+    first(price, aspiral(t)) as o, max(price) as h, min(price) as l, last(price, aspiral(t)) as c,
     sum(vol) as volume,
     aspiral_sketch(price) as price_sketch 
 FROM asset_ticks 
 GROUP BY 1, 2;
-
--- Cascading refresh
-REFRESH MATERIALIZED VIEW asset_ohlcv_1m;
--- LOG: Aspiral cascading refresh to 'asset_ohlcv_1m_5m'
--- LOG: Aspiral cascading refresh to 'asset_ohlcv_1m_1h'
 ```
+
+### 2. See it in Action
+Running `walkthrough.sql` demonstrates the core capabilities:
+
+**Realistic Data Ingestion:**
+```text
+psql:walkthrough.sql:36: INFO:  Aspiral identified 120 dirty buckets for 'asset_ohlcv_1m'
+psql:walkthrough.sql:36: INFO:  Aspiral cascading refresh to 'asset_ohlcv_5m' due to dirty buckets
+psql:walkthrough.sql:36: INFO:  Aspiral cascading full refresh to 'asset_ohlcv_1h'
+```
+
+**OHLC Candlesticks (5m):**
+```text
+           t            | symbol |    o     |    h     |    l     |    c     | volume 
+------------------------+--------+----------+----------+----------+----------+--------
+ 2026-04-14 21:00:00-03 | BTC    | 60002.52 | 60554.35 | 60002.52 | 60166.95 |    313
+ 2026-04-14 21:05:00-03 | BTC    | 60156.88 | 60156.88 | 59538.11 | 59881.93 |    347
+ ...
+```
+
+**Hierarchical Percentiles (1h):**
+Using T-Digest sketches, we calculate precise quantiles across aggregated windows:
+```text
+ symbol |  median  |   p95    |   p99    
+--------+----------+----------+----------
+ BTC    | 60073.32 | 60540.48 | 60582.94
+```
+
+**Reactive Backfills:**
+When you update historical data, Aspiral flags the specific "dirty buckets" and only refreshes what is necessary during the next cycle:
+```text
+   base_view    |        bucket_t        |   scope_values    
+----------------+------------------------+-------------------
+ asset_ohlcv_1m | 2026-04-14 21:05:00-03 | {"symbol": "BTC"}
+```
+
+## Architecture
+
+Aspiral is built for **Mathematical Addressing**. By mapping `(time, tenant_id)` to a predictable byte offset, it aims to achieve $O(1)$ read performance for time-series "lanes", bypassing traditional B-Tree index bloat.
