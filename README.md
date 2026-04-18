@@ -80,9 +80,11 @@ Aspiral tracks "dirty buckets" in a transactional changelog.
 
 ## 📖 Quick Start
 
+Running `short-walkthrough.sql` provides a complete, hands-on demonstration of the zero-config lifecycle.
+
 ```sql
 CREATE EXTENSION aspiral;
-
+...
 -- Set your "Day Zero"
 SET aspiral.kickoff_date = '2026-04-15';
 

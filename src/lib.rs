@@ -245,17 +245,27 @@ fn split_by_4(a: u32) -> u64 {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn aspiral_zorder(t: i64, ids: Vec<i32>) -> i64 {
+fn aspiral_zorder(t: i64, ids: Vec<String>) -> i64 {
     let t_scaled = (t / 3600) as u32;
-    let res: u64 = match ids.len() {
-        1 => split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1),
-        2 => split_by_3(t_scaled) | (split_by_3(ids[0] as u32) << 1) | (split_by_3(ids[1] as u32) << 2),
-        3 => split_by_4(t_scaled) | (split_by_4(ids[0] as u32) << 1) | (split_by_4(ids[1] as u32) << 2) | (split_by_4(ids[2] as u32) << 3),
+    
+    // Hash text IDs into u32 for bit interleaving
+    let hashed_ids: Vec<u32> = ids.iter().map(|s| {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish() as u32
+    }).collect();
+
+    let res: u64 = match hashed_ids.len() {
+        1 => split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1),
+        2 => split_by_3(t_scaled) | (split_by_3(hashed_ids[0]) << 1) | (split_by_3(hashed_ids[1]) << 2),
+        3 => split_by_4(t_scaled) | (split_by_4(hashed_ids[0]) << 1) | (split_by_4(hashed_ids[1]) << 2) | (split_by_4(hashed_ids[2]) << 3),
         _ => {
-            if ids.is_empty() {
+            if hashed_ids.is_empty() {
                 t as u64
             } else {
-                split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1)
+                split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1)
             }
         }
     };
@@ -298,7 +308,7 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimension_cols: 
         "CREATE INDEX \"{}\" ON \"{}\" (
             aspiral_zorder(
                 {time_expr}, 
-                ARRAY[{dimensions_joined}]::integer[]
+                ARRAY[{dimensions_joined}]::text[]
             )
         )",
         index_name, table_name
