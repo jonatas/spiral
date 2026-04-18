@@ -64,6 +64,8 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
                 format!("last({}, aspiral(t)) as {}", col, col)
             } else if col.ends_with("_sketch") {
                 format!("aspiral_sketch_merge({}) as {}", col, col)
+            } else if col.ends_with("_stats") {
+                format!("aspiral_stats_merge({}) as {}", col, col)
             } else if col == "price" {
                  // Special case for financial 'price' - usually we want OHLC
                  continue; 

@@ -9,6 +9,7 @@ mod catalog;
 mod rollup;
 mod tam;
 mod storage;
+mod stats;
 
 ::pgrx::pg_module_magic!(name, version);
 
