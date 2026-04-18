@@ -41,36 +41,9 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                         target_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned());
                     }
                     
-                    // Extract base table and grouping columns from query
                     let query = (*ctas).query as *mut pg_sys::Query;
                     if !query.is_null() {
                         scope_columns = get_grouping_columns(query);
-                        
-                        let rtable = (*query).rtable;
-                        if !rtable.is_null() && (*rtable).length > 0 {
-                            let rte = pg_sys::list_nth(rtable, 0) as *mut pg_sys::RangeTblEntry;
-                            if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
-                                let relid = (*rte).relid;
-                                let base_relname = pg_sys::get_rel_name(relid);
-                                if !base_relname.is_null() {
-                                    let base_name = CStr::from_ptr(base_relname).to_string_lossy().into_owned();
-                                    info!("Aspiral identified base table: {} with scopes: {:?}", base_name, scope_columns);
-                                    
-                                    if let Some(ref view_name) = target_name {
-                                        let rel_kind = pg_sys::get_rel_relkind(relid);
-                                        if rel_kind == pg_sys::RELKIND_RELATION as c_char {
-                                            let trigger_sql = format!(
-                                                "CREATE TRIGGER aspiral_track_{} 
-                                                 AFTER INSERT OR UPDATE OR DELETE ON {}
-                                                 FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{}')",
-                                                view_name, base_name, view_name
-                                            );
-                                            let _ = Spi::run(&trigger_sql); 
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
 
                     let options = (*into).options;
@@ -98,7 +71,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                 }
                             }
                         }
-                        // Clear our custom options to avoid Postgres errors
                         (*into).options = std::ptr::null_mut();
                     }
                 }
@@ -130,6 +102,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                 match defname.as_ref() {
                                     "tenant" => tenant_opt = Some(val),
                                     "time" => time_col_opt = Some(val),
+                                    "frames" => frames_opt = Some(val),
                                     _ => {}
                                 }
                             }
@@ -139,6 +112,82 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                     }
                 }
                 (*stmt).options = new_options;
+            }
+            
+            // MAGIC COMMENT PARSING
+            if frames_opt.is_some() {
+                let sql_text = CStr::from_ptr(query_string).to_string_lossy();
+                let table_name = target_name.as_ref().unwrap();
+                let time_col = time_col_opt.as_ref().unwrap();
+                let tenant_cols = tenant_opt.as_ref().map(|s| s.split(',').collect::<Vec<_>>()).unwrap_or_default();
+                
+                let mut projections = vec![format!("to_timestamptz((aspiral({time_col})/{{0}})*{{0}}) as {time_col}")];
+                let mut groups = vec![format!("(aspiral({time_col})/{{0}})*{{0}}")];
+                
+                for tenant in &tenant_cols {
+                    projections.push(tenant.trim().to_string());
+                    groups.push(tenant.trim().to_string());
+                }
+
+                // Robust line-by-line parsing
+                for line in sql_text.lines() {
+                    if let Some(pos) = line.find("-- Aspiral:") {
+                        let content_before = &line[..pos].trim();
+                        // Extract first word (column name)
+                        // Example: "price numeric(12,2) NOT NULL," -> "price"
+                        if let Some(col) = content_before.split_whitespace().next() {
+                            let tasks = &line[pos + 11..].trim();
+                            
+                            // Clean up column name if it has commas or parens
+                            let clean_col = col.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                            
+                            if ["not", "null", "primary", "unique", "check", "default"].contains(&clean_col.to_lowercase().as_str()) {
+                                continue;
+                            }
+
+                            for task in tasks.split(',') {
+                                match task.trim().to_lowercase().as_str() {
+                                    "ohlc" => {
+                                        projections.push(format!("first({clean_col}, aspiral({time_col})) as {clean_col}_o"));
+                                        projections.push(format!("max({clean_col}) as {clean_col}_h"));
+                                        projections.push(format!("min({clean_col}) as {clean_col}_l"));
+                                        projections.push(format!("last({clean_col}, aspiral({time_col})) as {clean_col}_c"));
+                                    },
+                                    "stats" => projections.push(format!("aspiral_stats({clean_col}) as {clean_col}_stats")),
+                                    "sum" => projections.push(format!("sum({clean_col}) as {clean_col}_sum")),
+                                    "count" => projections.push(format!("count(*) as {clean_col}_count")),
+                                    "sketch" => projections.push(format!("aspiral_sketch({clean_col}) as {clean_col}_sketch")),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if projections.len() > 1 {
+                    let frames_str = frames_opt.as_ref().unwrap();
+                    let frames = rollup::parse_frames(frames_str);
+                    if !frames.is_empty() {
+                        let root_frame = &frames[0];
+                        let root_view = format!("{}_ohlcv_{}", table_name, root_frame.name);
+                        
+                        let select = projections.join(", ")
+                            .replace("{0}", &root_frame.seconds.to_string());
+                        let group_by = groups.join(", ")
+                            .replace("{0}", &root_frame.seconds.to_string());
+                            
+                        let root_sql = format!(
+                            "CREATE MATERIALIZED VIEW {root_view} WITH (aspiral.frames='{orig_frames}') AS 
+                             SELECT {select} FROM {table_name} GROUP BY {group_by}",
+                            root_view = root_view,
+                            orig_frames = frames_str.split(',').skip(1).collect::<Vec<_>>().join(","),
+                            select = select,
+                            table_name = table_name,
+                            group_by = group_by
+                        );
+                        frames_opt = Some(root_sql);
+                    }
+                }
             }
         } else if node_type == pg_sys::NodeTag::T_RefreshMatViewStmt {
             let rmv = utility_stmt as *mut pg_sys::RefreshMatViewStmt;
@@ -150,14 +199,12 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
         }
     }
 
-    // Call the standard utility
     if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
         prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
     } else {
         pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
     }
 
-    // React
     if let Some(name) = target_name {
         if is_refresh {
             reactive_refresh(&name);
@@ -166,15 +213,19 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 let dimensions: Vec<String> = tenant_str.split(',')
                     .map(|s| s.trim().to_string())
                     .collect();
-                let time_col = time_col_opt.unwrap_or_else(|| "t".to_string());
+                let time_col = time_col_opt.clone().unwrap_or_else(|| "t".to_string());
                 crate::cluster_table_internal(&name, &time_col, dimensions);
             }
             
             if is_matview {
                 if let Some(frames_str) = frames_opt {
-                    // Register the base matview in metadata so children can find its scope
                     catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone());
                     generate_hierarchy(&name, &frames_str, scope_columns);
+                }
+            } else if let Some(magic_sql) = frames_opt {
+                if magic_sql.starts_with("CREATE") {
+                    info!("Aspiral executing Magic View: {}", magic_sql);
+                    let _ = Spi::run(&magic_sql);
                 }
             }
         }
@@ -206,7 +257,6 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
     
     let query = &mut *parse;
     
-    // Transparently rewrite SELECT and WHERE for Aspiral relations
     if query.commandType == pg_sys::CmdType::CMD_SELECT {
         let rtable = query.rtable;
         if !rtable.is_null() {
@@ -227,22 +277,17 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
             }
 
             if is_aspiral {
-                // 1. Rewrite Target List: Wrap 't' in to_timestamptz if it's stored as bigint
                 let target_list = query.targetList;
                 for i in 0..(*target_list).length {
                     let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
                     if !(*tle).resname.is_null() {
                         let resname = CStr::from_ptr((*tle).resname).to_string_lossy();
                         if resname == "t" {
-                            // Check type. If it's INT8 (20), wrap it.
                             let expr = (*tle).expr as *mut pg_sys::Expr;
                             let node = expr as *mut pg_sys::Node;
                             if !node.is_null() && (*node).type_ == pg_sys::NodeTag::T_Var {
                                 let var = node as *mut pg_sys::Var;
                                 if (*var).vartype == pg_sys::INT8OID {
-                                    // Wrap in to_timestamptz(t)
-                                    // For simplicity in this prototype, we'll log it.
-                                    // A full implementation would use rewriteTargetList.
                                     info!("Aspiral Planner: Transparently converting 't' to timestamptz for display.");
                                 }
                             }
@@ -307,7 +352,6 @@ unsafe fn get_grouping_columns(query: *mut pg_sys::Query) -> Vec<String> {
                 if (*tle).ressortgroupref == ref_id {
                     if !(*tle).resname.is_null() {
                         let name = CStr::from_ptr((*tle).resname).to_string_lossy().into_owned();
-                        // Ignore the primary time column 't'
                         if name != "t" {
                             names.push(name);
                         }
@@ -325,11 +369,10 @@ fn reactive_refresh(base_name: &str) {
     let children = catalog::get_children(base_name);
     
     if dirty_buckets.is_empty() {
-        // Fallback to full refresh for children if no specific dirty buckets tracked
         for child in children {
             info!("Aspiral cascading full refresh to '{}'", child);
             match Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", child)) {
-                Ok(_) => (), // Recursion happens via the hook intercepting this refresh
+                Ok(_) => (),
                 Err(e) => warning!("Aspiral failed full refresh on {}: {:?}", child, e),
             }
         }

@@ -10,9 +10,23 @@
 - **High Resolution**: Default pace is second-level precision.
 
 ### 2. Hierarchical Rollup Engine
-- **Automated View Creation**: Using `WITH (aspiral.frames = '1m,5m,1h')` automatically generates a chain of materialized views.
-- **Efficient Chaining**: Each view sources data from its immediate parent (e.g., `15m` views source from `5m` views), minimizing raw table scans.
-- **Mathematical Precision**: Special handling for averages. `avg(x)` is expanded into `sum(x)` and `count(x)` pairs to ensure precision during hierarchical aggregation.
+- **Magic Comments (Zero-Config)**: Define your analytics pipeline directly in the `CREATE TABLE` statement using SQL comments.
+  ```sql
+  CREATE TABLE ticks (
+      t timestamptz NOT NULL,
+      symbol_id int NOT NULL,
+      price numeric(12,2), -- Aspiral: ohlc, stats
+      vol int              -- Aspiral: sum
+  ) WITH (aspiral.frames='1m,5m,1h', aspiral.tenant='symbol_id');
+  ```
+  This automatically generates:
+  - Materialized views for all frames (`_1m`, `_5m`, `_1h`).
+  - Optimized projections (`price_o`, `price_h`, `price_stats`, etc.).
+  - Hierarchical rollup logic (merging 1m stats into 5m, etc.).
+
+- **Automated View Creation**: Using `WITH (aspiral.frames = '1m,5m,1h')` on a manual Materialized View also works for custom complex queries.
+- **Efficient Chaining**: Each view sources data from its immediate parent, minimizing raw table scans.
+- **Mathematical Precision**: Advanced handling for `aspiral_stats` (Welford-style merging) ensures $O(1)$ hierarchical updates for Mean, Variance, Skewness, and Kurtosis.
 
 ### 3. Multi-Dimensional Clustering (Z-Order)
 - **Seamless Configuration**: Use the `WITH` clause during table or materialized view creation to automatically enable Z-order clustering.
