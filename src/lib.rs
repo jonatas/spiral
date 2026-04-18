@@ -209,6 +209,16 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
     Ok(trigger.new())
 }
 
+fn split_by_2(a: u32) -> u64 {
+    let mut x = a as u64;
+    x = (x | x << 16) & 0x0000ffff0000ffff;
+    x = (x | x << 8)  & 0x00ff00ff00ff00ff;
+    x = (x | x << 4)  & 0x0f0f0f0f0f0f0f0f;
+    x = (x | x << 2)  & 0x3333333333333333;
+    x = (x | x << 1)  & 0x5555555555555555;
+    x
+}
+
 fn split_by_3(a: u32) -> u64 {
     let mut x = (a & 0x1fffff) as u64; // 21 bits
     x = (x | x << 32) & 0x1f00000000ffff;
@@ -219,18 +229,37 @@ fn split_by_3(a: u32) -> u64 {
     x
 }
 
-fn morton_encode_3d(x: u32, y: u32, z: u32) -> u64 {
-    split_by_3(x) | (split_by_3(y) << 1) | (split_by_3(z) << 2)
+fn split_by_4(a: u32) -> u64 {
+    let mut x = (a & 0xffff) as u64; // 16 bits
+    x = (x | x << 24) & 0x0000ff00000000ff;
+    x = (x | x << 12) & 0x000f000f000f000f;
+    x = (x | x << 6)  & 0x0303030303030303;
+    x = (x | x << 3)  & 0x1111111111111111;
+    x
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_zorder(t: i64, ids: Vec<i32>) -> i64 {
+    let t_scaled = (t / 3600) as u32;
+    let res: u64 = match ids.len() {
+        1 => split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1),
+        2 => split_by_3(t_scaled) | (split_by_3(ids[0] as u32) << 1) | (split_by_3(ids[1] as u32) << 2),
+        3 => split_by_4(t_scaled) | (split_by_4(ids[0] as u32) << 1) | (split_by_4(ids[1] as u32) << 2) | (split_by_4(ids[2] as u32) << 3),
+        _ => {
+            if ids.is_empty() {
+                t as u64
+            } else {
+                split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1)
+            }
+        }
+    };
+    res as i64
 }
 
 #[pg_extern(immutable, parallel_safe)]
 fn aspiral_zorder_3d(t: i64, org_id: i32, user_id: i32) -> i64 {
-    // For time, we scale it down (e.g., to hours) so that 21 bits can cover ~239 years.
-    // This creates spatial locality for data within the same hour across tenants.
-    let t_scaled = (t / 3600) as u32; 
-    let morton = morton_encode_3d(t_scaled, org_id as u32, user_id as u32);
-    // Return as i64 (PG bigint) to be indexed via standard B-Tree
-    morton as i64
+    // Legacy support for the 3D version
+    aspiral_zorder(t, vec![org_id, user_id])
 }
 
 #[pg_extern]
