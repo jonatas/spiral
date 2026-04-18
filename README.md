@@ -21,7 +21,9 @@
   ```
   This automatically generates:
   - Materialized views for all frames (`_1m`, `_5m`, `_1h`).
-  - Optimized projections (`price_o`, `price_h`, `price_stats`, etc.).
+  - Optimized projections with **Intelligent Naming**:
+    - Single-formula columns keep their original name (e.g., `vol` remains `vol`).
+    - Multi-formula or multi-output columns (like `ohlc`) use descriptive suffixes (e.g., `price_o`, `price_stats`).
   - Hierarchical rollup logic (merging 1m stats into 5m, etc.).
 
 - **Automated View Creation**: Using `WITH (aspiral.frames = '1m,5m,1h')` on a manual Materialized View also works for custom complex queries.

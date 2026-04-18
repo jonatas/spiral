@@ -145,18 +145,33 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                 continue;
                             }
 
-                            for task in tasks.split(',') {
-                                match task.trim().to_lowercase().as_str() {
+                            let tasks_list: Vec<&str> = tasks.split(',').map(|t| t.trim()).collect();
+                            let use_suffix = tasks_list.len() > 1 || tasks_list.contains(&"ohlc");
+
+                            for task in tasks_list {
+                                match task.to_lowercase().as_str() {
                                     "ohlc" => {
                                         projections.push(format!("first({clean_col}, aspiral({time_col})) as {clean_col}_o"));
                                         projections.push(format!("max({clean_col}) as {clean_col}_h"));
                                         projections.push(format!("min({clean_col}) as {clean_col}_l"));
                                         projections.push(format!("last({clean_col}, aspiral({time_col})) as {clean_col}_c"));
                                     },
-                                    "stats" => projections.push(format!("aspiral_stats({clean_col}) as {clean_col}_stats")),
-                                    "sum" => projections.push(format!("sum({clean_col}) as {clean_col}_sum")),
-                                    "count" => projections.push(format!("count(*) as {clean_col}_count")),
-                                    "sketch" => projections.push(format!("aspiral_sketch({clean_col}) as {clean_col}_sketch")),
+                                    "stats" => {
+                                        let alias = if use_suffix { format!("{clean_col}_stats") } else { clean_col.to_string() };
+                                        projections.push(format!("aspiral_stats({clean_col}) as {alias}"));
+                                    },
+                                    "sum" => {
+                                        let alias = if use_suffix { format!("{clean_col}_sum") } else { clean_col.to_string() };
+                                        projections.push(format!("sum({clean_col}) as {alias}"));
+                                    },
+                                    "count" => {
+                                        let alias = if use_suffix { format!("{clean_col}_count") } else { clean_col.to_string() };
+                                        projections.push(format!("count(*) as {alias}"));
+                                    },
+                                    "sketch" => {
+                                        let alias = if use_suffix { format!("{clean_col}_sketch") } else { clean_col.to_string() };
+                                        projections.push(format!("aspiral_sketch({clean_col}) as {alias}"));
+                                    },
                                     _ => {}
                                 }
                             }
