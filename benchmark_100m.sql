@@ -41,12 +41,12 @@ CREATE AGGREGATE last_pg(double precision, timestamptz) (sfunc = last_pg_sfunc, 
 -- density: 1000 ticks/sec
 DO $$
 DECLARE
-    rows int := 10000000; -- 10M
+    rows int := 10000000; -- 10M (Adjust to 100M if hardware allows)
     start_time timestamptz;
     dur_base interval;
     dur_aspi interval;
 BEGIN
-    RAISE NOTICE '--- Starting 100M Row Ingestion (Baseline) ---';
+    RAISE NOTICE '--- Starting 10M Row Ingestion (Baseline) ---';
     start_time := clock_timestamp();
     INSERT INTO baseline_ticks (t, symbol_id, price, vol) 
     SELECT 
@@ -56,10 +56,9 @@ BEGIN
         (random()*100)::int
     FROM generate_series(0, rows-1) i;
     dur_base := clock_timestamp() - start_time;
-    RAISE NOTICE 'Baseline 100M Ingest: % (% rows/s)', dur_base, round(rows / extract(epoch from dur_base));
+    RAISE NOTICE 'Baseline 10M Ingest: % (% rows/s)', dur_base, round(rows / extract(epoch from dur_base));
 
-    RAISE NOTICE '--- Starting 100M Row Ingestion (Aspiral - Bulk) ---';
-    -- Trigger is NOT yet created (no views)
+    RAISE NOTICE '--- Starting 10M Row Ingestion (Aspiral - Bulk) ---';
     start_time := clock_timestamp();
     INSERT INTO aspiral_ticks (t, symbol_id, price, vol) 
     SELECT 
@@ -69,22 +68,25 @@ BEGIN
         (random()*100)::int
     FROM generate_series(0, rows-1) i;
     dur_aspi := clock_timestamp() - start_time;
-    RAISE NOTICE 'Aspiral 100M Ingest:  % (% rows/s)', dur_aspi, round(rows / extract(epoch from dur_aspi));
+    RAISE NOTICE 'Aspiral 10M Ingest:  % (% rows/s)', dur_aspi, round(rows / extract(epoch from dur_aspi));
 END $$;
 
 -- 5. INDEXING
-RAISE NOTICE '--- Creating Indexes ---';
-CREATE INDEX idx_baseline_ticks_t_symbol ON baseline_ticks (t, symbol_id);
-CREATE INDEX idx_aspiral_ticks_t_symbol ON aspiral_ticks (t, symbol_id);
+\echo '--- Creating Indexes ---'
+-- Optimized index for symbol-based filtering and grouping
+CREATE INDEX idx_baseline_ticks_symbol_t ON baseline_ticks (symbol_id, t);
+CREATE INDEX idx_aspiral_ticks_symbol_t ON aspiral_ticks (symbol_id, t);
+-- Expression index to speed up the initial rollup aggregation
+CREATE INDEX idx_aspiral_ticks_aspiral_t ON aspiral_ticks (symbol_id, aspiral(t));
 
 -- 6. VIEW CREATION (Initial Aggregation)
-RAISE NOTICE '--- Creating Baseline Views (Aggregating 100M rows) ---';
+\echo '--- Creating Baseline Views (Aggregating 10M rows) ---'
 CREATE MATERIALIZED VIEW baseline_ohlcv_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
 CREATE MATERIALIZED VIEW baseline_ohlcv_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_ohlcv_1m GROUP BY 1, 2;
 CREATE INDEX idx_baseline_ohlcv_1h_t_symbol ON baseline_ohlcv_1h (t, symbol_id);
 
-RAISE NOTICE '--- Creating Aspiral Hierarchy (Aggregating 100M rows + Sketches) ---';
--- This will automatically create aspiral_ohlcv_5m and aspiral_ohlcv_1h
+\echo '--- Creating Aspiral Hierarchy (Aggregating 10M rows + Sketches) ---'
+-- This will automatically create aspiral_ohlcv_5m and aspiral_ohlcv_1h due to our fix in hooks.rs
 CREATE MATERIALIZED VIEW aspiral_ohlcv_1m WITH (aspiral.frames='5m,1h') AS 
 SELECT 
     to_timestamptz((aspiral(t)/60)*60) as t, 
@@ -98,10 +100,10 @@ GROUP BY 1, 2;
 CREATE INDEX idx_aspiral_ohlcv_1h_t_symbol ON aspiral_ohlcv_1h (t, symbol_id);
 
 -- 7. PERFORMANCE QUERIES
-SELECT '--- P95 Percentile: Raw Data (100M Rows) ---' as test;
+\echo '--- P95 Percentile: Raw Data (10M Rows) ---'
 EXPLAIN ANALYZE SELECT symbol_id, percentile_cont(0.95) WITHIN GROUP (ORDER BY price) FROM baseline_ticks WHERE symbol_id = 5 GROUP BY 1;
 
-SELECT '--- P95 Percentile: Aspiral Sketch (Pre-aggregated 1h) ---' as test;
+\echo '--- P95 Percentile: Aspiral Sketch (Pre-aggregated 1h) ---'
 EXPLAIN ANALYZE SELECT symbol_id, aspiral_quantile(price_sketch, 0.95) FROM aspiral_ohlcv_1h WHERE symbol_id = 5;
 
 -- STORAGE
