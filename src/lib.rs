@@ -31,8 +31,37 @@ pub unsafe extern "C" fn _PG_init() {
     );
 }
 
+use std::cell::RefCell;
+
+thread_local! {
+    static KICKOFF_CACHE: RefCell<Option<(String, i64)>> = RefCell::new(None);
+}
+
 fn get_kickoff_epoch() -> i64 {
-    1776211200 // 2026-04-15
+    let kickoff = KICKOFF_DATE.get();
+    let kickoff_str = match kickoff {
+        Some(s) => s.to_string_lossy().into_owned(),
+        None => "2026-04-15".to_string(),
+    };
+
+    if let Some((cached_str, cached_val)) = KICKOFF_CACHE.with(|c| c.borrow().clone()) {
+        if cached_str == kickoff_str {
+            return cached_val;
+        }
+    }
+
+    let date_part = if kickoff_str.contains(' ') {
+        kickoff_str.split(' ').next().unwrap().to_string()
+    } else {
+        kickoff_str.clone()
+    };
+
+    // Use a robust way to get epoch from YYYY-MM-DD
+    let sql = format!("SELECT extract(epoch from '{} 00:00:00Z'::timestamptz)::bigint", date_part.replace("'", "''"));
+    let val = Spi::get_one::<i64>(&sql).unwrap_or(Some(1776211200)).unwrap_or(1776211200);
+    
+    KICKOFF_CACHE.with(|c| *c.borrow_mut() = Some((kickoff_str, val)));
+    val
 }
 
 #[pg_extern(immutable, parallel_safe, name = "aspiral")]
@@ -58,10 +87,7 @@ fn to_timestamptz(a: i64) -> TimestampWithTimeZone {
 
 #[pg_extern(immutable, parallel_safe)]
 fn aspiral_now() -> i64 {
-    let now = unsafe { pgrx::pg_sys::GetCurrentTimestamp() };
-    let pg_epoch_unix: i64 = 946684800;
-    let unix_seconds = pg_epoch_unix + (now / 1_000_000);
-    unix_seconds - get_kickoff_epoch()
+    Spi::get_one::<i64>("SELECT aspiral(now())").unwrap_or(Some(0)).unwrap_or(0)
 }
 
 #[pg_extern(immutable, parallel_safe)]
@@ -187,7 +213,8 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
         .cloned()
         .ok_or("Missing base_view_name in trigger arguments")?;
     
-    let (scope_cols, _) = catalog::get_metadata(&base_view_name).unwrap_or((vec![], 0));
+    let metadata = catalog::get_metadata(&base_view_name);
+    let scope_cols = metadata.map(|m| m.scope_columns).unwrap_or_default();
 
     let process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
         if let Some(tuple) = row {
@@ -197,9 +224,19 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
             
             let mut scope_map = serde_json::Map::new();
             for col in &scope_cols {
-                let val: Option<String> = tuple.get_by_name(col).unwrap_or(None);
+                // Try to get as string first, then as i32, then as i64
+                let val: Option<String> = if let Ok(v) = tuple.get_by_name::<String>(col) {
+                    v
+                } else if let Ok(v) = tuple.get_by_name::<i32>(col) {
+                    v.map(|i| i.to_string())
+                } else if let Ok(v) = tuple.get_by_name::<i64>(col) {
+                    v.map(|i| i.to_string())
+                } else {
+                    None
+                };
+
                 if let Some(v) = val {
-                    scope_map.insert(col.clone(), serde_json::Value::String(v));
+                    scope_map.insert(col.to_string(), serde_json::Value::String(v));
                 }
             }
             let scope_json = pgrx::JsonB(serde_json::Value::Object(scope_map));
@@ -274,6 +311,70 @@ fn aspiral_zorder(t: i64, ids: Vec<String>) -> i64 {
     res as i64
 }
 
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_zorder_fine(t: i64, scale_seconds: i32, ids: Vec<String>) -> i64 {
+    let t_scaled = if scale_seconds > 0 { (t / scale_seconds as i64) as u32 } else { t as u32 };
+    
+    let hashed_ids: Vec<u32> = ids.iter().map(|s| {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish() as u32
+    }).collect();
+
+    let res: u64 = match hashed_ids.len() {
+        1 => split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1),
+        2 => split_by_3(t_scaled) | (split_by_3(hashed_ids[0]) << 1) | (split_by_3(hashed_ids[1]) << 2),
+        3 => split_by_4(t_scaled) | (split_by_4(hashed_ids[0]) << 1) | (split_by_4(hashed_ids[1]) << 2) | (split_by_4(hashed_ids[2]) << 3),
+        _ => {
+            if hashed_ids.is_empty() {
+                t as u64
+            } else {
+                split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1)
+            }
+        }
+    };
+    res as i64
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_hilbert_2d(x: i32, y: i32) -> i64 {
+    let mut x = x as u32;
+    let mut y = y as u32;
+    let mut d = 0u64;
+    let mut s = 1u32 << 30; 
+    while s > 0 {
+        let rx = if (x & s) > 0 { 1 } else { 0 };
+        let ry = if (y & s) > 0 { 1 } else { 0 };
+        d += s as u64 * s as u64 * ((3 * rx) ^ ry) as u64;
+        
+        // rot
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - (x & (s - 1));
+                y = s - 1 - (y & (s - 1));
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s >>= 1;
+    }
+    d as i64
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_zorder_adaptive(t: i64, table_name: &str, ids: Vec<String>) -> i64 {
+    // Determine scale dynamically from table stats
+    // Note: We use Spi::get_one instead of get_one_with_args for the table name
+    let query = format!(
+        "SELECT GREATEST(1, (EXTRACT(EPOCH FROM MAX(t)) - EXTRACT(EPOCH FROM MIN(t)))::int / 1000) FROM (SELECT t FROM {} LIMIT 1000) s",
+        table_name.replace("'", "''")
+    );
+    let scale = Spi::get_one::<i32>(&query).unwrap_or(Some(60)).unwrap_or(60);
+
+    aspiral_zorder_fine(t, scale, ids)
+}
+
 #[pg_extern(name = "aspiral_cluster_table")]
 fn aspiral_cluster_table(table_name: &str, time_col: &str, dimension_cols: Vec<String>) {
     cluster_table_internal(table_name, time_col, dimension_cols);
@@ -289,10 +390,16 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimension_cols: 
         .join(", ");
 
     // Smart detection for time_col type to avoid AT TIME ZONE on bigints
+    // Safely check if relation exists before calling ::regclass
+    let exists = Spi::get_one_with_args::<bool>("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1::text)", &[Some(table_name.into_datum()).into()]).unwrap_or(Some(false)).unwrap_or(false);
+    if !exists { return; }
+
     let is_bigint = unsafe {
         Spi::get_one_with_args::<bool>(
-            "SELECT atttypid = 'int8'::regtype OR atttypid = 'bigint'::regtype 
-             FROM pg_attribute WHERE attrelid = $1::regclass AND attname = $2",
+            "SELECT a.atttypid = 'int8'::regtype OR a.atttypid = 'bigint'::regtype 
+             FROM pg_attribute a 
+             JOIN pg_class c ON a.attrelid = c.oid
+             WHERE c.relname = $1 AND a.attname = $2",
             &[
                 pgrx::datum::DatumWithOid::new(table_name.into_datum(), pg_sys::TEXTOID),
                 pgrx::datum::DatumWithOid::new(time_col.into_datum(), pg_sys::TEXTOID),
@@ -325,66 +432,98 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimension_cols: 
     }
 }
 
-pub fn refresh_incremental(view_name: &str) -> bool {
-    Spi::connect(|client| {
+pub fn refresh_incremental(view_name: &str, extra_where: Option<String>) -> bool {
+    let result = Spi::connect(|client| {
         // 1. Get metadata for the view
-        let meta = client.select(
-            "SELECT parent_view, frame_seconds, scope_columns FROM aspiral.metadata WHERE view_name = $1::text",
-            None,
+        let meta_row = client.select(
+            "SELECT parent_view, frame_seconds, scope_columns, base_view FROM aspiral.metadata WHERE view_name = $1::text",
+            Some(1),
             &[Some(view_name.into_datum()).into()]
-        ).unwrap().first();
+        )?.first();
 
-        if meta.is_empty() { return Ok::<bool, spi::Error>(false); }
+        if meta_row.is_empty() { return Ok::<bool, spi::Error>(false); }
 
-        let parent_view: String = meta.get::<String>(1).unwrap().unwrap();
-        let frame_seconds: i32 = meta.get::<i32>(2).unwrap().unwrap();
-        let scope_cols_raw: Vec<String> = meta.get::<Vec<String>>(3).unwrap().unwrap();
+        let parent_view: String = meta_row.get::<String>(1)?.unwrap();
+        let frame_seconds: i32 = meta_row.get::<i32>(2)?.unwrap();
+        let scope_cols_raw: Vec<String> = meta_row.get::<Vec<String>>(3)?.unwrap();
+        let root_view: String = meta_row.get::<String>(4)?.unwrap();
         let scope_cols: Vec<String> = scope_cols_raw.iter().map(|s| format!("\"{}\"", s)).collect();
 
-        // 2. Fetch dirty buckets
-        let dirty = client.select(
-            "SELECT DISTINCT bucket_t, scope_values FROM aspiral.changelog WHERE base_view = $1",
+        // 2. Fetch all column names
+        let mut all_cols = Vec::new();
+        let cols_table = client.select(
+            &format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("'", "''")),
             None,
-            &[Some(view_name.into_datum()).into()]
-        ).unwrap();
+            &[]
+        )?;
+        for row in cols_table { all_cols.push(row.get::<String>(1)?.unwrap()); }
 
-        if dirty.is_empty() { return Ok(true); }
+        let update_cols: Vec<String> = all_cols.iter()
+            .filter(|&c| c != "t" && !scope_cols_raw.contains(c))
+            .map(|c| format!("\"{}\"", c)).collect();
 
-        info!("Aspiral: Performing incremental refresh for '{}' ({} dirty buckets)", view_name, dirty.len());
-
-        // 3. Construct the patch query
-        // We derive the SQL logic similarly to rollup.rs but scoped to the dirty buckets
+        // 3. Construct MERGE
         let sql = rollup::derive_child_sql(view_name, &parent_view, frame_seconds, &scope_cols_raw);
-        
-        // Wrap the derived SQL in a patch mechanism
-        // For each dirty bucket, we re-run the aggregation and upsert
-        for row in dirty {
-            let bucket_t: i64 = row.get::<i64>(1).unwrap().unwrap();
-            let scope_vals: Vec<String> = row.get::<Vec<String>>(2).unwrap().unwrap();
-            
-            let mut where_clause = format!("WHERE aspiral(t) = {}", bucket_t);
-            for (i, col) in scope_cols.iter().enumerate() {
-                where_clause.push_str(&format!(" AND {} = '{}'", col, scope_vals[i].replace("'", "''")));
-            }
+        let select_part = sql.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
 
-            // Derive the single-bucket patch
-            let select_part = sql.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
-            
-            let delete_sql = format!("DELETE FROM {} {}", view_name, where_clause);
-            let insert_sql = format!("INSERT INTO {} SELECT {} FROM {} {} GROUP BY 1, {}", 
-                view_name, select_part, parent_view, where_clause, scope_cols.join(", "));
-            
-            unsafe {
-                let _ = Spi::run(&delete_sql);
-                let _ = Spi::run(&insert_sql);
-            }
+        let mut on_clause = vec!["target.t = source.t".to_string()];
+        for col in &scope_cols { on_clause.push(format!("target.{} = source.{}", col, col)); }
+        let update_set = update_cols.iter().map(|c| format!("{} = source.{}", c, c)).collect::<Vec<_>>().join(", ");
+
+        // IMPORTANT: Use root_view for changelog lookup!
+        let mut source_where = format!("WHERE (aspiral(t)/{0})*{0} IN (SELECT bucket_t FROM aspiral.changelog WHERE base_view = '{root_view}')", frame_seconds, root_view = root_view.replace("'", "''"));
+        if let Some(ref extra) = extra_where { source_where.push_str(&format!(" AND ({})", extra)); }
+
+        let merge_sql = format!(
+            "MERGE INTO {view_name} AS target
+             USING (
+                 SELECT {select_part} FROM {parent_view} 
+                 {source_where}
+                 GROUP BY 1, {groups}
+             ) AS source
+             ON ({on_clause})
+             WHEN MATCHED THEN UPDATE SET {update_set}
+             WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
+            view_name = view_name, select_part = select_part, parent_view = parent_view, source_where = source_where, groups = scope_cols.join(", "), on_clause = on_clause.join(" AND "),
+            update_set = if update_set.is_empty() { "t = source.t" } else { &update_set },
+            all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
+            source_cols_joined = all_cols.iter().map(|c| format!("source.\"{}\"", c)).collect::<Vec<_>>().join(", ")
+        );
+
+        info!("Aspiral: Performing Incremental MERGE for '{}'", view_name);
+        let _ = Spi::run(&merge_sql);
+        Ok(true)
+    }).unwrap_or(false);
+
+    if result {
+        let children = catalog::get_children(view_name);
+        for child in children {
+            refresh_incremental(&child, extra_where.clone());
         }
+    }
+    result
+}
 
-        // 4. Clear changelog for this view
-        let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", view_name.replace("'", "''")));
+fn where_clause_was_none(opt: Option<String>) -> bool { opt.is_none() }
 
-        Ok::<bool, spi::Error>(true)
-    }).unwrap_or(false)
+#[pg_extern(name = "aspiral_refresh")]
+fn aspiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL")) {
+    hooks::reactive_refresh(view_name, where_clause.map(|s| s.to_string()));
+}
+
+#[pg_extern]
+fn aspiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>) {
+    catalog::insert_metadata(view_name, parent_view, frame_seconds, base_view, scope_columns.clone());
+    // Also create the trigger on the base table if this is a root view
+    if parent_view == "BASE" {
+        let trigger_sql = format!("CREATE TRIGGER aspiral_track_{} AFTER INSERT OR UPDATE OR DELETE ON \"{}\" FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{}')", base_view, base_view, view_name);
+        let _ = Spi::run(&trigger_sql);
+    }
+}
+
+#[pg_extern]
+fn aspiral_create_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<String>) {
+    hooks::generate_hierarchy(base_name, frames_str, scope_columns);
 }
 
 #[pg_extern]

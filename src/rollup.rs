@@ -41,8 +41,11 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
 pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32, scope_columns: &[String]) -> String {
     Spi::connect(|client| {
         let query = format!(
-            "SELECT attname::text FROM pg_attribute WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped",
-            parent_name
+            "SELECT a.attname::text 
+             FROM pg_attribute a 
+             JOIN pg_class c ON a.attrelid = c.oid 
+             WHERE c.relname = '{}' AND a.attnum > 0 AND NOT a.attisdropped",
+            parent_name.replace("'", "''")
         );
         let columns = client.select(&query, None, &[])?;
         
@@ -84,23 +87,32 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
             select_cols.push(agg);
         }
         
-        let scope_cols_str = scope_columns.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
-        let index_cols = if scope_cols_str.is_empty() { "t".to_string() } else { format!("t, {}", scope_cols_str) };
+        let scope_cols_str = scope_columns.iter().map(|s| format!("\"{}\"", s.trim())).collect::<Vec<_>>().join(", ");
+
+        let index_sql = if scope_columns.is_empty() {
+            format!("CREATE UNIQUE INDEX idx_u_{child_name} ON {child_name}(t)")
+        } else {
+            // Use Z-Order for clustered multi-tenant access
+            format!(
+                "CREATE INDEX idx_z_{child_name} ON {child_name} (
+                    aspiral_zorder(aspiral(t), ARRAY[{scope_cols_str}]::text[])
+                )"
+            )
+        };
 
         let sql = format!(
-            "CREATE MATERIALIZED VIEW {child_name} AS 
+            "CREATE TABLE {child_name} AS 
              SELECT {select_cols} 
              FROM {parent_name}
-             WHERE aspiral(t) < ((aspiral_now()::bigint / {frame_seconds}) * {frame_seconds})
              GROUP BY {group_by};
-             CREATE UNIQUE INDEX idx_u_{child_name} ON {child_name}({index_cols});",
+             {index_sql};",
             child_name = child_name,
             select_cols = select_cols.join(", "), 
             parent_name = parent_name,
-            frame_seconds = frame_seconds,
             group_by = group_by.join(", "),
-            index_cols = index_cols
+            index_sql = index_sql
         );
+
         Ok::<String, spi::Error>(sql)
     }).unwrap_or_else(|e| {
         error!("Aspiral failed to derive child SQL for {}: {:?}", parent_name, e);

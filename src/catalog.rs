@@ -102,19 +102,27 @@ pub fn is_aspiral_relation(name: &str) -> bool {
     }).unwrap_or(false)
 }
 
-pub fn get_metadata(view_name: &str) -> Option<(Vec<String>, i32)> {
+pub struct Metadata {
+    pub parent_view: String,
+    pub frame_seconds: i32,
+    pub scope_columns: Vec<String>,
+}
+
+pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     Spi::connect(|client| {
         let row = unsafe {
             client.select(
-                "SELECT scope_columns, frame_seconds FROM aspiral.metadata WHERE view_name = $1",
+                "SELECT parent_view, frame_seconds, scope_columns FROM aspiral.metadata WHERE view_name = $1",
                 None,
                 &[DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value())]
             ).unwrap().first()
         };
-        if row.is_empty() { return Ok::<Option<(Vec<String>, i32)>, spi::Error>(None); }
-        let cols = row.get::<Vec<String>>(1).unwrap().unwrap();
-        let frame = row.get::<i32>(2).unwrap().unwrap();
-        Ok(Some((cols, frame)))
+        if row.is_empty() { return Ok::<Option<Metadata>, spi::Error>(None); }
+        Ok(Some(Metadata {
+            parent_view: row.get::<String>(1).unwrap().unwrap(),
+            frame_seconds: row.get::<i32>(2).unwrap().unwrap(),
+            scope_columns: row.get::<Vec<String>>(3).unwrap().unwrap(),
+        }))
     }).unwrap_or(None)
 }
 

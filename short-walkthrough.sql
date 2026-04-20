@@ -28,9 +28,10 @@ SELECT
     (random() * 20)::int + 1
 FROM generate_series(0, 719) s(i);
 
--- 4. Single Refresh triggers the entire pipeline
+-- Single Refresh triggers the entire pipeline
 SELECT '--- Refreshing 1m view (Cascades to 5m, 1h) ---' as msg;
-REFRESH MATERIALIZED VIEW asset_ticks_ohlcv_1m;
+SELECT aspiral_refresh('asset_ticks_ohlcv_1m');
+
 
 -- 5. Verify Automated Hierarchy
 -- View names are derived from the table name and the first frame.
@@ -56,7 +57,7 @@ SELECT '--- Changelog Check ---' as msg;
 SELECT base_view, to_timestamptz(bucket_t) as bucket_t FROM aspiral.changelog;
 
 -- Sync the backfill
-REFRESH MATERIALIZED VIEW asset_ticks_ohlcv_1m;
+SELECT aspiral_refresh('asset_ticks_ohlcv_1m');
 
 -- Verify 1h view reflects the fix
 SELECT '--- Post-Backfill Check (1h Max) ---' as msg;

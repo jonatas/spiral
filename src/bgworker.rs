@@ -19,8 +19,17 @@ pub unsafe extern "C-unwind" fn aspiral_worker_main(_arg: pg_sys::Datum) {
 
             for row in tuple_table {
                 if let Ok(Some(view_name)) = row.get::<String>(1) {
-                    info!("Aspiral Worker: Auto-refreshing root view '{}'", view_name);
-                    let _ = Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", view_name));
+                    // Only refresh if there are dirty buckets
+                    let has_dirty: bool = client.select(
+                        &format!("SELECT 1 FROM aspiral.changelog WHERE base_view = $1 LIMIT 1"),
+                        Some(1),
+                        &[Some(view_name.clone().into_datum()).into()]
+                    ).and_then(|t| Ok(!t.is_empty())).unwrap_or(false);
+
+                    if has_dirty {
+                        info!("Aspiral Worker: Auto-refreshing root view '{}'", view_name);
+                        let _ = Spi::run(&format!("REFRESH MATERIALIZED VIEW {}", view_name));
+                    }
                 }
             }
             Ok::<(), spi::Error>(())
