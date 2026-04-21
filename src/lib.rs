@@ -20,7 +20,7 @@ pub static BGWORKER_DBNAME: GucSetting<Option<std::ffi::CString>> = GucSetting::
 #[no_mangle]
 pub unsafe extern "C" fn _PG_init() {
     hooks::init_hooks();
-    bgworker::init_worker();
+    // bgworker::init_worker();
 
     GucRegistry::define_string_guc(
         CStr::from_bytes_with_nul(b"aspiral.kickoff_date\0").unwrap(),
@@ -355,6 +355,38 @@ fn split_by_4(a: u32) -> u64 {
     x
 }
 
+#[pg_extern(immutable, parallel_safe, name = "aspiral_zorder")]
+fn aspiral_zorder_ints(t: i64, ids: Vec<i32>) -> i64 {
+    let t_scaled = (t / 3600) as u32;
+    let res: u64 = match ids.len() {
+        1 => split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1),
+        2 => split_by_3(t_scaled) | (split_by_3(ids[0] as u32) << 1) | (split_by_3(ids[1] as u32) << 2),
+        3 => split_by_4(t_scaled) | (split_by_4(ids[0] as u32) << 1) | (split_by_4(ids[1] as u32) << 2) | (split_by_4(ids[2] as u32) << 3),
+        _ => {
+            if ids.is_empty() {
+                t as u64
+            } else {
+                split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1)
+            }
+        }
+    };
+    res as i64
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_zorder_3d(t: i64, x: i32, y: i32) -> i64 {
+    let t_scaled = (t / 3600) as u32;
+    let res = split_by_3(t_scaled) | (split_by_3(x as u32) << 1) | (split_by_3(y as u32) << 2);
+    res as i64
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn aspiral_zorder_4d(t: i64, x: i32, y: i32, z: i32) -> i64 {
+    let t_scaled = (t / 3600) as u32;
+    let res = split_by_4(t_scaled) | (split_by_4(x as u32) << 1) | (split_by_4(y as u32) << 2) | (split_by_4(z as u32) << 3);
+    res as i64
+}
+
 #[pg_extern(immutable, parallel_safe)]
 fn aspiral_zorder(t: i64, ids: Vec<String>) -> i64 {
     let t_scaled = (t / 3600) as u32;
@@ -437,11 +469,22 @@ fn aspiral_hilbert_2d(x: i32, y: i32) -> i64 {
 #[pg_extern(immutable, parallel_safe)]
 fn aspiral_zorder_adaptive(t: i64, table_name: &str, ids: Vec<String>) -> i64 {
     // Determine scale dynamically from table stats
-    // Note: We use Spi::get_one instead of get_one_with_args for the table name
+    let table_name_clean = table_name.replace("'", "''");
+    let type_name = Spi::get_one::<String>(
+        &format!("SELECT pg_typeof(t)::text FROM {} LIMIT 1", table_name_clean)
+    ).unwrap_or(Some("bigint".to_string())).unwrap_or("bigint".to_string());
+
+    let expr = if type_name.contains("timestamp") { 
+        "EXTRACT(EPOCH FROM MAX(t)) - EXTRACT(EPOCH FROM MIN(t))" 
+    } else { 
+        "MAX(t) - MIN(t)" 
+    };
+
     let query = format!(
-        "SELECT GREATEST(1, (EXTRACT(EPOCH FROM MAX(t)) - EXTRACT(EPOCH FROM MIN(t)))::int / 1000) FROM (SELECT t FROM {} LIMIT 1000) s",
-        table_name.replace("'", "''")
+        "SELECT GREATEST(1, ({})::int / 1000) FROM (SELECT t FROM {} LIMIT 1000) s",
+        expr, table_name_clean
     );
+    notice!("Aspiral: adaptive scale query: {}", query);
     let scale = Spi::get_one::<i32>(&query).unwrap_or(Some(60)).unwrap_or(60);
 
     aspiral_zorder_fine(t, scale, ids)
