@@ -152,10 +152,22 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     let scope_columns_final = scope_columns.clone();
 
     let mut handled_incrementally = false;
-    if let Some(name) = target_name_final {
+    if let Some(name) = target_name_final.clone() {
         if is_refresh {
             handled_incrementally = reactive_refresh(&name, None);
+        }
+    }
+
+    if !handled_incrementally {
+        if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
+            prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
         } else {
+            pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
+        }
+    }
+
+    if let Some(name) = target_name_final {
+        if !is_refresh {
             if let Some(ref tenant_str) = tenant_opt_final {
                 let dimensions: Vec<String> = tenant_str.split(',').map(|s| s.trim().to_string()).collect();
                 let time_col = time_col_opt_final.clone().unwrap_or_else(|| "t".to_string());
@@ -237,14 +249,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                     generate_hierarchy(&name, &frames_str, scope_columns_final);
                 }
             }
-        }
-    }
-
-    if !handled_incrementally {
-        if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
-            prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
-        } else {
-            pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
         }
     }
 

@@ -54,7 +54,7 @@ UPDATE asset_ticks SET price = 85000.0 WHERE t = '2026-04-15 00:05:00Z' AND symb
 
 -- Verify Aspiral tracked the dirty bucket
 SELECT '--- Changelog Check ---' as msg;
-SELECT base_view, to_timestamptz(bucket_t) as bucket_t FROM aspiral.changelog;
+SELECT base_view, to_timestamptz(t_start) as bucket_t FROM aspiral.changelog;
 
 -- Sync the backfill
 SELECT aspiral_refresh('asset_ticks_ohlcv_1m');

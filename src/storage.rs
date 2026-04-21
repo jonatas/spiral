@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<AspiralingRow>(), 64);
         
         let test_oid = 12345;
-        let path = get_storage_path(test_oid);
+        let path = get_storage_path(test_oid, "");
         if path.exists() { let _ = fs::remove_file(&path); }
 
         let mut file = OpenOptions::new().write(true).create(true).open(&path).unwrap();

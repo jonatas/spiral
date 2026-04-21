@@ -4,7 +4,7 @@ use pgrx::bgworkers::*;
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C-unwind" fn aspiral_worker_main(_arg: pg_sys::Datum) {
-    // BackgroundWorker::attach_signal_handlers(SignalHandlerOptions::ConfigCustom);
+    BackgroundWorker::connect_worker_to_spi(Some("aspiral"), None);
 
     info!("Aspiral Background Worker Started.");
 
