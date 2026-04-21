@@ -11,10 +11,6 @@ pub struct StatsState {
 }
 
 impl StatsState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn add(&mut self, x: f64) {
         let n1 = self.n;
         self.n += 1.0;

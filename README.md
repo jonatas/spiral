@@ -70,6 +70,23 @@ Aspiral tracks "dirty buckets" in a transactional changelog to provide **Increme
 - **Cascading Logic**: Refreshing a parent view automatically triggers incremental updates for all downstream children.
 - **Self-Healing Dashboards**: Historical data corrections automatically flag those buckets for re-aggregation in the next refresh cycle.
 
+## 🏗 Architecture & Design Patterns
+
+### 1. The Spiral Mapping (Time to Epoch)
+Aspiral maps `timestamptz` to a relative `bigint` epoch starting from a configurable `kickoff_date`. This constant-time conversion allows for efficient bitwise operations and Z-Order interleaving.
+- **Session Caching**: The kickoff epoch is cached in a thread-local variable to eliminate redundant SPI queries during bulk operations.
+
+### 2. Segment-Based Change Tracking (Joining Unions)
+Traditional IVM often struggles with high-volume updates because tracking every single row is expensive. Aspiral uses a **Segment Unification** strategy:
+- **Statement-Level Triggers**: Uses PostgreSQL **Transition Tables** (`REFERENCING NEW TABLE`) to capture thousands of changes in a single Rust-side iteration.
+- **Unification Algorithm**: Overlapping or adjacent "dirty" time ranges are merged into unified segments (unions of intervals). This keeps the `aspiral.changelog` extremely compact.
+- **JOIN-Based Refresh**: The incremental refresh logic performs a direct `JOIN` between the rollup table and the unified segments, ensuring PostgreSQL only touches the minimal set of pages needed.
+
+### 3. Cascading Hierarchical Refresh
+Refreshing a root view automatically triggers a recursive, incremental update down the entire hierarchy (e.g., 1m -> 5m -> 1h). Each level only re-aggregates data from its direct parent for the specific segments that were flagged as dirty.
+
+---
+
 ## 🚀 Performance & Scalability
 
 Aspiral is engineered for high-throughput ingestion and instant analytics on billion-row datasets.

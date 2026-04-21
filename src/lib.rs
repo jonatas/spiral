@@ -2,7 +2,7 @@ use pgrx::prelude::*;
 use pgrx::guc::{GucRegistry, GucSetting, GucContext, GucFlags};
 use serde::{Deserialize, Serialize};
 use std::ffi::CStr;
-use pgrx::AllocatedByPostgres;
+use pgrx::{AllocatedByPostgres, PgTupleDesc};
 
 mod hooks;
 mod catalog;
@@ -212,19 +212,83 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
         .first()
         .cloned()
         .ok_or("Missing base_view_name in trigger arguments")?;
-    
-    let metadata = catalog::get_metadata(&base_view_name);
-    let scope_cols = metadata.map(|m| m.scope_columns).unwrap_or_default();
 
+    let metadata = catalog::get_metadata(&base_view_name);
+    let scope_cols = metadata.as_ref().map(|m| m.scope_columns.clone()).unwrap_or_default();
+
+    // If it's a statement trigger with transition tables, we can be much more efficient
+    let tg_data = trigger.trigger_data();
+    let is_after = (tg_data.tg_event & pg_sys::TRIGGER_EVENT_BEFORE) == 0;
+    let is_statement = (tg_data.tg_event & pg_sys::TRIGGER_EVENT_ROW) == 0;
+
+    if is_after && is_statement {
+        let tg = *trigger.trigger_data();
+
+        let process_tuplestore = |tuplestore: *mut pg_sys::Tuplestorestate, desc: pg_sys::TupleDesc| -> Result<(), String> {
+            if tuplestore.is_null() { return Ok(()); }
+            
+            let mut scope_dirty = std::collections::HashMap::new();
+            let pg_desc = unsafe { PgTupleDesc::from_pg_copy(desc) };
+
+            unsafe {
+                let slot = pg_sys::MakeSingleTupleTableSlot(desc, &pg_sys::TTSOpsMinimalTuple);
+                while pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
+                    let mut should_free = false;
+                    let tuple = pg_sys::ExecFetchSlotHeapTuple(slot, true, &mut should_free);
+                    let htup = PgHeapTuple::from_heap_tuple(pg_desc.clone(), tuple);
+                    
+                    if let Ok(Some(t_val)) = htup.get_by_name::<TimestampWithTimeZone>("t") {
+                        let a = aspiral(t_val);
+
+                        let mut scope_map = serde_json::Map::new();
+                        for col in &scope_cols {
+                            let val: Option<String> = if let Ok(v) = htup.get_by_name::<String>(col) {
+                                v
+                            } else if let Ok(v) = htup.get_by_name::<i32>(col) {
+                                v.map(|i| i.to_string())
+                            } else if let Ok(v) = htup.get_by_name::<i64>(col) {
+                                v.map(|i| i.to_string())
+                            } else {
+                                None
+                            };
+                            if let Some(v) = val {
+                                scope_map.insert(col.to_string(), serde_json::Value::String(v));
+                            }
+                        }
+                        let scope_val = serde_json::Value::Object(scope_map);
+                        let entry = scope_dirty.entry(scope_val).or_insert((i64::MAX, i64::MIN));
+                        entry.0 = entry.0.min(a);
+                        entry.1 = entry.1.max(a);
+                    }
+                    pg_sys::ExecClearTuple(slot);
+                }
+                pg_sys::ExecDropSingleTupleTableSlot(slot);
+            }
+
+            for (scope_val, (s, e)) in scope_dirty {
+                catalog::mark_range_dirty(&base_view_name, s, e, pgrx::JsonB(scope_val));
+            }
+            Ok(())
+        };
+
+        unsafe {
+            if !tg.tg_newtable.is_null() { process_tuplestore(tg.tg_newtable, (*tg.tg_relation).rd_att)?; }
+            if !tg.tg_oldtable.is_null() { process_tuplestore(tg.tg_oldtable, (*tg.tg_relation).rd_att)?; }
+        }
+
+        catalog::unify_changelog(&base_view_name);
+        return Ok(None);
+    }
+
+    // Fallback to row-level if statement-level wasn't set up correctly
     let process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
         if let Some(tuple) = row {
             let t_val: TimestampWithTimeZone = tuple.get_by_name("t")
                 .map_err(|e| format!("Failed to get 't' column: {}", e))?
                 .ok_or("Column 't' is null")?;
-            
+
             let mut scope_map = serde_json::Map::new();
             for col in &scope_cols {
-                // Try to get as string first, then as i32, then as i64
                 let val: Option<String> = if let Ok(v) = tuple.get_by_name::<String>(col) {
                     v
                 } else if let Ok(v) = tuple.get_by_name::<i32>(col) {
@@ -242,8 +306,7 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
             let scope_json = pgrx::JsonB(serde_json::Value::Object(scope_map));
 
             let a = aspiral(t_val);
-            let bucket_1m = (a / 60) * 60;
-            catalog::mark_bucket_dirty(&base_view_name, bucket_1m, scope_json);
+            catalog::mark_range_dirty(&base_view_name, a, a, scope_json);
         }
         Ok(())
     };
@@ -253,7 +316,6 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
 
     Ok(trigger.new())
 }
-
 fn split_by_2(a: u32) -> u64 {
     let mut x = a as u64;
     x = (x | x << 16) & 0x0000ffff0000ffff;
@@ -471,8 +533,22 @@ pub fn refresh_incremental(view_name: &str, extra_where: Option<String>) -> bool
         let update_set = update_cols.iter().map(|c| format!("{} = source.{}", c, c)).collect::<Vec<_>>().join(", ");
 
         // IMPORTANT: Use root_view for changelog lookup!
-        let mut source_where = format!("WHERE (aspiral(t)/{0})*{0} IN (SELECT bucket_t FROM aspiral.changelog WHERE base_view = '{root_view}')", frame_seconds, root_view = root_view.replace("'", "''"));
-        if let Some(ref extra) = extra_where { source_where.push_str(&format!(" AND ({})", extra)); }
+        // Join with segments to only process affected buckets
+        let scope_cols_json = if scope_cols_raw.is_empty() { 
+            "''".to_string() 
+        } else { 
+            scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"", s, s)).collect::<Vec<_>>().join(", ") 
+        };
+        
+        let mut source_where = format!(
+            "JOIN aspiral.changelog c ON c.base_view = '{root_view}' 
+             AND (aspiral(t)/{0})*{0} >= c.t_start AND (aspiral(t)/{0})*{0} <= c.t_end 
+             AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
+            frame_seconds,
+            scope_cols_json,
+            root_view = root_view.replace("'", "''")
+        );
+        if let Some(ref extra) = extra_where { source_where.push_str(&format!(" WHERE ({})", extra)); }
 
         let merge_sql = format!(
             "MERGE INTO {view_name} AS target
@@ -504,8 +580,6 @@ pub fn refresh_incremental(view_name: &str, extra_where: Option<String>) -> bool
     result
 }
 
-fn where_clause_was_none(opt: Option<String>) -> bool { opt.is_none() }
-
 #[pg_extern(name = "aspiral_refresh")]
 fn aspiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL")) {
     hooks::reactive_refresh(view_name, where_clause.map(|s| s.to_string()));
@@ -516,8 +590,26 @@ fn aspiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32,
     catalog::insert_metadata(view_name, parent_view, frame_seconds, base_view, scope_columns.clone());
     // Also create the trigger on the base table if this is a root view
     if parent_view == "BASE" {
-        let trigger_sql = format!("CREATE TRIGGER aspiral_track_{} AFTER INSERT OR UPDATE OR DELETE ON \"{}\" FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{}')", base_view, base_view, view_name);
-        let _ = Spi::run(&trigger_sql);
+        for event in &["INSERT", "UPDATE", "DELETE"] {
+            let mut transition = String::new();
+            if *event == "UPDATE" {
+                transition.push_str("REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table ");
+            } else if *event == "INSERT" {
+                transition.push_str("REFERENCING NEW TABLE AS new_table ");
+            } else if *event == "DELETE" {
+                transition.push_str("REFERENCING OLD TABLE AS old_table ");
+            }
+
+            let trigger_sql = format!(
+                "CREATE TRIGGER aspiral_track_{base_view}_{event_lower} 
+                 AFTER {event} ON \"{base_view}\" 
+                 {transition}
+                 FOR EACH STATEMENT EXECUTE FUNCTION aspiral_track_changes('{view_name}')",
+                base_view = base_view, event = event, event_lower = event.to_lowercase(),
+                transition = transition, view_name = view_name
+            );
+            let _ = Spi::run(&trigger_sql);
+        }
     }
 }
 

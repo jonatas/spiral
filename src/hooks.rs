@@ -211,7 +211,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                         let root_view = format!("\"{}_ohlcv_{}\"", table_name, root_frame.name);
                         let select = projections.join(", ").replace("{0}", &root_frame.seconds.to_string());
                         let group_by = groups.join(", ").replace("{0}", &root_frame.seconds.to_string());
-                        let scope_cols_str = tenant_cols.iter().map(|s| format!("\"{}\"", s.trim())).collect::<Vec<_>>().join(", ");
                         
                         let index_sql = format!("CREATE INDEX IF NOT EXISTS \"idx_u_{table_name}_root\" ON {root_view}(t)");
 

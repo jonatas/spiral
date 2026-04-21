@@ -16,37 +16,70 @@ extension_sql!(
 
     CREATE TABLE IF NOT EXISTS aspiral.changelog (
         base_view text NOT NULL,
-        bucket_t bigint NOT NULL,
-        scope_values jsonb NOT NULL DEFAULT '{}',
-        PRIMARY KEY (base_view, bucket_t, scope_values)
+        t_start bigint NOT NULL,
+        t_end bigint NOT NULL,
+        scope_values jsonb NOT NULL DEFAULT '{}'
     );
+    CREATE INDEX IF NOT EXISTS idx_aspiral_changelog_base ON aspiral.changelog (base_view);
     "#,
     name = "create_aspiral_metadata"
 );
 
-pub fn mark_bucket_dirty(base_view: &str, t: i64, scope_values: pgrx::JsonB) {
+pub fn mark_range_dirty(base_view: &str, t_start: i64, t_end: i64, scope_values: pgrx::JsonB) {
     unsafe {
         Spi::run_with_args(
-            "INSERT INTO aspiral.changelog (base_view, bucket_t, scope_values) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            "INSERT INTO aspiral.changelog (base_view, t_start, t_end, scope_values) VALUES ($1, $2, $3, $4)",
             &[
                 DatumWithOid::new(base_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(t.into_datum(), PgBuiltInOids::INT8OID.value()),
+                DatumWithOid::new(t_start.into_datum(), PgBuiltInOids::INT8OID.value()),
+                DatumWithOid::new(t_end.into_datum(), PgBuiltInOids::INT8OID.value()),
                 DatumWithOid::new(scope_values.into_datum(), PgBuiltInOids::JSONBOID.value()),
             ],
         ).unwrap();
     }
 }
 
+pub fn unify_changelog(base_view: &str) {
+    // This function implements the "joining unions of segments" logic.
+    // It merges overlapping or adjacent segments for the same base_view and scope_values.
+    let _ = Spi::connect(|client| {
+         let _ = client.select(
+            "SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
+             INTO TEMP temp_unified
+             FROM (
+                SELECT *,
+                    COUNT(*) FILTER (WHERE prev_end < t_start OR prev_end IS NULL) OVER (PARTITION BY base_view, scope_values ORDER BY t_start) as grp
+                FROM (
+                    SELECT *,
+                        MAX(t_end) OVER (PARTITION BY base_view, scope_values ORDER BY t_start ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
+                    FROM aspiral.changelog
+                    WHERE base_view = $1::text
+                ) s1
+             ) s2
+             GROUP BY base_view, scope_values, grp",
+             None,
+             &[Some(base_view.into_datum()).into()]
+         )?;
+         let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", base_view.replace("'", "''")));
+         let _ = Spi::run(&format!("INSERT INTO aspiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified"));
+         let _ = Spi::run("DROP TABLE temp_unified");
+         Ok::<(), spi::Error>(())
+    });
+}
+
+#[allow(dead_code)]
 pub fn get_dirty_buckets(base_view: &str) -> Vec<(i64, pgrx::JsonB)> {
     Spi::connect(|client| {
         let mut res = Vec::new();
-        let tuple_table = unsafe {
-            client.select(
-                "SELECT bucket_t, scope_values FROM aspiral.changelog WHERE base_view = $1",
-                None,
-                &[DatumWithOid::new(base_view.into_datum(), PgBuiltInOids::TEXTOID.value())]
-            ).unwrap()
-        };
+        // Generate series of minute buckets (60s) for each segment
+        let tuple_table = client.select(
+            "SELECT DISTINCT b, scope_values 
+             FROM aspiral.changelog, 
+                  generate_series(t_start, t_end, 60) as b 
+             WHERE base_view = $1",
+            None,
+            &[Some(base_view.into_datum()).into()]
+        )?;
         for row in tuple_table {
             let t = row.get::<i64>(1).unwrap().unwrap();
             let sv = row.get::<pgrx::JsonB>(2).unwrap().unwrap();
@@ -56,6 +89,7 @@ pub fn get_dirty_buckets(base_view: &str) -> Vec<(i64, pgrx::JsonB)> {
     }).unwrap_or_default()
 }
 
+#[allow(dead_code)]
 pub fn clear_dirty_buckets(base_view: &str, buckets: &[(i64, pgrx::JsonB)]) {
     if buckets.is_empty() { return; }
     for (t, sv) in buckets {
@@ -104,6 +138,7 @@ pub fn is_aspiral_relation(name: &str) -> bool {
 
 pub struct Metadata {
     pub parent_view: String,
+    #[allow(dead_code)]
     pub frame_seconds: i32,
     pub scope_columns: Vec<String>,
 }
