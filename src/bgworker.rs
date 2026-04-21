@@ -4,9 +4,12 @@ use pgrx::bgworkers::*;
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C-unwind" fn aspiral_worker_main(_arg: pg_sys::Datum) {
-    BackgroundWorker::connect_worker_to_spi(Some("aspiral"), None);
+    let dbname = crate::BGWORKER_DBNAME.get().map(|s| s.to_string_lossy().into_owned());
+    let dbname = dbname.as_deref().unwrap_or("aspiral");
+    
+    BackgroundWorker::connect_worker_to_spi(Some(dbname), None);
 
-    info!("Aspiral Background Worker Started.");
+    info!("Aspiral Background Worker Started on database '{}'.", dbname);
 
     while BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(60))) {
         let _ = Spi::connect(|client| {

@@ -15,6 +15,7 @@ mod bgworker;
 ::pgrx::pg_module_magic!(name, version);
 
 static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
+pub static BGWORKER_DBNAME: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
 
 #[no_mangle]
 pub unsafe extern "C" fn _PG_init() {
@@ -26,6 +27,15 @@ pub unsafe extern "C" fn _PG_init() {
         CStr::from_bytes_with_nul(b"Point zero for the aspiral timeline (YYYY-MM-DD)\0").unwrap(),
         CStr::from_bytes_with_nul(b"The first day the system starts operating as the point zero.\0").unwrap(),
         &KICKOFF_DATE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        CStr::from_bytes_with_nul(b"aspiral.bgworker_dbname\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Database name for the background worker to connect to.\0").unwrap(),
+        CStr::from_bytes_with_nul(b"If not set, defaults to 'aspiral'.\0").unwrap(),
+        &BGWORKER_DBNAME,
         GucContext::Suset,
         GucFlags::default(),
     );

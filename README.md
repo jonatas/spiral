@@ -140,5 +140,20 @@ CREATE TABLE ticks (
 REFRESH MATERIALIZED VIEW ticks_ohlcv_1m;
 ```
 
+## ⚙️ Production Setup
+
+For Aspiral's background worker and certain hooks to function correctly in production, you must add `aspiral` to your `shared_preload_libraries` in `postgresql.conf`:
+
+```ini
+shared_preload_libraries = 'aspiral'
+```
+
+### Background Worker Configuration
+By default, the background worker attempts to connect to a database named `aspiral`. You can configure this using the following GUC:
+
+```ini
+aspiral.bgworker_dbname = 'your_database_name'
+```
+
 ---
 Built with ❤️ using `pgrx` and `ta-statistics`.
