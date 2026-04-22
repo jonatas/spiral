@@ -38,12 +38,19 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
         .collect()
 }
 
-pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32, scope_columns: &[String]) -> String {
+#[derive(Debug, Clone)]
+pub struct SourceDef {
+    pub base_column: String,
+    pub formula: String,
+    pub mat_column: String,
+}
+
+pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32, scope_columns: &[String]) -> (String, Vec<SourceDef>) {
     Spi::connect(|client| {
         let exists = client.select(
             "SELECT 1 FROM pg_class WHERE relname = $1",
             Some(1),
-            unsafe { &[pgrx::datum::DatumWithOid::new(child_name.into_datum(), pg_sys::TEXTOID)] }
+            unsafe { &[pgrx::datum::DatumWithOid::new(child_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
         )?.first().is_empty() == false;
 
         let source_for_cols = if exists { child_name } else { parent_name };
@@ -57,13 +64,14 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
         );
         let columns = client.select(&query, None, &[])?;
         
-        let mut select_cols = vec![format!("to_timestamptz((aspiral(t) / {0}) * {0}) as t", frame_seconds)];
+        let mut select_cols = vec![format!("to_timestamp(((aspiral(t) / {0}) * {0})::double precision) as t", frame_seconds)];
         let mut group_by = vec!["(aspiral(t) / {0}) * {0}".replace("{0}", &frame_seconds.to_string())];
+        let mut sources = Vec::new();
         
         let parent_is_view = client.select(
             "SELECT 1 FROM aspiral.metadata WHERE view_name = $1",
             Some(1),
-            unsafe { &[pgrx::datum::DatumWithOid::new(parent_name.into_datum(), pg_sys::TEXTOID)] }
+            unsafe { &[pgrx::datum::DatumWithOid::new(parent_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
         )?.first().is_empty() == false;
 
         for row in columns {
@@ -71,71 +79,101 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
             if col == "t" { continue; }
             
             if scope_columns.contains(&col) {
-                select_cols.push(col.clone());
-                group_by.push(col.clone());
+                select_cols.push(format!("\"{}\"", col));
+                group_by.push(format!("\"{}\"", col));
                 continue;
             }
             
             // Heuristic for mapping view columns back to base table columns
-            let agg = if col.ends_with("_stats") {
+            let mut base_col = col.clone();
+            let (agg, formula) = if col.ends_with("_stats") {
                 if !parent_is_view {
-                    let base = &col[..col.len()-6];
-                    format!("aspiral_stats(\"{}\") as \"{}\"", base, col)
+                    base_col = col[..col.len()-6].to_string();
+                    (format!("aspiral_stats(\"{}\") as \"{}\"", base_col, col), "stats")
                 } else {
-                    format!("aspiral_stats_merge(\"{}\") as \"{}\"", col, col)
+                    // Try to extract base column from sources table if it exists
+                    (format!("aspiral_stats_merge(\"{}\") as \"{}\"", col, col), "stats")
                 }
             } else if col.ends_with("_sum") {
                 if !parent_is_view {
-                    let base = &col[..col.len()-4];
-                    format!("sum(\"{}\") as \"{}\"", base, col)
+                    base_col = col[..col.len()-4].to_string();
+                    (format!("sum(\"{}\") as \"{}\"", base_col, col), "sum")
                 } else {
-                    format!("sum(\"{}\") as \"{}\"", col, col)
+                    (format!("sum(\"{}\") as \"{}\"", col, col), "sum")
+                }
+            } else if col.ends_with("_count") {
+                if !parent_is_view {
+                    base_col = col[..col.len()-6].to_string();
+                    (format!("count(*) as \"{}\"", col), "count")
+                } else {
+                    (format!("sum(\"{}\") as \"{}\"", col, col), "count")
                 }
             } else if col.ends_with("_sketch") {
                 if !parent_is_view {
-                    let base = &col[..col.len()-7];
-                    format!("aspiral_sketch(\"{}\") as \"{}\"", base, col)
+                    base_col = col[..col.len()-7].to_string();
+                    (format!("aspiral_sketch(\"{}\") as \"{}\"", base_col, col), "sketch")
                 } else {
-                    format!("aspiral_sketch_merge(\"{}\") as \"{}\"", col, col)
+                    (format!("aspiral_sketch_merge(\"{}\") as \"{}\"", col, col), "sketch")
                 }
             } else if col.ends_with("_o") {
                 if !parent_is_view {
-                    let base = &col[..col.len()-2];
-                    format!("first(\"{}\", aspiral(t)) as \"{}\"", base, col)
+                    base_col = col[..col.len()-2].to_string();
+                    (format!("first(\"{}\", aspiral(t)) as \"{}\"", base_col, col), "ohlc_o")
                 } else {
-                    format!("first(\"{}\", aspiral(t)) as \"{}\"", col, col)
+                    (format!("first(\"{}\", aspiral(t)) as \"{}\"", col, col), "ohlc_o")
                 }
             } else if col.ends_with("_h") {
                 if !parent_is_view {
-                    let base = &col[..col.len()-2];
-                    format!("max(\"{}\") as \"{}\"", base, col)
+                    base_col = col[..col.len()-2].to_string();
+                    (format!("max(\"{}\") as \"{}\"", base_col, col), "ohlc_h")
                 } else {
-                    format!("max(\"{}\") as \"{}\"", col, col)
+                    (format!("max(\"{}\") as \"{}\"", col, col), "ohlc_h")
                 }
             } else if col.ends_with("_l") {
                 if !parent_is_view {
-                    let base = &col[..col.len()-2];
-                    format!("min(\"{}\") as \"{}\"", base, col)
+                    base_col = col[..col.len()-2].to_string();
+                    (format!("min(\"{}\") as \"{}\"", base_col, col), "ohlc_l")
                 } else {
-                    format!("min(\"{}\") as \"{}\"", col, col)
+                    (format!("min(\"{}\") as \"{}\"", col, col), "ohlc_l")
                 }
             } else if col.ends_with("_c") {
                 if !parent_is_view {
-                    let base = &col[..col.len()-2];
-                    format!("last(\"{}\", aspiral(t)) as \"{}\"", base, col)
+                    base_col = col[..col.len()-2].to_string();
+                    (format!("last(\"{}\", aspiral(t)) as \"{}\"", base_col, col), "ohlc_c")
                 } else {
-                    format!("last(\"{}\", aspiral(t)) as \"{}\"", col, col)
+                    (format!("last(\"{}\", aspiral(t)) as \"{}\"", col, col), "ohlc_c")
                 }
             } else if col == "h" || col.ends_with("_max") {
-                format!("max(\"{}\") as \"{}\"", col, col)
+                (format!("max(\"{}\") as \"{}\"", col, col), "max")
             } else if col == "l" || col.ends_with("_min") {
-                format!("min(\"{}\") as \"{}\"", col, col)
+                (format!("min(\"{}\") as \"{}\"", col, col), "min")
             } else if col == "volume" || col == "amount" || col.ends_with("_revenue") {
-                format!("sum(\"{}\") as \"{}\"", col, col)
+                (format!("sum(\"{}\") as \"{}\"", col, col), "sum")
             } else {
-                format!("last(\"{}\", aspiral(t)) as \"{}\"", col, col)
+                (format!("sum(\"{}\") as \"{}\"", col, col), "sum")
             };
+
+            // If the parent is a view, we need to lookup the true base_column from aspiral.sources.
+            if parent_is_view {
+                if let Ok(res) = client.select("SELECT base_column FROM aspiral.sources WHERE view_name = $1 AND mat_column = $2 LIMIT 1", None, unsafe { &[
+                    pgrx::datum::DatumWithOid::new(parent_name.into_datum().unwrap(), pg_sys::TEXTOID),
+                    pgrx::datum::DatumWithOid::new(col.clone().into_datum().unwrap(), pg_sys::TEXTOID),
+                ]}) {
+                    for row in res {
+                        if let Ok(Some(bc)) = row.get::<String>(1) {
+                            base_col = bc;
+                        }
+                        break;
+                    }
+                }
+            }
+
             select_cols.push(agg);
+            sources.push(SourceDef {
+                base_column: base_col,
+                formula: formula.to_string(),
+                mat_column: col.clone(),
+            });
         }
         
         let scope_cols_str = scope_columns.iter().map(|s| format!("\"{}\"", s.trim())).collect::<Vec<_>>().join(", ");
@@ -164,8 +202,9 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
             index_sql = index_sql
         );
 
-        Ok::<String, spi::Error>(sql)
+        Ok::< (String, Vec<SourceDef>), spi::Error>((sql, sources))
     }).unwrap_or_else(|e| {
         error!("Aspiral failed to derive child SQL for {}: {:?}", parent_name, e);
+        ("".to_string(), vec![])
     })
 }

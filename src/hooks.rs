@@ -3,12 +3,14 @@ use pgrx::pg_sys;
 use std::os::raw::{c_char, c_int};
 use std::ffi::CStr;
 use crate::{catalog, rollup};
+use std::cell::Cell;
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
 static mut PREV_PLANNER_HOOK: pg_sys::planner_hook_type = None;
 
 thread_local! { 
     static IN_UTILITY: Cell<bool> = Cell::new(false); 
+    static IN_HOOK: Cell<bool> = Cell::new(false);
 }
 
 #[pg_guard]
@@ -23,8 +25,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     completion_tag: *mut pg_sys::QueryCompletion,
 ) {
     let q_str = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
-    notice!("Aspiral Hook: Processing query: {:?}", &q_str[..std::cmp::min(100, q_str.len())]);
-
     if IN_UTILITY.with(|h| h.get()) {
         if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
             prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
@@ -37,7 +37,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
 
     let utility_stmt = (*pstmt).utilityStmt;
     let node_type = if !utility_stmt.is_null() { unsafe { (*(utility_stmt as *mut pg_sys::Node)).type_ } } else { pg_sys::NodeTag::T_Invalid };
-    info!("Aspiral Hook: UtilityStmt type: {:?}", node_type);
 
     let mut frames_opt: Option<String> = None;
     let mut tenant_opt: Option<String> = None;
@@ -48,14 +47,11 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     let mut is_matview = false;
     let mut aspiral_enabled = false;
     
-    let sql_text = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
-    if sql_text.to_lowercase().contains("-- aspiral: enabled") {
-        notice!("Aspiral Hook: Magic header found!");
+    if q_str.to_lowercase().contains("-- aspiral: enabled") {
         aspiral_enabled = true;
     }
 
     if !utility_stmt.is_null() {
-        let node_type = (*(utility_stmt as *mut pg_sys::Node)).type_;
         if node_type == pg_sys::NodeTag::T_CreateTableAsStmt {
             let ctas = utility_stmt as *mut pg_sys::CreateTableAsStmt;
             if (*ctas).objtype == pg_sys::ObjectType::OBJECT_MATVIEW {
@@ -69,14 +65,13 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 if !query.is_null() { scope_columns = get_grouping_columns(query); }
                 let options = (*into).options;
                 if !options.is_null() {
-                    let mut new_options = std::ptr::null_mut();
+                    let mut new_options: *mut pg_sys::List = std::ptr::null_mut();
                     for i in 0..(*options).length {
                         let def_elem = pg_sys::list_nth(options, i as i32) as *mut pg_sys::DefElem;
                         if !def_elem.is_null() {
                             let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
                             let defnamespace = if (*def_elem).defnamespace.is_null() { std::borrow::Cow::Borrowed("") } else { CStr::from_ptr((*def_elem).defnamespace).to_string_lossy() };
                             if defnamespace == "aspiral" || defname == "aspiral" || defname == "aspiral_enabled" || (defnamespace == "aspiral" && defname == "enabled") {
-                                notice!("Aspiral Hook (CTAS): Found aspiral option: {}.{}", defnamespace, defname);
                                 aspiral_enabled = true;
                                 let arg = (*def_elem).arg as *mut pg_sys::Node;
                                 if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
@@ -131,14 +126,13 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
             }
             let options = (*stmt).options;
             if !options.is_null() {
-                let mut new_options = std::ptr::null_mut();
+                let mut new_options: *mut pg_sys::List = std::ptr::null_mut();
                 for i in 0..(*options).length {
                     let def_elem = pg_sys::list_nth(options, i as i32) as *mut pg_sys::DefElem;
                     if !def_elem.is_null() {
                         let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
                         let defnamespace = if (*def_elem).defnamespace.is_null() { std::borrow::Cow::Borrowed("") } else { CStr::from_ptr((*def_elem).defnamespace).to_string_lossy() };
                         if defnamespace == "aspiral" || defname == "aspiral" || defname == "aspiral_enabled" || (defnamespace == "aspiral" && defname == "enabled") {
-                            notice!("Aspiral Hook (Create): Found aspiral option: {}.{}", defnamespace, defname);
                             aspiral_enabled = true;
                             let arg = (*def_elem).arg as *mut pg_sys::Node;
                             if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
@@ -166,16 +160,10 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
         }
     }
 
-    if aspiral_enabled {
-        crate::bgworker::maybe_start_worker();
-    }
+    if aspiral_enabled { crate::bgworker::maybe_start_worker(); }
 
     let mut handled_incrementally = false;
-    if let Some(ref name) = target_name {
-        if is_refresh {
-            handled_incrementally = reactive_refresh(name, None);
-        }
-    }
+    if let Some(ref name) = target_name { if is_refresh { handled_incrementally = reactive_refresh(name, None); } }
 
     if !handled_incrementally {
         if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
@@ -193,7 +181,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 let time_col = time_col_opt.clone().unwrap_or_else(|| "t".to_string());
                 crate::cluster_table_internal(&name, &time_col, dimensions);
             }
-            let sql_text = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
             if !is_matview && aspiral_enabled {
                 let actual_frames = frames_opt.unwrap_or_else(|| rollup::DEFAULT_FRAMES.to_string());
                 let table_name = name.clone();
@@ -202,7 +189,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 let mut projections = vec![format!("to_timestamptz((aspiral(\"{time_col}\")/{{0}})*{{0}}) as \"{time_col}\"")];
                 let mut groups = vec![format!("(aspiral(\"{time_col}\")/{{0}})*{{0}}")];
                 for tenant in &tenant_cols { let t = tenant.trim(); projections.push(format!("\"{t}\"")); groups.push(format!("\"{t}\"")); }
-                for line in sql_text.lines() {
+                for line in q_str.lines() {
                     if let Some(pos) = line.find("-- Aspiral:") {
                         let content_before = &line[..pos].trim();
                         if let Some(col) = content_before.split_whitespace().next() {
@@ -242,35 +229,20 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                         let root_view = format!("\"{}_ohlcv_{}\"", table_name, root_frame.name);
                         let select = projections.join(", ").replace("{0}", &root_frame.seconds.to_string());
                         let group_by = groups.join(", ").replace("{0}", &root_frame.seconds.to_string());
-                        
                         let index_sql = format!("CREATE INDEX IF NOT EXISTS \"idx_u_{table_name}_root\" ON {root_view}(t)");
-
-                        let root_sql = format!(
-                            "CREATE TABLE IF NOT EXISTS {root_view} AS SELECT {select} FROM \"{table_name}\" GROUP BY {group_by};
-                             {index_sql};",
-                            root_view = root_view, select = select, table_name = table_name, group_by = group_by, index_sql = index_sql
-                        );
+                        let root_sql = format!("CREATE TABLE IF NOT EXISTS {root_view} AS SELECT {select} FROM \"{table_name}\" GROUP BY {group_by}; {index_sql};", root_view = root_view, select = select, table_name = table_name, group_by = group_by, index_sql = index_sql);
                         let root_name = root_view.trim_matches('"').to_string();
                         match Spi::run(&root_sql) {
                             Ok(_) => {
-                                catalog::insert_metadata(&root_name, "BASE", root_frame.seconds, &table_name, tenant_cols.iter().map(|s| s.trim().to_string()).collect());
+                                let (_sql_child, sources) = rollup::derive_child_sql(&root_name, &table_name, root_frame.seconds, &tenant_cols.iter().map(|s| s.trim().to_string()).collect::<Vec<_>>());
+                                catalog::insert_metadata(&root_name, "BASE", root_frame.seconds, &table_name, tenant_cols.iter().map(|s| s.trim().to_string()).collect(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
+                                for src in sources { 
+                                    catalog::insert_source(&root_name, &table_name, root_frame.seconds, &src.base_column, &src.formula, &src.mat_column, pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); 
+                                }
                                 generate_hierarchy(&root_name, &actual_frames, tenant_cols.iter().map(|s| s.trim().to_string()).collect());
-                                
                                 for event in &["INSERT", "UPDATE", "DELETE"] {
-                                    let transition = match *event {
-                                        "INSERT" => "REFERENCING NEW TABLE AS new_table",
-                                        "UPDATE" => "REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table",
-                                        "DELETE" => "REFERENCING OLD TABLE AS old_table",
-                                        _ => ""
-                                    };
-                                    let trigger_sql = format!(
-                                        "CREATE TRIGGER aspiral_track_{base}_{event_lower} 
-                                         AFTER {event} ON \"{base}\" 
-                                         {transition}
-                                         FOR EACH STATEMENT EXECUTE FUNCTION aspiral_track_changes('{root}')",
-                                        base = table_name, event = event, event_lower = event.to_lowercase(),
-                                        transition = transition, root = root_name
-                                    );
+                                    let transition = match *event { "INSERT" => "REFERENCING NEW TABLE AS new_table", "UPDATE" => "REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table", "DELETE" => "REFERENCING OLD TABLE AS old_table", _ => "" };
+                                    let trigger_sql = format!("CREATE TRIGGER aspiral_track_{base}_{event_lower} AFTER {event} ON \"{base}\" {transition} FOR EACH STATEMENT EXECUTE FUNCTION aspiral_track_changes('{root}')", base = table_name, event = event, event_lower = event.to_lowercase(), transition = transition, root = root_name);
                                     let _ = Spi::run(&trigger_sql);
                                 }
                             },
@@ -280,26 +252,27 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 }
             } else if is_matview {
                 if let Some(frames_str) = frames_opt {
-                    catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone());
+                    let ctas = utility_stmt as *mut pg_sys::CreateTableAsStmt;
+                    let query = (*ctas).query as *mut pg_sys::Query;
+                    let rtable = (*query).rtable;
+
+                    let sources = unsafe { extract_aggregate_mappings(query, rtable) };
+                    catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
+                    for src in sources { 
+                        catalog::insert_source(&name, &name, 0, &src.base_column, &src.formula, &src.mat_column, pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); 
+                    }
                     generate_hierarchy(&name, &frames_str, scope_columns);
                 }
             }
         }
     }
-
     IN_UTILITY.with(|h| h.set(false));
 }
-
-use std::cell::Cell;
-thread_local! { static IN_HOOK: Cell<bool> = Cell::new(false); }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aspiral_planner_hook(
     parse: *mut pg_sys::Query, query_string: *const c_char, cursor_options: c_int, bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
-    let q_str = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
-    notice!("Aspiral Planner Hook: Processing query: {:?}", &q_str[..std::cmp::min(100, q_str.len())]);
-
     if IN_HOOK.with(|h| h.get()) {
         return if let Some(prev_hook) = PREV_PLANNER_HOOK { prev_hook(parse, query_string, cursor_options, bound_params) } else { pg_sys::standard_planner(parse, query_string, cursor_options, bound_params) };
     }
@@ -308,32 +281,41 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
     if query.commandType == pg_sys::CmdType::CMD_SELECT {
         let rtable = query.rtable;
         if !rtable.is_null() {
-            let mut is_aspiral = false;
+            let mut target_base_table: Option<String> = None;
             for i in 0..(*rtable).length {
                 let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
                 if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                     let relid = (*rte).relid;
                     let relname = pg_sys::get_rel_name(relid);
                     if !relname.is_null() {
-                        let name = CStr::from_ptr(relname).to_string_lossy();
-                        if catalog::is_aspiral_relation(&name) { is_aspiral = true; break; }
+                        let name = CStr::from_ptr(relname).to_string_lossy().into_owned();
+                        let has_rollups = Spi::connect(|client| {
+                            let res = client.select("SELECT 1 FROM aspiral.metadata WHERE base_view = $1 LIMIT 1", Some(1), 
+                                &[pgrx::datum::DatumWithOid::new(name.clone().into_datum(), pg_sys::TEXTOID)])?;
+                            Ok::<bool, spi::Error>(!res.is_empty())
+                        }).unwrap_or(false);
+                        if has_rollups { target_base_table = Some(name); break; }
                     }
                 }
             }
-            if is_aspiral {
-                let target_list = query.targetList;
-                for i in 0..(*target_list).length {
-                    let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
-                    if !(*tle).resname.is_null() {
-                        let resname = CStr::from_ptr((*tle).resname).to_string_lossy();
-                        if resname == "t" {
-                            let expr = (*tle).expr as *mut pg_sys::Expr;
-                            let node = expr as *mut pg_sys::Node;
-                            if !node.is_null() && (*node).type_ == pg_sys::NodeTag::T_Var {
-                                let var = node as *mut pg_sys::Var;
-                                if (*var).vartype == pg_sys::INT8OID { info!("Aspiral Planner: Transparently converting 't' to timestamptz for display."); }
-                            }
-                        }
+
+            if let Some(base_table) = target_base_table {
+                let (t_start, t_end) = extract_time_range(query.jointree, rtable);
+                if let (Some(ts), Some(te)) = (t_start, t_end) {
+                    let hierarchy = catalog::get_children(&base_table);
+                    if !hierarchy.is_empty() {
+                         let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te);
+                         let segments = resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges);
+                         if !segments.is_empty() && segments.iter().any(|s| s.source != base_table) {
+                             let cols = extract_query_columns(query, rtable);
+                             let union_sql = construct_union_sql(&base_table, &segments, &cols);
+                             let new_query = parse_sql_to_query(&union_sql);
+                             if !new_query.is_null() {
+                                 let result = if let Some(prev_hook) = PREV_PLANNER_HOOK { prev_hook(new_query, query_string, cursor_options, bound_params) } else { pg_sys::standard_planner(new_query, query_string, cursor_options, bound_params) };
+                                 IN_HOOK.with(|h| h.set(false));
+                                 return result;
+                             }
+                         }
                     }
                 }
             }
@@ -342,6 +324,158 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
     let result = if let Some(prev_hook) = PREV_PLANNER_HOOK { prev_hook(parse, query_string, cursor_options, bound_params) } else { pg_sys::standard_planner(parse, query_string, cursor_options, bound_params) };
     IN_HOOK.with(|h| h.set(false));
     result
+}
+
+#[derive(Debug)]
+struct Segment { source: String, t_start: i64, t_end: i64 }
+
+fn resolve_segments(base_table: &str, ts: i64, te: i64, hierarchy: &[String], dirty: &[(i64, i64)]) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut current_ts = ts;
+    let mut sorted_hierarchy: Vec<(String, i32)> = hierarchy.iter().filter_map(|h| catalog::get_metadata(h).map(|m| (h.clone(), m.frame_seconds))).collect();
+    sorted_hierarchy.sort_by_key(|h| -h.1);
+    while current_ts < te {
+        let is_dirty = dirty.iter().any(|(s, e)| current_ts >= *s && current_ts < *e);
+        if is_dirty {
+            let dirty_end = dirty.iter().filter(|(s, _)| current_ts >= *s).map(|(_, e)| *e).max().unwrap_or(current_ts);
+            let segment_end = te.min(dirty_end);
+            segments.push(Segment { source: base_table.to_string(), t_start: current_ts, t_end: segment_end });
+            current_ts = segment_end;
+            continue;
+        }
+        let mut found_frame = false;
+        for (h_name, frame_secs) in &sorted_hierarchy {
+            let f_s = *frame_secs as i64; if f_s == 0 { continue; }
+            let bucket_start = (current_ts / f_s) * f_s;
+            let bucket_end = bucket_start + f_s;
+            if current_ts == bucket_start && bucket_end <= te {
+                let bucket_dirty = dirty.iter().any(|(s, e)| !(*e <= bucket_start || *s >= bucket_end));
+                if !bucket_dirty { segments.push(Segment { source: h_name.clone(), t_start: bucket_start, t_end: bucket_end }); current_ts = bucket_end; found_frame = true; break; }
+            }
+        }
+        if !found_frame { let next_ts = te.min(current_ts + 60); segments.push(Segment { source: base_table.to_string(), t_start: current_ts, t_end: next_ts }); current_ts = next_ts; }
+    }
+    segments
+}
+
+unsafe fn extract_query_columns(query: *mut pg_sys::Query, rtable: *mut pg_sys::List) -> Vec<(String, Option<String>)> {
+    let mut cols = Vec::new();
+    let target_list = (*query).targetList;
+    if target_list.is_null() { return cols; }
+    for i in 0..(*target_list).length {
+        let tle = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
+        let node = (*tle).expr as *mut pg_sys::Node;
+        if node.is_null() { continue; }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_Var => {
+                let var = node as *mut pg_sys::Var;
+                let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
+                let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                if !varname.is_null() { cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None)); }
+            }
+            pg_sys::NodeTag::T_Aggref => {
+                let agg = node as *mut pg_sys::Aggref;
+                let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
+                if !agg_fn.is_null() {
+                    let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
+                    let args = (*agg).args;
+                    if !args.is_null() && (*args).length > 0 {
+                        let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
+                        let arg_expr = (*arg).expr as *mut pg_sys::Node;
+                        if !arg_expr.is_null() && (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
+                            let var = arg_expr as *mut pg_sys::Var;
+                            let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
+                            let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                            if !varname.is_null() { cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), Some(fn_name))); }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    cols
+}
+
+unsafe fn extract_time_range(jointree: *mut pg_sys::FromExpr, rtable: *mut pg_sys::List) -> (Option<i64>, Option<i64>) {
+    let mut t_start = None; let mut t_end = None;
+    if jointree.is_null() { return (None, None); }
+    let quals = (*jointree).quals as *mut pg_sys::Node;
+    if quals.is_null() { return (None, None); }
+    let mut stack = vec![quals];
+    while let Some(node) = stack.pop() {
+        if node.is_null() { continue; }
+        if (*node).type_ == pg_sys::NodeTag::T_OpExpr {
+            let op = node as *mut pg_sys::OpExpr;
+            let opname = pg_sys::get_opname((*op).opno);
+            if !opname.is_null() {
+                let name = CStr::from_ptr(opname).to_string_lossy();
+                let args = (*op).args;
+                if !args.is_null() && (*args).length == 2 {
+                    let left = pg_sys::list_nth(args, 0) as *mut pg_sys::Node;
+                    let right = pg_sys::list_nth(args, 1) as *mut pg_sys::Node;
+                    if (*left).type_ == pg_sys::NodeTag::T_Var && (*right).type_ == pg_sys::NodeTag::T_Const {
+                        let var = left as *mut pg_sys::Var;
+                        let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
+                        let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                        if !varname.is_null() && CStr::from_ptr(varname).to_string_lossy() == "t" {
+                            let con = right as *mut pg_sys::Const;
+                            let val = if (*con).consttype == pg_sys::INT8OID { Some(i64::from_datum((*con).constvalue, (*con).constisnull).unwrap()) } else { None };
+                            if let Some(v) = val { if name == ">=" { t_start = Some(v); } else if name == "<" { t_end = Some(v); } }
+                        }
+                    }
+                }
+            }
+        } else if (*node).type_ == pg_sys::NodeTag::T_BoolExpr {
+            let bexpr = node as *mut pg_sys::BoolExpr;
+            let args = (*bexpr).args;
+            for i in 0..(*args).length { stack.push(pg_sys::list_nth(args, i as i32) as *mut pg_sys::Node); }
+        }
+    }
+    (t_start, t_end)
+}
+
+unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
+    let c_sql = std::ffi::CString::new(sql).unwrap();
+    let raw_list = pg_sys::raw_parser(c_sql.as_ptr(), 0);
+    if raw_list.is_null() || (*raw_list).length == 0 { return std::ptr::null_mut(); }
+    let raw_stmt = pg_sys::list_nth(raw_list, 0) as *mut pg_sys::RawStmt;
+    let query_list = pg_sys::pg_analyze_and_rewrite_withcb(raw_stmt, c_sql.as_ptr(), None, std::ptr::null_mut(), std::ptr::null_mut());
+    if query_list.is_null() || (*query_list).length == 0 { return std::ptr::null_mut(); }
+    pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query
+}
+
+fn map_agg_inner(agg_fn: &str, col: &str, is_rollup: bool) -> String {
+    if !is_rollup { 
+        return match agg_fn.to_lowercase().as_str() { "avg" => format!("sum(\"{0}\") as \"{0}_sum_part\", count(\"{0}\") as \"{0}_count_part\"", col), _ => format!("{}(\"{}\")", agg_fn, col) };
+    }
+    match agg_fn.to_lowercase().as_str() {
+        "sum" => format!("sum(\"{}_sum\")", col), "count" => format!("sum(\"{}_count\")", col),
+        "min" => format!("min(\"{}_min\")", col), "max" => format!("max(\"{}_max\")", col),
+        "avg" => format!("sum(\"{0}_sum\") as \"{0}_sum_part\", sum(\"{0}_count\") as \"{0}_count_part\"", col),
+        _ => format!("{}(\"{}\")", agg_fn, col),
+    }
+}
+
+fn map_agg_outer(agg_fn: &str, col: &str) -> String {
+    match agg_fn.to_lowercase().as_str() { "sum" | "count" | "min" | "max" => format!("{}(\"{}\")", agg_fn, col), "avg" => format!("sum(\"{0}_sum_part\") / sum(\"{0}_count_part\")", col), _ => format!("{}(\"{}\")", agg_fn, col) }
+}
+
+fn construct_union_sql(base_table: &str, segments: &[Segment], cols: &[(String, Option<String>)]) -> String {
+    let mut select_parts = Vec::new();
+    for (col, agg) in cols { if let Some(agg_fn) = agg { select_parts.push(format!("{} as \"{}\"", map_agg_outer(agg_fn, col), col)); } else { select_parts.push(format!("\"{}\"", col)); } }
+    let mut union_parts = Vec::new();
+    for seg in segments {
+        let mut inner_select = Vec::new();
+        for (col, agg) in cols { if let Some(agg_fn) = agg { let is_rollup = seg.source != base_table; inner_select.push(map_agg_inner(agg_fn, col, is_rollup)); } else { inner_select.push(format!("\"{}\"", col)); } }
+        let where_clause = format!("t >= to_timestamptz({}) AND t < to_timestamptz({})", seg.t_start, seg.t_end);
+        let group_by = cols.iter().filter(|(_, agg)| agg.is_none()).map(|(col, _)| format!("\"{}\"", col)).collect::<Vec<_>>();
+        let group_by_str = if group_by.is_empty() { "".to_string() } else { format!(" GROUP BY {}", group_by.join(", ")) };
+        union_parts.push(format!("SELECT {} FROM {} WHERE {}{}", inner_select.join(", "), seg.source, where_clause, group_by_str));
+    }
+    let final_group_by = cols.iter().filter(|(_, agg)| agg.is_none()).map(|(col, _)| format!("\"{}\"", col)).collect::<Vec<_>>();
+    let final_group_by_str = if final_group_by.is_empty() { "".to_string() } else { format!(" GROUP BY {}", final_group_by.join(", ")) };
+    format!("SELECT {} FROM ({}) s{}", select_parts.join(", "), union_parts.join(" UNION ALL "), final_group_by_str)
 }
 
 pub fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<String>) {
@@ -353,16 +487,55 @@ pub fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<
     for frame in frames {
         let child_name = format!("{}_{}", base_prefix, frame.name);
         if child_name == current_parent { continue; }
-        info!("Aspiral creating child view '{}' from parent '{}'", child_name, current_parent);
-        let sql = rollup::derive_child_sql(&child_name, &current_parent, frame.seconds, &scope_columns);
-        match Spi::run(&sql) {
-            Ok(_) => {
-                catalog::insert_metadata(&child_name, &current_parent, frame.seconds, base_name, scope_columns.clone());
-                current_parent = child_name;
-            },
-            Err(e) => warning!("Aspiral failed to create child view {}: {:?}", child_name, e),
+        let (sql, sources) = rollup::derive_child_sql(&child_name, &current_parent, frame.seconds, &scope_columns);
+        match Spi::run(&sql) { 
+            Ok(_) => { 
+                catalog::insert_metadata(&child_name, &current_parent, frame.seconds, base_name, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); 
+                for src in sources {
+                    catalog::insert_source(&child_name, base_name, frame.seconds, &src.base_column, &src.formula, &src.mat_column, pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
+                }
+                current_parent = child_name; 
+            }, 
+            Err(e) => warning!("Aspiral failed to create child view {}: {:?}", child_name, e), 
         }
     }
+}
+
+unsafe fn extract_aggregate_mappings(query: *mut pg_sys::Query, rtable: *mut pg_sys::List) -> Vec<rollup::SourceDef> {
+    let mut sources = Vec::new();
+    let target_list = (*query).targetList;
+    if target_list.is_null() { return sources; }
+
+    for i in 0..(*target_list).length {
+        let tle = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
+        if tle.is_null() || (*tle).resname.is_null() { continue; }
+        let mat_column = CStr::from_ptr((*tle).resname).to_string_lossy().into_owned();
+        let expr = (*tle).expr as *mut pg_sys::Node;
+        if expr.is_null() { continue; }
+
+        if (*expr).type_ == pg_sys::NodeTag::T_Aggref {
+            let agg = expr as *mut pg_sys::Aggref;
+            let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
+            if !agg_fn.is_null() {
+                let formula = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
+                let args = (*agg).args;
+                if !args.is_null() && (*args).length > 0 {
+                    let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
+                    let arg_expr = (*arg).expr as *mut pg_sys::Node;
+                    if !arg_expr.is_null() && (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
+                        let var = arg_expr as *mut pg_sys::Var;
+                        let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
+                        let base_col_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                        if !base_col_ptr.is_null() {
+                            let base_column = CStr::from_ptr(base_col_ptr).to_string_lossy().into_owned();
+                            sources.push(rollup::SourceDef { base_column, formula, mat_column });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sources
 }
 
 unsafe fn get_grouping_columns(query: *mut pg_sys::Query) -> Vec<String> {
@@ -371,15 +544,12 @@ unsafe fn get_grouping_columns(query: *mut pg_sys::Query) -> Vec<String> {
     if !query_ref.groupClause.is_null() {
         let group_clause = query_ref.groupClause;
         for i in 0..(*group_clause).length {
-            let sg_clause = pg_sys::list_nth(group_clause, i) as *mut pg_sys::SortGroupClause;
+            let sg_clause = pg_sys::list_nth(group_clause, i as i32) as *mut pg_sys::SortGroupClause;
             let ref_id = (*sg_clause).tleSortGroupRef;
             let target_list = query_ref.targetList;
             for j in 0..(*target_list).length {
-                let tle = pg_sys::list_nth(target_list, j) as *mut pg_sys::TargetEntry;
-                if (*tle).ressortgroupref == ref_id {
-                    if !(*tle).resname.is_null() { let name = CStr::from_ptr((*tle).resname).to_string_lossy().into_owned(); if name != "t" { names.push(name); } }
-                    break;
-                }
+                let tle = pg_sys::list_nth(target_list, j as i32) as *mut pg_sys::TargetEntry;
+                if (*tle).ressortgroupref == ref_id { if !(*tle).resname.is_null() { let name = CStr::from_ptr((*tle).resname).to_string_lossy().into_owned(); if name != "t" { names.push(name); } } break; }
             }
         }
     }
@@ -389,22 +559,12 @@ unsafe fn get_grouping_columns(query: *mut pg_sys::Query) -> Vec<String> {
 pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     let metadata = catalog::get_metadata(base_name);
     let is_root = metadata.as_ref().map(|m| m.parent_view == "BASE").unwrap_or(false);
-
-    if is_root {
-        catalog::unify_changelog(base_name);
-    }
-
-    if crate::refresh_incremental(base_name, where_clause.clone()) {
-        if where_clause.is_none() && is_root {
-            let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", base_name.replace("'", "''")));
-        }
-        return true;
-    }
+    if is_root { catalog::unify_changelog(base_name); }
+    if crate::refresh_incremental(base_name, where_clause.clone()) { if where_clause.is_none() && is_root { let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", base_name.replace("'", "''"))); } return true; }
     false
 }
 
 pub unsafe fn init_hooks() {
-    notice!("Aspiral: Initializing hooks...");
     PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
     pg_sys::ProcessUtility_hook = Some(aspiral_process_utility_hook);
     PREV_PLANNER_HOOK = pg_sys::planner_hook;

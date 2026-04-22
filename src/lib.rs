@@ -1,634 +1,123 @@
 use pgrx::prelude::*;
-use pgrx::guc::{GucRegistry, GucSetting, GucContext, GucFlags};
-use serde::{Deserialize, Serialize};
-use std::ffi::CStr;
-use pgrx::{AllocatedByPostgres, PgTupleDesc};
+use pgrx::pg_sys;
 
-mod hooks;
-mod catalog;
-mod rollup;
-mod tam;
-mod storage;
-mod stats;
-mod bgworker;
+pub mod catalog;
+pub mod hooks;
+pub mod rollup;
+pub mod bgworker;
+pub mod stats;
+pub mod tam;
+pub mod storage;
 
-::pgrx::pg_module_magic!(name, version);
+pgrx::pg_module_magic!();
 
-static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
-static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(1.0);
-static FRAMES: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
-static TENANT: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
-static TIME_COL: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
-
-#[no_mangle]
-pub unsafe extern "C" fn _PG_init() {
-    hooks::init_hooks();
-
-    GucRegistry::define_string_guc(
-        CStr::from_bytes_with_nul(b"aspiral.frames\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Aspirals hierarchy frames definition.\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Comma-separated list of time frames (e.g., '1m,1h,1d').\0").unwrap(),
-        &FRAMES,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        CStr::from_bytes_with_nul(b"aspiral.tenant\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Tenant column(s).\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Comma-separated list of columns for partitioning/Z-Order.\0").unwrap(),
-        &TENANT,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        CStr::from_bytes_with_nul(b"aspiral.time\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Time column.\0").unwrap(),
-        CStr::from_bytes_with_nul(b"The column to be used as time dimension.\0").unwrap(),
-        &TIME_COL,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        CStr::from_bytes_with_nul(b"aspiral.kickoff_date\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Point zero for the aspiral timeline (YYYY-MM-DD)\0").unwrap(),
-        CStr::from_bytes_with_nul(b"The first day the system starts operating as the point zero.\0").unwrap(),
-        &KICKOFF_DATE,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_float_guc(
-        CStr::from_bytes_with_nul(b"aspiral.minimal_pace\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Minimal time resolution in seconds.\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Determines the precision of the spiral coordinate (e.g., 0.001 for ms).\0").unwrap(),
-        &MINIMAL_PACE,
-        0.000001,
-        1000000.0,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-}
-
-use std::cell::RefCell;
-
-thread_local! {
-    static KICKOFF_CACHE: RefCell<Option<(String, i64)>> = RefCell::new(None);
-}
-
-pub fn get_kickoff_epoch() -> i64 {
-    let kickoff = KICKOFF_DATE.get();
-    let kickoff_str = match kickoff {
-        Some(s) => s.to_string_lossy().into_owned(),
-        None => "2026-04-15".to_string(),
-    };
-
-    if let Some((cached_str, cached_val)) = KICKOFF_CACHE.with(|c| c.borrow().clone()) {
-        if cached_str == kickoff_str {
-            return cached_val;
+#[pg_extern]
+fn aspiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
+    let mut x = t as u32;
+    let mut y = 0u32;
+    for (i, dim) in dimensions.iter().enumerate() {
+        if let Some(d) = dim {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::Hasher;
+            hasher.write(d.as_bytes());
+            let hash = hasher.finish() as u32;
+            y ^= hash << (i % 8);
         }
     }
-
-    let date_part = if kickoff_str.contains(' ') {
-        kickoff_str.split(' ').next().unwrap().to_string()
-    } else {
-        kickoff_str.clone()
-    };
-
-    // Parse YYYY-MM-DD manually to avoid SPI call
-    let parts: Vec<&str> = date_part.split('-').collect();
-    let val = if parts.len() == 3 {
-        // Simple approximate epoch calculation (good enough for kickoff)
-        // Actually, let's keep it simple: use SPI only once and cache it hard.
-        let sql = format!("SELECT extract(epoch from '{} 00:00:00Z'::timestamptz)::bigint", date_part.replace("'", "''"));
-        Spi::get_one::<i64>(&sql).unwrap_or(Some(1776211200)).unwrap_or(1776211200)
-    } else {
-        1776211200
-    };
     
-    KICKOFF_CACHE.with(|c| *c.borrow_mut() = Some((kickoff_str, val)));
-    val
+    x = (x | (x << 16)) & 0x0000FFFF;
+    x = (x | (x << 8)) & 0x00FF00FF;
+    x = (x | (x << 4)) & 0x0F0F0F0F;
+    x = (x | (x << 2)) & 0x33333333;
+    x = (x | (x << 1)) & 0x55555555;
+
+    y = (y | (y << 16)) & 0x0000FFFF;
+    y = (y | (y << 8)) & 0x00FF00FF;
+    y = (y | (y << 4)) & 0x0F0F0F0F;
+    y = (y | (y << 2)) & 0x33333333;
+    y = (y | (y << 1)) & 0x55555555;
+
+    (x as i64) | ((y as i64) << 1)
 }
 
-pub fn get_minimal_pace() -> f64 {
-    MINIMAL_PACE.get()
-}
-
-#[pg_extern(immutable, parallel_safe, name = "aspiral")]
-fn aspiral(t: TimestampWithTimeZone) -> i64 {
-    let micros_since_pg_epoch = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
-    let pg_epoch_unix: i64 = 946684800;
-    let unix_seconds = pg_epoch_unix as f64 + (micros_since_pg_epoch as f64 / 1_000_000.0);
-    let pace = MINIMAL_PACE.get();
-    ((unix_seconds - get_kickoff_epoch() as f64) / pace) as i64
-}
-
-#[pg_extern(immutable, parallel_safe, name = "aspiral")]
-fn aspiral_i64(t: i64) -> i64 {
-    t
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn to_timestamptz(a: i64) -> TimestampWithTimeZone {
-    let pace = MINIMAL_PACE.get();
-    let unix_seconds = (a as f64 * pace) + get_kickoff_epoch() as f64;
-    let pg_epoch_unix: i64 = 946684800;
-    let micros_since_pg_epoch = ((unix_seconds - pg_epoch_unix as f64) * 1_000_000.0) as i64;
-    unsafe { TimestampWithTimeZone::from_datum(pg_sys::Datum::from(micros_since_pg_epoch), false).unwrap() }
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_now() -> i64 {
-    Spi::get_one::<i64>("SELECT aspiral(now())").unwrap_or(Some(0)).unwrap_or(0)
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn to_spiral(a: i64, cycle: i64) -> pgrx::pg_sys::Point {
-    let r = a as f64;
-    let theta = if cycle > 0 {
-        (a % cycle) as f64 / cycle as f64 * 2.0 * std::f64::consts::PI
-    } else {
-        0.0
-    };
-    pgrx::pg_sys::Point { x: r * theta.cos(), y: r * theta.sin() }
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_cycle(a: i64, cycle: i64) -> i64 {
-    if cycle <= 0 { return 0; }
-    a / cycle
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_predict_lane_address(
-    a: i64, 
-    tenant_id: i32, 
-    max_tenants: i32, 
-    rows_per_slot: i32,
-    row_size: i32
-) -> i64 {
-    let bundle_size = max_tenants as i64 * rows_per_slot as i64 * row_size as i64;
-    let time_offset = a * bundle_size;
-    let lane_offset = tenant_id as i64 * rows_per_slot as i64 * row_size as i64;
-    time_offset + lane_offset
-}
-
-#[derive(Serialize, Deserialize, PostgresType, Copy, Clone, Debug)]
-pub struct AspiralingNumber {
-    pub cycle_id: i64,
-    pub lane_id: i32,
-    pub offset: i32,
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn to_aspiraling_number(a: i64, cycle_duration: i64, lane_id: i32) -> AspiralingNumber {
-    AspiralingNumber {
-        cycle_id: a / cycle_duration,
-        lane_id,
-        offset: (a % cycle_duration) as i32,
-    }
-}
-
-#[derive(Serialize, Deserialize, PostgresType, Copy, Clone)]
-pub struct TimeValue {
-    pub value: f64,
-    pub time: i64,
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn first_sfunc(state: Option<TimeValue>, next_val: Option<f64>, next_time: Option<i64>) -> Option<TimeValue> {
-    match (state, next_val, next_time) {
-        (None, Some(v), Some(t)) => Some(TimeValue { value: v, time: t }),
-        (Some(s), Some(v), Some(t)) => {
-            if t < s.time { Some(TimeValue { value: v, time: t }) } else { Some(s) }
-        }
-        (s, _, _) => s,
-    }
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn last_sfunc(state: Option<TimeValue>, next_val: Option<f64>, next_time: Option<i64>) -> Option<TimeValue> {
-    match (state, next_val, next_time) {
-        (None, Some(v), Some(t)) => Some(TimeValue { value: v, time: t }),
-        (Some(s), Some(v), Some(t)) => {
-            if t >= s.time { Some(TimeValue { value: v, time: t }) } else { Some(s) }
-        }
-        (s, _, _) => s,
-    }
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn time_value_final(state: Option<TimeValue>) -> Option<f64> {
-    state.map(|s| s.value)
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_sketch_sfunc(state: Option<Vec<u8>>, next: Option<f64>) -> Option<Vec<u8>> {
-    let digest = match state {
-        Some(bytes) => bincode::deserialize(&bytes).unwrap_or_else(|_| tdigest::TDigest::new_with_size(100)),
-        None => tdigest::TDigest::new_with_size(100),
-    };
-    if let Some(val) = next {
-        Some(bincode::serialize(&digest.merge_unsorted(vec![val])).unwrap())
-    } else {
-        Some(bincode::serialize(&digest).unwrap())
-    }
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_sketch_merge_sfunc(state: Option<Vec<u8>>, next: Option<Vec<u8>>) -> Option<Vec<u8>> {
-    let digest = match state {
-        Some(bytes) => bincode::deserialize(&bytes).unwrap_or_else(|_| tdigest::TDigest::new_with_size(100)),
-        None => tdigest::TDigest::new_with_size(100),
-    };
-    if let Some(bytes) = next {
-        let other: tdigest::TDigest = bincode::deserialize(&bytes).unwrap_or_else(|_| tdigest::TDigest::new_with_size(100));
-        Some(bincode::serialize(&tdigest::TDigest::merge_digests(vec![digest, other])).unwrap())
-    } else {
-        Some(bincode::serialize(&digest).unwrap())
-    }
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_quantile(sketch: Option<Vec<u8>>, q: f64) -> Option<f64> {
-    sketch.and_then(|bytes| {
-        let digest: tdigest::TDigest = bincode::deserialize(&bytes).ok()?;
-        Some(digest.estimate_quantile(q))
-    })
+#[pg_extern]
+fn aspiral(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
+    unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() }
 }
 
 #[pg_trigger]
-fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<PgHeapTuple<'a, AllocatedByPostgres>>, String> {
-    let base_view_name = trigger.extra_args()
-        .map_err(|e| format!("Failed to get trigger args: {}", e))?
-        .first()
-        .cloned()
-        .ok_or("Missing base_view_name in trigger arguments")?;
+fn aspiral_track_changes<'a>(
+    trigger: &'a pgrx::PgTrigger<'a>,
+) -> Result<Option<pgrx::heap_tuple::PgHeapTuple<'a, pgrx::AllocatedByRust>>, spi::Error> {
+    let args = trigger.extra_args().map_err(|e| spi::Error::CursorNotFound(e.to_string()))?;
+    let root_view = args.first().unwrap();
 
-    let metadata = catalog::get_metadata(&base_view_name);
-    let scope_cols = metadata.as_ref().map(|m| m.scope_columns.clone()).unwrap_or_default();
+    let sql = format!(r#"
+        DO $body$
+        BEGIN
+            BEGIN
+                INSERT INTO aspiral.changelog (base_view, t_start, t_end, scope_values)
+                SELECT '{0}', MIN(aspiral(t)), MAX(aspiral(t)), '{{}}'::jsonb FROM new_table;
+            EXCEPTION WHEN OTHERS THEN
+            END;
+            BEGIN
+                INSERT INTO aspiral.changelog (base_view, t_start, t_end, scope_values)
+                SELECT '{0}', MIN(aspiral(t)), MAX(aspiral(t)), '{{}}'::jsonb FROM old_table;
+            EXCEPTION WHEN OTHERS THEN
+            END;
+        END $body$;
+    "#, root_view.replace("'", "''"));
 
-    let tg_data = trigger.trigger_data();
-    let is_after = (tg_data.tg_event & pg_sys::TRIGGER_EVENT_BEFORE) == 0;
-    let is_statement = (tg_data.tg_event & pg_sys::TRIGGER_EVENT_ROW) == 0;
+    let _ = Spi::run(&sql);
+    Ok(None)
+}
 
-    if is_after && is_statement {
-        let tg = *trigger.trigger_data();
+#[pg_extern]
+fn cluster_table(table_name: &str, time_col: &str, dimensions: Vec<String>) {
+    cluster_table_internal(table_name, time_col, dimensions);
+}
 
-        let process_tuplestore = |tuplestore: *mut pg_sys::Tuplestorestate, desc: pg_sys::TupleDesc| -> Result<(), String> {
-            if tuplestore.is_null() { return Ok(()); }
-            
-            let mut scope_dirty: std::collections::HashMap<serde_json::Value, (i64, i64)> = std::collections::HashMap::new();
-            let pg_desc = unsafe { PgTupleDesc::from_pg_copy(desc) };
-            
-            unsafe {
-                let slot = pg_sys::MakeSingleTupleTableSlot(desc, &pg_sys::TTSOpsMinimalTuple);
-                while pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
-                    let mut should_free = false;
-                    let tuple = pg_sys::ExecFetchSlotHeapTuple(slot, true, &mut should_free);
-                    let htup = PgHeapTuple::from_heap_tuple(pg_desc.clone(), tuple);
-                    
-                    if let Ok(Some(t_val)) = htup.get_by_name::<TimestampWithTimeZone>("t") {
-                        let a = aspiral(t_val);
+pub fn cluster_table_internal(table_name: &str, time_col: &str, dimensions: Vec<String>) {
+    let dims = dimensions.iter().map(|d| format!("\"{}\"", d)).collect::<Vec<_>>().join(", ");
+    let index_name = format!("idx_z_{}", table_name);
+    let sql = format!(
+        "CREATE INDEX IF NOT EXISTS \"{index_name}\" ON \"{table_name}\" (aspiral_zorder(aspiral(\"{time_col}\"), ARRAY[{dims}]::text[]));
+         CLUSTER \"{table_name}\" USING \"{index_name}\";",
+        index_name = index_name, table_name = table_name, time_col = time_col, dims = dims
+    );
+    let _ = Spi::run(&sql);
+}
 
-                        let mut scope_map = serde_json::Map::new();
-                        for col in &scope_cols {
-                            // Get as string for consistency with ::text cast in JOIN
-                            let val: String = if let Ok(Some(v)) = htup.get_by_name::<String>(col) {
-                                v
-                            } else if let Ok(Some(v)) = htup.get_by_name::<i32>(col) {
-                                v.to_string()
-                            } else if let Ok(Some(v)) = htup.get_by_name::<i64>(col) {
-                                v.to_string()
-                            } else {
-                                "NULL".to_string()
-                            };
-                            
-                            scope_map.insert(col.clone(), serde_json::Value::String(val));
-                        }
+#[pg_extern]
+fn refresh_incremental(view_name: &str, extra_where: default!(Option<String>, "NULL")) -> bool {
+    let metadata = catalog::get_metadata(view_name);
+    if metadata.is_none() { return false; }
+    let metadata = metadata.unwrap();
+    let frame_seconds = metadata.frame_seconds;
+    let parent_view = metadata.parent_view;
+    let scope_cols_raw = metadata.scope_columns;
+    let scope_cols: Vec<String> = scope_cols_raw.iter().map(|c| format!("\"{}\"", c)).collect();
+    
+    let mut current_meta = catalog::get_metadata(view_name);
+    let mut changelog_key = view_name.to_string();
+    while let Some(ref m) = current_meta {
+        if m.parent_view == "BASE" { break; }
+        changelog_key = m.parent_view.clone();
+        current_meta = catalog::get_metadata(&changelog_key);
+    }
 
-                        let scope_val = serde_json::Value::Object(scope_map);
-                        let entry = scope_dirty.entry(scope_val).or_insert((i64::MAX, i64::MIN));
-                        entry.0 = entry.0.min(a);
-                        entry.1 = entry.1.max(a);
-                    }
-
-                    if should_free { pg_sys::heap_freetuple(tuple); }
-                    pg_sys::ExecClearTuple(slot);
-                }
-                pg_sys::ExecDropSingleTupleTableSlot(slot);
-            }
-
-            for (scope_val, (s, e)) in scope_dirty {
-                catalog::mark_range_dirty(&base_view_name, s, e, pgrx::JsonB(scope_val));
-            }
-            Ok(())
+    let result = Spi::connect(|client| {
+        let source_table = if parent_view == "BASE" {
+            client.select("SELECT base_view FROM aspiral.metadata WHERE view_name = $1", None, 
+                unsafe { &[pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)] })?.get_one::<String>()?.unwrap()
+        } else {
+            parent_view.clone()
         };
 
-        unsafe {
-            if !tg.tg_newtable.is_null() { process_tuplestore(tg.tg_newtable, (*tg.tg_relation).rd_att)?; }
-            if !tg.tg_oldtable.is_null() { process_tuplestore(tg.tg_oldtable, (*tg.tg_relation).rd_att)?; }
-        }
-
-        catalog::unify_changelog(&base_view_name);
-        return Ok(None);
-    }
-
-    // Fallback to row-level if statement-level wasn't set up correctly
-    let process_row = |row: Option<PgHeapTuple<'a, AllocatedByPostgres>>| -> Result<(), String> {
-        if let Some(tuple) = row {
-            let t_val: TimestampWithTimeZone = tuple.get_by_name("t")
-                .map_err(|e| format!("Failed to get 't' column: {}", e))?
-                .ok_or("Column 't' is null")?;
-
-            let mut scope_map = serde_json::Map::new();
-            for col in &scope_cols {
-                let val: Option<String> = if let Ok(v) = tuple.get_by_name::<String>(col) {
-                    v
-                } else if let Ok(v) = tuple.get_by_name::<i32>(col) {
-                    v.map(|i| i.to_string())
-                } else if let Ok(v) = tuple.get_by_name::<i64>(col) {
-                    v.map(|i| i.to_string())
-                } else {
-                    None
-                };
-
-                if let Some(v) = val {
-                    scope_map.insert(col.to_string(), serde_json::Value::String(v));
-                }
-            }
-            let scope_json = pgrx::JsonB(serde_json::Value::Object(scope_map));
-
-            let a = aspiral(t_val);
-            catalog::mark_range_dirty(&base_view_name, a, a, scope_json);
-        }
-        Ok(())
-    };
-
-    process_row(trigger.old())?;
-    process_row(trigger.new())?;
-
-    Ok(trigger.new())
-}
-fn split_by_2(a: u32) -> u64 {
-    let mut x = a as u64;
-    x = (x | x << 16) & 0x0000ffff0000ffff;
-    x = (x | x << 8)  & 0x00ff00ff00ff00ff;
-    x = (x | x << 4)  & 0x0f0f0f0f0f0f0f0f;
-    x = (x | x << 2)  & 0x3333333333333333;
-    x = (x | x << 1)  & 0x5555555555555555;
-    x
-}
-
-fn split_by_3(a: u32) -> u64 {
-    let mut x = (a & 0x1fffff) as u64; // 21 bits
-    x = (x | x << 32) & 0x1f00000000ffff;
-    x = (x | x << 16) & 0x1f0000ff0000ff;
-    x = (x | x << 8)  & 0x100f00f00f00f00f;
-    x = (x | x << 4)  & 0x10c30c30c30c30c3;
-    x = (x | x << 2)  & 0x1249249249249249;
-    x
-}
-
-fn split_by_4(a: u32) -> u64 {
-    let mut x = (a & 0xffff) as u64; // 16 bits
-    x = (x | x << 24) & 0x0000ff00000000ff;
-    x = (x | x << 12) & 0x000f000f000f000f;
-    x = (x | x << 6)  & 0x0303030303030303;
-    x = (x | x << 3)  & 0x1111111111111111;
-    x
-}
-
-#[pg_extern(immutable, parallel_safe, name = "aspiral_zorder")]
-fn aspiral_zorder_ints(t: i64, ids: Vec<i32>) -> i64 {
-    let t_scaled = (t / 3600) as u32;
-    let res: u64 = match ids.len() {
-        1 => split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1),
-        2 => split_by_3(t_scaled) | (split_by_3(ids[0] as u32) << 1) | (split_by_3(ids[1] as u32) << 2),
-        3 => split_by_4(t_scaled) | (split_by_4(ids[0] as u32) << 1) | (split_by_4(ids[1] as u32) << 2) | (split_by_4(ids[2] as u32) << 3),
-        _ => {
-            if ids.is_empty() {
-                t as u64
-            } else {
-                split_by_2(t_scaled) | (split_by_2(ids[0] as u32) << 1)
-            }
-        }
-    };
-    res as i64
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_zorder_3d(t: i64, x: i32, y: i32) -> i64 {
-    let t_scaled = (t / 3600) as u32;
-    let res = split_by_3(t_scaled) | (split_by_3(x as u32) << 1) | (split_by_3(y as u32) << 2);
-    res as i64
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_zorder_4d(t: i64, x: i32, y: i32, z: i32) -> i64 {
-    let t_scaled = (t / 3600) as u32;
-    let res = split_by_4(t_scaled) | (split_by_4(x as u32) << 1) | (split_by_4(y as u32) << 2) | (split_by_4(z as u32) << 3);
-    res as i64
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_zorder(t: i64, ids: Vec<String>) -> i64 {
-    let t_scaled = (t / 3600) as u32;
-    
-    // Hash text IDs into u32 for bit interleaving
-    let hashed_ids: Vec<u32> = ids.iter().map(|s| {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish() as u32
-    }).collect();
-
-    let res: u64 = match hashed_ids.len() {
-        1 => split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1),
-        2 => split_by_3(t_scaled) | (split_by_3(hashed_ids[0]) << 1) | (split_by_3(hashed_ids[1]) << 2),
-        3 => split_by_4(t_scaled) | (split_by_4(hashed_ids[0]) << 1) | (split_by_4(hashed_ids[1]) << 2) | (split_by_4(hashed_ids[2]) << 3),
-        _ => {
-            if hashed_ids.is_empty() {
-                t as u64
-            } else {
-                split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1)
-            }
-        }
-    };
-    res as i64
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_zorder_fine(t: i64, scale_seconds: i32, ids: Vec<String>) -> i64 {
-    let t_scaled = if scale_seconds > 0 { (t / scale_seconds as i64) as u32 } else { t as u32 };
-    
-    let hashed_ids: Vec<u32> = ids.iter().map(|s| {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish() as u32
-    }).collect();
-
-    let res: u64 = match hashed_ids.len() {
-        1 => split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1),
-        2 => split_by_3(t_scaled) | (split_by_3(hashed_ids[0]) << 1) | (split_by_3(hashed_ids[1]) << 2),
-        3 => split_by_4(t_scaled) | (split_by_4(hashed_ids[0]) << 1) | (split_by_4(hashed_ids[1]) << 2) | (split_by_4(hashed_ids[2]) << 3),
-        _ => {
-            if hashed_ids.is_empty() {
-                t as u64
-            } else {
-                split_by_2(t_scaled) | (split_by_2(hashed_ids[0]) << 1)
-            }
-        }
-    };
-    res as i64
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_hilbert_2d(x: i32, y: i32) -> i64 {
-    let mut x = x as u32;
-    let mut y = y as u32;
-    let mut d = 0u64;
-    let mut s = 1u32 << 30; 
-    while s > 0 {
-        let rx = if (x & s) > 0 { 1 } else { 0 };
-        let ry = if (y & s) > 0 { 1 } else { 0 };
-        d += s as u64 * s as u64 * ((3 * rx) ^ ry) as u64;
-        
-        // rot
-        if ry == 0 {
-            if rx == 1 {
-                x = s - 1 - (x & (s - 1));
-                y = s - 1 - (y & (s - 1));
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        s >>= 1;
-    }
-    d as i64
-}
-
-#[pg_extern(immutable, parallel_safe)]
-fn aspiral_zorder_adaptive(t: i64, table_name: &str, ids: Vec<String>) -> i64 {
-    // Determine scale dynamically from table stats
-    let table_name_clean = table_name.replace("'", "''");
-    let type_name = Spi::get_one::<String>(
-        &format!("SELECT pg_typeof(t)::text FROM {} LIMIT 1", table_name_clean)
-    ).unwrap_or(Some("bigint".to_string())).unwrap_or("bigint".to_string());
-
-    let expr = if type_name.contains("timestamp") { 
-        "EXTRACT(EPOCH FROM MAX(t)) - EXTRACT(EPOCH FROM MIN(t))" 
-    } else { 
-        "MAX(t) - MIN(t)" 
-    };
-
-    let query = format!(
-        "SELECT GREATEST(1, ({})::int / 1000) FROM (SELECT t FROM {} LIMIT 1000) s",
-        expr, table_name_clean
-    );
-    notice!("Aspiral: adaptive scale query: {}", query);
-    let scale = Spi::get_one::<i32>(&query).unwrap_or(Some(60)).unwrap_or(60);
-
-    aspiral_zorder_fine(t, scale, ids)
-}
-
-#[pg_extern(name = "aspiral_cluster_table")]
-fn aspiral_cluster_table(table_name: &str, time_col: &str, dimension_cols: Vec<String>) {
-    cluster_table_internal(table_name, time_col, dimension_cols);
-}
-
-pub fn cluster_table_internal(table_name: &str, time_col: &str, dimension_cols: Vec<String>) {
-    let index_name = format!("idx_aspiral_z_{}", table_name.replace(".", "_"));
-    
-    // Construct the dimensions array part
-    let dimensions_joined = dimension_cols.iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<String>>()
-        .join(", ");
-
-    // Smart detection for time_col type to avoid AT TIME ZONE on bigints
-    // Safely check if relation exists before calling ::regclass
-    let exists = Spi::get_one_with_args::<bool>("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1::text)", &[Some(table_name.into_datum()).into()]).unwrap_or(Some(false)).unwrap_or(false);
-    if !exists { return; }
-
-    let is_bigint = unsafe {
-        Spi::get_one_with_args::<bool>(
-            "SELECT a.atttypid = 'int8'::regtype OR a.atttypid = 'bigint'::regtype 
-             FROM pg_attribute a 
-             JOIN pg_class c ON a.attrelid = c.oid
-             WHERE c.relname = $1 AND a.attname = $2",
-            &[
-                pgrx::datum::DatumWithOid::new(table_name.into_datum(), pg_sys::TEXTOID),
-                pgrx::datum::DatumWithOid::new(time_col.into_datum(), pg_sys::TEXTOID),
-            ]
-        ).unwrap_or(Some(false)).unwrap_or(false)
-    };
-
-    let time_expr = if is_bigint {
-        format!("\"{}\"", time_col)
-    } else {
-        format!("EXTRACT(EPOCH FROM (\"{time_col}\" AT TIME ZONE 'UTC'))::bigint")
-    };
-
-    let query = format!(
-        "CREATE INDEX \"{}\" ON \"{}\" (
-            aspiral_zorder(
-                {time_expr}, 
-                ARRAY[{dimensions_joined}]::text[]
-            )
-        )",
-        index_name, table_name
-    );
-
-    pgrx::notice!("Creating Z-Order index: {}", index_name);
-    
-    let result = pgrx::spi::Spi::run(&query);
-    match result {
-        Ok(_) => pgrx::notice!("Successfully created Z-Order clustering index on {}", table_name),
-        Err(e) => pgrx::error!("Failed to create Z-Order index: {}", e),
-    }
-}
-
-pub fn refresh_incremental(view_name: &str, extra_where: Option<String>) -> bool {
-    let result = Spi::connect(|client| {
-        // 1. Get metadata for the view
-        let meta_row = client.select(
-            "SELECT parent_view, frame_seconds, scope_columns, base_view FROM aspiral.metadata WHERE view_name = $1",
-            Some(1),
-            unsafe { &[pgrx::datum::DatumWithOid::new(view_name.into_datum(), pg_sys::TEXTOID)] }
-        )?.first();
-
-        if meta_row.is_empty() { 
-            notice!("Aspiral: No metadata found for view '{}'", view_name);
-            return Ok::<bool, spi::Error>(false); 
-        }
-
-        let parent_view_meta: String = meta_row.get::<String>(1)?.unwrap();
-        let frame_seconds: i32 = meta_row.get::<i32>(2)?.unwrap();
-        let scope_cols_raw: Vec<String> = meta_row.get::<Vec<String>>(3)?.unwrap();
-        let base_view_meta: String = meta_row.get::<String>(4)?.unwrap();
-        
-        let is_root = parent_view_meta == "BASE";
-        let source_table = if is_root { base_view_meta.clone() } else { parent_view_meta.clone() };
-        let changelog_key = if is_root { view_name.to_string() } else { base_view_meta.clone() };
-
-        let scope_cols: Vec<String> = scope_cols_raw.iter().map(|s| format!("\"{}\"", s)).collect();
-
-        // 2. Fetch all column names
-        let mut all_cols = Vec::new();
-        let cols_table = client.select(
-            &format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\"")),
-            None,
-            &[]
-        )?;
-        for row in cols_table { all_cols.push(row.get::<String>(1)?.unwrap()); }
+        let cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\""));
+        let all_cols: Vec<String> = client.select(&cols_query, None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap()).collect();
 
         if all_cols.is_empty() {
-            notice!("Aspiral: No columns found for view '{}'", view_name);
             return Ok::<bool, spi::Error>(false);
         }
 
@@ -636,60 +125,62 @@ pub fn refresh_incremental(view_name: &str, extra_where: Option<String>) -> bool
             .filter(|&c| c != "t" && !scope_cols_raw.contains(c))
             .map(|c| format!("\"{}\"", c)).collect();
 
-        // 3. Construct MERGE
-        let sql = rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
-        let select_part = sql.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
+        let (sql_child, _) = rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
+        let select_part = sql_child.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
 
         let mut on_clause = vec!["target.t = source.t".to_string()];
         for col in &scope_cols { on_clause.push(format!("target.{} = source.{}", col, col)); }
         let update_set = update_cols.iter().map(|c| format!("{} = source.{}", c, c)).collect::<Vec<_>>().join(", ");
 
-        // IMPORTANT: Use changelog_key for lookup!
-        let scope_cols_json = if scope_cols_raw.is_empty() { 
-            "''".to_string() 
-        } else { 
-            scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"::text", s, s)).collect::<Vec<_>>().join(", ") 
+        let mut source_where = if scope_cols_raw.is_empty() {
+            format!(
+                "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
+                 AND aspiral(t) >= (c.t_start/{0})*{0} 
+                 AND aspiral(t) < ((c.t_end/{0})+1)*{0}
+                 AND c.scope_values = '{{}}'::jsonb",
+                frame_seconds,
+                changelog_key = changelog_key.replace("'", "''")
+            )
+        } else {
+            let scope_cols_json = scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"::text", s, s)).collect::<Vec<_>>().join(", ");
+            format!(
+                "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
+                 AND aspiral(t) >= (c.t_start/{0})*{0} 
+                 AND aspiral(t) < ((c.t_end/{0})+1)*{0}
+                 AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
+                frame_seconds,
+                scope_cols_json,
+                changelog_key = changelog_key.replace("'", "''")
+            )
         };
-        
-        let mut source_where = format!(
-            "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
-             AND aspiral(t) >= (c.t_start/{0})*{0} 
-             AND aspiral(t) < ((c.t_end/{0})+1)*{0}
-             AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
-            frame_seconds,
-            scope_cols_json,
-            changelog_key = changelog_key.replace("'", "''")
-        );
         if let Some(ref extra) = extra_where { source_where.push_str(&format!(" WHERE ({})", extra)); }
+
+        let group_by_clause = if scope_cols.is_empty() { "1".to_string() } else { format!("1, {}", scope_cols.join(", ")) };
 
         let merge_sql = format!(
             "MERGE INTO \"{view_name}\" AS target
              USING (
                  SELECT {select_part} FROM \"{source_table}\" 
                  {source_where}
-                 GROUP BY 1, {groups}
+                 GROUP BY {group_by_clause}
              ) AS source
              ON ({on_clause})
              WHEN MATCHED THEN UPDATE SET {update_set}
              WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
-            view_name = view_name, select_part = select_part, source_table = source_table, source_where = source_where, groups = scope_cols.join(", "), on_clause = on_clause.join(" AND "),
+            view_name = view_name, select_part = select_part, source_table = source_table, source_where = source_where, group_by_clause = group_by_clause, on_clause = on_clause.join(" AND "),
             update_set = if update_set.is_empty() { "t = source.t" } else { &update_set },
             all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
             source_cols_joined = all_cols.iter().map(|c| format!("source.\"{}\"", c)).collect::<Vec<_>>().join(", ")
         );
 
-        notice!("Aspiral: Performing MERGE for '{}'", view_name);
         let _ = Spi::run(&merge_sql);
         Ok(true)
-    }).unwrap_or_else(|e| {
-        notice!("Aspiral: Error during refresh of '{}': {:?}", view_name, e);
-        false
-    });
+    }).unwrap_or(false);
 
     if result {
         let children = catalog::get_children(view_name);
         for child in children {
-            refresh_incremental(&child, extra_where.clone());
+            let _ = refresh_incremental(&child, extra_where.clone());
         }
     }
     result
@@ -702,8 +193,16 @@ fn aspiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL")
 
 #[pg_extern]
 fn aspiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>) {
-    catalog::insert_metadata(view_name, parent_view, frame_seconds, base_view, scope_columns.clone());
-    // Also create the trigger on the base table if this is a root view
+    let source_table = if parent_view == "BASE" { base_view } else { parent_view };
+    let (sql, sources) = rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
+    
+    if !sql.is_empty() {
+        let create_sql = format!("CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0", view_name, sql.split(" AS ").nth(1).unwrap().split(';').next().unwrap());
+        let _ = Spi::run(&create_sql);
+    }
+
+    catalog::insert_metadata(view_name, parent_view, frame_seconds, base_view, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
+    for src in sources { catalog::insert_source(view_name, base_view, frame_seconds, &src.base_column, &src.formula, &src.mat_column, pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); }
     if parent_view == "BASE" {
         for event in &["INSERT", "UPDATE", "DELETE"] {
             let mut transition = String::new();
@@ -728,67 +227,64 @@ fn aspiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32,
     }
 }
 
-#[pg_extern]
-fn aspiral_create_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<String>) {
-    hooks::generate_hierarchy(base_name, frames_str, scope_columns);
+pub fn get_kickoff_epoch() -> i64 {
+    Spi::get_one::<i64>("SELECT aspiral(COALESCE(current_setting('aspiral.kickoff_date', true), '1970-01-01')::timestamptz)").unwrap_or(Some(0)).unwrap()
 }
 
-#[pg_extern]
-fn aspiral_create_partition(table_name: &str, cycle_seconds: i64, cycle_id: i64) {
-    let start = cycle_id * cycle_seconds;
-    let end = (cycle_id + 1) * cycle_seconds;
-    let p_name = format!("{}_p{}", table_name, cycle_id);
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} FOR VALUES FROM ({}) TO ({})",
-        p_name, table_name, start, end
-    );
-    let _ = Spi::run(&sql);
+pub fn get_minimal_pace() -> f64 {
+    Spi::get_one::<f64>("SELECT COALESCE(current_setting('aspiral.minimal_pace', true), '60')::numeric::float8").unwrap_or(Some(60.0)).unwrap()
 }
-
-// Consolidate all custom SQL into one file, but ensure dependencies are defined by pgrx first
-extension_sql_file!(
-    "../sql/aspiral.sql", 
-    name = "create_aspiral_entities",
-    requires = [
-        aspiral_sketch_sfunc,
-        aspiral_sketch_merge_sfunc,
-        first_sfunc,
-        last_sfunc,
-        time_value_final,
-        AspiralingNumber,
-        TimeValue
-    ]
-);
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
+
     #[pg_test]
     fn test_regular_tables_ignored() {
         Spi::run("CREATE TABLE regular_table (t timestamptz, val double precision);").unwrap();
         let count = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.metadata WHERE base_view = 'regular_table'").unwrap().unwrap();
         assert_eq!(count, 0);
-        
+
         let trigger_exists = Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid = 'regular_table'::regclass AND tgname LIKE 'aspiral%')").unwrap().unwrap();
         assert!(!trigger_exists);
     }
 
     #[pg_test]
-    fn test_aspiral_table_activated() {
-        // Use a CTAS with aspiral option to verify activation
-        Spi::run("CREATE TABLE base_data (t timestamptz, val double precision);").unwrap();
-        Spi::run("INSERT INTO base_data VALUES (now(), 1.0);").unwrap();
-        Spi::run("CREATE MATERIALIZED VIEW aspiral_matview WITH (aspiral.frames='1m') AS SELECT to_timestamptz((aspiral(t)/60)*60) as t, sum(val) as val_sum FROM base_data GROUP BY 1;").unwrap();
+    fn test_hierarchical_cache_acceleration() {
+        Spi::run("SET aspiral.kickoff_date = '2026-04-15';").unwrap();
+        Spi::run("CREATE TABLE cache_heavy (t timestamptz NOT NULL, val double precision);").unwrap();
         
-        let count = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.metadata WHERE base_view = 'aspiral_matview'").unwrap().unwrap();
-        assert!(count > 0);
+        Spi::run("SELECT aspiral_register_view('cache_heavy_ohlcv_1m', 'BASE', 60, 'cache_heavy', ARRAY[]::text[]);").unwrap();
+        Spi::run("SELECT aspiral_register_view('cache_heavy_ohlcv_1h', 'cache_heavy_ohlcv_1m', 3600, 'cache_heavy', ARRAY[]::text[]);").unwrap();
+
+        Spi::run("INSERT INTO cache_heavy (t, val) VALUES
+            ('2026-04-15 10:00:05Z', 10.0),
+            ('2026-04-15 10:00:55Z', 20.0),
+            ('2026-04-15 10:01:05Z', 30.0);").unwrap();
+
+        Spi::run("INSERT INTO cache_heavy (t, val) VALUES
+            ('2026-04-15 11:00:05Z', 40.0),
+            ('2026-04-15 11:00:55Z', 50.0);").unwrap();
+
+        Spi::run("SELECT aspiral_refresh('cache_heavy_ohlcv_1m');").unwrap();
+        Spi::run("SELECT aspiral_refresh('cache_heavy_ohlcv_1h');").unwrap();
+
+        let total_sum = Spi::get_one::<f64>("SELECT sum(val) FROM cache_heavy WHERE t >= '2026-04-15 10:00:00Z' AND t < '2026-04-15 12:00:00Z'").unwrap().unwrap();
+        assert_eq!(total_sum, 150.0);
+
+        let total_count = Spi::get_one::<i64>("SELECT count(val) FROM cache_heavy WHERE t >= '2026-04-15 10:00:00Z' AND t < '2026-04-15 12:00:00Z'").unwrap().unwrap();
+        assert_eq!(total_count, 5);
+
+        let total_avg = Spi::get_one::<f64>("SELECT avg(val) FROM cache_heavy WHERE t >= '2026-04-15 10:00:00Z' AND t < '2026-04-15 12:00:00Z'").unwrap().unwrap();
+        assert_eq!(total_avg, 30.0);
     }
 }
 
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {}
+    pub fn setup(_options: Vec<&str>) {
+    }
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         vec!["shared_preload_libraries = 'aspiral'"]

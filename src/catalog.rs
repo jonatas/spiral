@@ -11,6 +11,7 @@ extension_sql!(
         frame_seconds integer NOT NULL,
         base_view text NOT NULL,
         scope_columns text[] NOT NULL DEFAULT '{}',
+        columns_metadata jsonb NOT NULL DEFAULT '{}',
         created_at timestamptz DEFAULT now()
     );
 
@@ -21,9 +22,44 @@ extension_sql!(
         scope_values jsonb NOT NULL DEFAULT '{}'
     );
     CREATE INDEX IF NOT EXISTS idx_aspiral_changelog_base ON aspiral.changelog (base_view);
+
+    CREATE TABLE IF NOT EXISTS aspiral.sources (
+        id serial PRIMARY KEY,
+        view_name text NOT NULL,
+        base_view text NOT NULL,
+        frame_seconds integer NOT NULL,
+        base_column text NOT NULL,
+        formula text NOT NULL,
+        mat_column text NOT NULL,
+        args jsonb NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_aspiral_sources_lookup ON aspiral.sources(base_view, base_column, formula);
+    
+    -- Hybrid view to show both manual sources and potentially rules/views
+    CREATE OR REPLACE VIEW aspiral.available_sources AS
+    SELECT view_name, base_view, frame_seconds, base_column, formula, mat_column, args
+    FROM aspiral.sources;
     "#,
     name = "create_aspiral_metadata"
 );
+
+pub fn insert_source(view_name: &str, base_view: &str, frame_seconds: i32, base_column: &str, formula: &str, mat_column: &str, args: pgrx::JsonB) {
+    unsafe {
+        Spi::run_with_args(
+            "INSERT INTO aspiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, args) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value()),
+                DatumWithOid::new(base_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
+                DatumWithOid::new(frame_seconds.into_datum(), PgBuiltInOids::INT4OID.value()),
+                DatumWithOid::new(base_column.into_datum(), PgBuiltInOids::TEXTOID.value()),
+                DatumWithOid::new(formula.into_datum(), PgBuiltInOids::TEXTOID.value()),
+                DatumWithOid::new(mat_column.into_datum(), PgBuiltInOids::TEXTOID.value()),
+                DatumWithOid::new(args.into_datum(), PgBuiltInOids::JSONBOID.value()),
+            ],
+        ).unwrap();
+    }
+}
 
 pub fn mark_range_dirty(base_view: &str, t_start: i64, t_end: i64, scope_values: pgrx::JsonB) {
     unsafe {
@@ -104,18 +140,19 @@ pub fn clear_dirty_buckets(base_view: &str, buckets: &[(i64, pgrx::JsonB)]) {
     }
 }
 
-pub fn insert_metadata(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>) {
+pub fn insert_metadata(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>, columns_metadata: pgrx::JsonB) {
     unsafe {
         Spi::run_with_args(
-            "INSERT INTO aspiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) 
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns",
+            "INSERT INTO aspiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata) 
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
             &[
                 DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value()),
                 DatumWithOid::new(parent_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
                 DatumWithOid::new(frame_seconds.into_datum(), PgBuiltInOids::INT4OID.value()),
                 DatumWithOid::new(base_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
                 DatumWithOid::new(scope_columns.into_datum(), PgBuiltInOids::TEXTARRAYOID.value()),
+                DatumWithOid::new(columns_metadata.into_datum(), PgBuiltInOids::JSONBOID.value()),
             ],
         ).unwrap();
     }
@@ -139,13 +176,14 @@ pub struct Metadata {
     #[allow(dead_code)]
     pub frame_seconds: i32,
     pub scope_columns: Vec<String>,
+    pub columns_metadata: pgrx::JsonB,
 }
 
 pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     Spi::connect(|client| {
         let row = unsafe {
             client.select(
-                "SELECT parent_view, frame_seconds, scope_columns FROM aspiral.metadata WHERE view_name = $1",
+                "SELECT parent_view, frame_seconds, scope_columns, columns_metadata FROM aspiral.metadata WHERE view_name = $1",
                 None,
                 &[DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value())]
             ).unwrap().first()
@@ -155,6 +193,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
             parent_view: row.get::<String>(1).unwrap().unwrap(),
             frame_seconds: row.get::<i32>(2).unwrap().unwrap(),
             scope_columns: row.get::<Vec<String>>(3).unwrap().unwrap(),
+            columns_metadata: row.get::<pgrx::JsonB>(4).unwrap().unwrap(),
         }))
     }).unwrap_or(None)
 }
@@ -162,18 +201,36 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
 pub fn get_children(view_name: &str) -> Vec<String> {
     Spi::connect(|client| {
         let mut children = Vec::new();
-        let tuple_table = unsafe {
-            // pgrx 0.17 client.select takes &[DatumWithOid] directly (no Some)
-            client.select(
-                "SELECT view_name FROM aspiral.metadata WHERE parent_view = $1 ORDER BY frame_seconds ASC",
-                None,
-                &[DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value())]
-            ).unwrap()
-        };
+        let tuple_table = client.select(
+            "SELECT view_name FROM aspiral.metadata WHERE parent_view = $1 ORDER BY frame_seconds ASC",
+            None,
+            unsafe { &[pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
+        )?;
         for row in tuple_table {
             let child = row.get::<String>(1).unwrap().unwrap();
             children.push(child);
         }
         Ok::<Vec<String>, spi::Error>(children)
+    }).unwrap_or_default()
+}
+
+pub fn get_dirty_ranges(base_view: &str, ts: i64, te: i64) -> Vec<(i64, i64)> {
+    Spi::connect(|client| {
+        let mut ranges = Vec::new();
+        let tuple_table = client.select(
+            "SELECT t_start, t_end FROM aspiral.changelog WHERE base_view = $1 AND NOT (t_end < $2 OR t_start > $3) ORDER BY t_start",
+            None,
+            unsafe { &[
+                pgrx::datum::DatumWithOid::new(base_view.into_datum().unwrap(), pg_sys::TEXTOID),
+                pgrx::datum::DatumWithOid::new(ts.into_datum().unwrap(), pg_sys::INT8OID),
+                pgrx::datum::DatumWithOid::new(te.into_datum().unwrap(), pg_sys::INT8OID),
+            ] }
+        )?;
+        for row in tuple_table {
+            let s = row.get::<i64>(1).unwrap().unwrap();
+            let e = row.get::<i64>(2).unwrap().unwrap();
+            ranges.push((s, e));
+        }
+        Ok::<Vec<(i64, i64)>, spi::Error>(ranges)
     }).unwrap_or_default()
 }
