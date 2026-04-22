@@ -149,11 +149,7 @@ shared_preload_libraries = 'aspiral'
 ```
 
 ### Background Worker Configuration
-By default, the background worker attempts to connect to a database named `aspiral`. You can configure this using the following GUC:
-
-```ini
-aspiral.bgworker_dbname = 'your_database_name'
-```
+Aspiral's background worker is auto-configured. It will automatically start for any database where a table is created using `WITH (aspiral = ...)`. No manual database name configuration is required.
 
 ---
 Built with ❤️ using `pgrx` and `ta-statistics`.

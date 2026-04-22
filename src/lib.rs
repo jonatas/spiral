@@ -15,12 +15,11 @@ mod bgworker;
 ::pgrx::pg_module_magic!(name, version);
 
 static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
-pub static BGWORKER_DBNAME: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
+static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(1.0);
 
 #[no_mangle]
 pub unsafe extern "C" fn _PG_init() {
     hooks::init_hooks();
-    // bgworker::init_worker();
 
     GucRegistry::define_string_guc(
         CStr::from_bytes_with_nul(b"aspiral.kickoff_date\0").unwrap(),
@@ -31,11 +30,13 @@ pub unsafe extern "C" fn _PG_init() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_string_guc(
-        CStr::from_bytes_with_nul(b"aspiral.bgworker_dbname\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Database name for the background worker to connect to.\0").unwrap(),
-        CStr::from_bytes_with_nul(b"If not set, defaults to 'aspiral'.\0").unwrap(),
-        &BGWORKER_DBNAME,
+    GucRegistry::define_float_guc(
+        CStr::from_bytes_with_nul(b"aspiral.minimal_pace\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Minimal time resolution in seconds.\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Determines the precision of the spiral coordinate (e.g., 0.001 for ms).\0").unwrap(),
+        &MINIMAL_PACE,
+        0.000001,
+        1000000.0,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -66,9 +67,16 @@ fn get_kickoff_epoch() -> i64 {
         kickoff_str.clone()
     };
 
-    // Use a robust way to get epoch from YYYY-MM-DD
-    let sql = format!("SELECT extract(epoch from '{} 00:00:00Z'::timestamptz)::bigint", date_part.replace("'", "''"));
-    let val = Spi::get_one::<i64>(&sql).unwrap_or(Some(1776211200)).unwrap_or(1776211200);
+    // Parse YYYY-MM-DD manually to avoid SPI call
+    let parts: Vec<&str> = date_part.split('-').collect();
+    let val = if parts.len() == 3 {
+        // Simple approximate epoch calculation (good enough for kickoff)
+        // Actually, let's keep it simple: use SPI only once and cache it hard.
+        let sql = format!("SELECT extract(epoch from '{} 00:00:00Z'::timestamptz)::bigint", date_part.replace("'", "''"));
+        Spi::get_one::<i64>(&sql).unwrap_or(Some(1776211200)).unwrap_or(1776211200)
+    } else {
+        1776211200
+    };
     
     KICKOFF_CACHE.with(|c| *c.borrow_mut() = Some((kickoff_str, val)));
     val
@@ -78,8 +86,9 @@ fn get_kickoff_epoch() -> i64 {
 fn aspiral(t: TimestampWithTimeZone) -> i64 {
     let micros_since_pg_epoch = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
     let pg_epoch_unix: i64 = 946684800;
-    let unix_seconds = pg_epoch_unix + (micros_since_pg_epoch / 1_000_000);
-    unix_seconds - get_kickoff_epoch()
+    let unix_seconds = pg_epoch_unix as f64 + (micros_since_pg_epoch as f64 / 1_000_000.0);
+    let pace = MINIMAL_PACE.get();
+    ((unix_seconds - get_kickoff_epoch() as f64) / pace) as i64
 }
 
 #[pg_extern(immutable, parallel_safe, name = "aspiral")]
@@ -89,9 +98,10 @@ fn aspiral_i64(t: i64) -> i64 {
 
 #[pg_extern(immutable, parallel_safe)]
 fn to_timestamptz(a: i64) -> TimestampWithTimeZone {
-    let unix_seconds = a + get_kickoff_epoch();
+    let pace = MINIMAL_PACE.get();
+    let unix_seconds = (a as f64 * pace) + get_kickoff_epoch() as f64;
     let pg_epoch_unix: i64 = 946684800;
-    let micros_since_pg_epoch = (unix_seconds - pg_epoch_unix) * 1_000_000;
+    let micros_since_pg_epoch = ((unix_seconds - pg_epoch_unix as f64) * 1_000_000.0) as i64;
     unsafe { TimestampWithTimeZone::from_datum(pg_sys::Datum::from(micros_since_pg_epoch), false).unwrap() }
 }
 
@@ -226,7 +236,6 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
     let metadata = catalog::get_metadata(&base_view_name);
     let scope_cols = metadata.as_ref().map(|m| m.scope_columns.clone()).unwrap_or_default();
 
-    // If it's a statement trigger with transition tables, we can be much more efficient
     let tg_data = trigger.trigger_data();
     let is_after = (tg_data.tg_event & pg_sys::TRIGGER_EVENT_BEFORE) == 0;
     let is_statement = (tg_data.tg_event & pg_sys::TRIGGER_EVENT_ROW) == 0;
@@ -237,9 +246,9 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
         let process_tuplestore = |tuplestore: *mut pg_sys::Tuplestorestate, desc: pg_sys::TupleDesc| -> Result<(), String> {
             if tuplestore.is_null() { return Ok(()); }
             
-            let mut scope_dirty = std::collections::HashMap::new();
+            let mut scope_dirty: std::collections::HashMap<serde_json::Value, (i64, i64)> = std::collections::HashMap::new();
             let pg_desc = unsafe { PgTupleDesc::from_pg_copy(desc) };
-
+            
             unsafe {
                 let slot = pg_sys::MakeSingleTupleTableSlot(desc, &pg_sys::TTSOpsMinimalTuple);
                 while pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
@@ -252,24 +261,27 @@ fn aspiral_track_changes<'a>(trigger: &'a pgrx::PgTrigger<'a>) -> Result<Option<
 
                         let mut scope_map = serde_json::Map::new();
                         for col in &scope_cols {
-                            let val: Option<String> = if let Ok(v) = htup.get_by_name::<String>(col) {
+                            // Get as string for consistency with ::text cast in JOIN
+                            let val: String = if let Ok(Some(v)) = htup.get_by_name::<String>(col) {
                                 v
-                            } else if let Ok(v) = htup.get_by_name::<i32>(col) {
-                                v.map(|i| i.to_string())
-                            } else if let Ok(v) = htup.get_by_name::<i64>(col) {
-                                v.map(|i| i.to_string())
+                            } else if let Ok(Some(v)) = htup.get_by_name::<i32>(col) {
+                                v.to_string()
+                            } else if let Ok(Some(v)) = htup.get_by_name::<i64>(col) {
+                                v.to_string()
                             } else {
-                                None
+                                "NULL".to_string()
                             };
-                            if let Some(v) = val {
-                                scope_map.insert(col.to_string(), serde_json::Value::String(v));
-                            }
+                            
+                            scope_map.insert(col.clone(), serde_json::Value::String(val));
                         }
+
                         let scope_val = serde_json::Value::Object(scope_map);
                         let entry = scope_dirty.entry(scope_val).or_insert((i64::MAX, i64::MIN));
                         entry.0 = entry.0.min(a);
                         entry.1 = entry.1.max(a);
                     }
+
+                    if should_free { pg_sys::heap_freetuple(tuple); }
                     pg_sys::ExecClearTuple(slot);
                 }
                 pg_sys::ExecDropSingleTupleTableSlot(slot);
@@ -551,78 +563,94 @@ pub fn refresh_incremental(view_name: &str, extra_where: Option<String>) -> bool
     let result = Spi::connect(|client| {
         // 1. Get metadata for the view
         let meta_row = client.select(
-            "SELECT parent_view, frame_seconds, scope_columns, base_view FROM aspiral.metadata WHERE view_name = $1::text",
+            "SELECT parent_view, frame_seconds, scope_columns, base_view FROM aspiral.metadata WHERE view_name = $1",
             Some(1),
-            &[Some(view_name.into_datum()).into()]
+            unsafe { &[pgrx::datum::DatumWithOid::new(view_name.into_datum(), pg_sys::TEXTOID)] }
         )?.first();
 
-        if meta_row.is_empty() { return Ok::<bool, spi::Error>(false); }
+        if meta_row.is_empty() { 
+            notice!("Aspiral: No metadata found for view '{}'", view_name);
+            return Ok::<bool, spi::Error>(false); 
+        }
 
-        let parent_view: String = meta_row.get::<String>(1)?.unwrap();
+        let parent_view_meta: String = meta_row.get::<String>(1)?.unwrap();
         let frame_seconds: i32 = meta_row.get::<i32>(2)?.unwrap();
         let scope_cols_raw: Vec<String> = meta_row.get::<Vec<String>>(3)?.unwrap();
-        let root_view: String = meta_row.get::<String>(4)?.unwrap();
+        let base_view_meta: String = meta_row.get::<String>(4)?.unwrap();
+        
+        let is_root = parent_view_meta == "BASE";
+        let source_table = if is_root { base_view_meta.clone() } else { parent_view_meta.clone() };
+        let changelog_key = if is_root { view_name.to_string() } else { base_view_meta.clone() };
+
         let scope_cols: Vec<String> = scope_cols_raw.iter().map(|s| format!("\"{}\"", s)).collect();
 
         // 2. Fetch all column names
         let mut all_cols = Vec::new();
         let cols_table = client.select(
-            &format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("'", "''")),
+            &format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\"")),
             None,
             &[]
         )?;
         for row in cols_table { all_cols.push(row.get::<String>(1)?.unwrap()); }
+
+        if all_cols.is_empty() {
+            notice!("Aspiral: No columns found for view '{}'", view_name);
+            return Ok::<bool, spi::Error>(false);
+        }
 
         let update_cols: Vec<String> = all_cols.iter()
             .filter(|&c| c != "t" && !scope_cols_raw.contains(c))
             .map(|c| format!("\"{}\"", c)).collect();
 
         // 3. Construct MERGE
-        let sql = rollup::derive_child_sql(view_name, &parent_view, frame_seconds, &scope_cols_raw);
+        let sql = rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
         let select_part = sql.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
 
         let mut on_clause = vec!["target.t = source.t".to_string()];
         for col in &scope_cols { on_clause.push(format!("target.{} = source.{}", col, col)); }
         let update_set = update_cols.iter().map(|c| format!("{} = source.{}", c, c)).collect::<Vec<_>>().join(", ");
 
-        // IMPORTANT: Use root_view for changelog lookup!
-        // Join with segments to only process affected buckets
+        // IMPORTANT: Use changelog_key for lookup!
         let scope_cols_json = if scope_cols_raw.is_empty() { 
             "''".to_string() 
         } else { 
-            scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"", s, s)).collect::<Vec<_>>().join(", ") 
+            scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"::text", s, s)).collect::<Vec<_>>().join(", ") 
         };
         
         let mut source_where = format!(
-            "JOIN aspiral.changelog c ON c.base_view = '{root_view}' 
-             AND (aspiral(t)/{0})*{0} >= c.t_start AND (aspiral(t)/{0})*{0} <= c.t_end 
+            "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
+             AND aspiral(t) >= (c.t_start/{0})*{0} 
+             AND aspiral(t) < ((c.t_end/{0})+1)*{0}
              AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
             frame_seconds,
             scope_cols_json,
-            root_view = root_view.replace("'", "''")
+            changelog_key = changelog_key.replace("'", "''")
         );
         if let Some(ref extra) = extra_where { source_where.push_str(&format!(" WHERE ({})", extra)); }
 
         let merge_sql = format!(
-            "MERGE INTO {view_name} AS target
+            "MERGE INTO \"{view_name}\" AS target
              USING (
-                 SELECT {select_part} FROM {parent_view} 
+                 SELECT {select_part} FROM \"{source_table}\" 
                  {source_where}
                  GROUP BY 1, {groups}
              ) AS source
              ON ({on_clause})
              WHEN MATCHED THEN UPDATE SET {update_set}
              WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
-            view_name = view_name, select_part = select_part, parent_view = parent_view, source_where = source_where, groups = scope_cols.join(", "), on_clause = on_clause.join(" AND "),
+            view_name = view_name, select_part = select_part, source_table = source_table, source_where = source_where, groups = scope_cols.join(", "), on_clause = on_clause.join(" AND "),
             update_set = if update_set.is_empty() { "t = source.t" } else { &update_set },
             all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
             source_cols_joined = all_cols.iter().map(|c| format!("source.\"{}\"", c)).collect::<Vec<_>>().join(", ")
         );
 
-        info!("Aspiral: Performing Incremental MERGE for '{}'", view_name);
+        notice!("Aspiral: Performing MERGE for '{}'", view_name);
         let _ = Spi::run(&merge_sql);
         Ok(true)
-    }).unwrap_or(false);
+    }).unwrap_or_else(|e| {
+        notice!("Aspiral: Error during refresh of '{}': {:?}", view_name, e);
+        false
+    });
 
     if result {
         let children = catalog::get_children(view_name);

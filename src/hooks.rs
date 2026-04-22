@@ -40,6 +40,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     let mut scope_columns = Vec::new();
     let mut is_refresh = false;
     let mut is_matview = false;
+    let mut aspiral_enabled = false;
     
     if !utility_stmt.is_null() {
         let node_type = (*(utility_stmt as *mut pg_sys::Node)).type_;
@@ -60,7 +61,8 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                             if !def_elem.is_null() {
                                 let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
                                 let defnamespace = if (*def_elem).defnamespace.is_null() { std::borrow::Cow::Borrowed("") } else { CStr::from_ptr((*def_elem).defnamespace).to_string_lossy() };
-                                if defnamespace == "aspiral" {
+                                if defnamespace == "aspiral" || defname == "aspiral" {
+                                    aspiral_enabled = true;
                                     let arg = (*def_elem).arg as *mut pg_sys::Node;
                                     if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
                                         let val = CStr::from_ptr((*(arg as *mut pg_sys::String)).sval).to_string_lossy().into_owned();
@@ -119,7 +121,8 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                     if !def_elem.is_null() {
                         let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
                         let defnamespace = if (*def_elem).defnamespace.is_null() { std::borrow::Cow::Borrowed("") } else { CStr::from_ptr((*def_elem).defnamespace).to_string_lossy() };
-                        if defnamespace == "aspiral" {
+                        if defnamespace == "aspiral" || defname == "aspiral" {
+                            aspiral_enabled = true;
                             let arg = (*def_elem).arg as *mut pg_sys::Node;
                             if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
                                 let val = CStr::from_ptr((*(arg as *mut pg_sys::String)).sval).to_string_lossy().into_owned();
@@ -151,6 +154,10 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     let is_matview_final = is_matview;
     let scope_columns_final = scope_columns.clone();
 
+    if aspiral_enabled {
+        crate::bgworker::maybe_start_worker();
+    }
+
     let mut handled_incrementally = false;
     if let Some(name) = target_name_final.clone() {
         if is_refresh {
@@ -168,14 +175,14 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
 
     if let Some(name) = target_name_final {
         if !is_refresh {
-            if let Some(ref tenant_str) = tenant_opt_final {
+            if aspiral_enabled && tenant_opt_final.is_some() {
+                let tenant_str = tenant_opt_final.clone().unwrap();
                 let dimensions: Vec<String> = tenant_str.split(',').map(|s| s.trim().to_string()).collect();
                 let time_col = time_col_opt_final.clone().unwrap_or_else(|| "t".to_string());
                 crate::cluster_table_internal(&name, &time_col, dimensions);
             }
             let sql_text = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
-            let has_magic = sql_text.contains("-- Aspiral:");
-            if !is_matview_final && (frames_opt_final.is_some() || has_magic) {
+            if !is_matview_final && aspiral_enabled {
                 let actual_frames = frames_opt_final.unwrap_or_else(|| rollup::DEFAULT_FRAMES.to_string());
                 let table_name = name.clone();
                 let time_col = time_col_opt_final.unwrap_or_else(|| "t".to_string());
@@ -234,10 +241,26 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                         let root_name = root_view.trim_matches('"').to_string();
                         match Spi::run(&root_sql) {
                             Ok(_) => {
-                                catalog::insert_metadata(&root_name, "BASE", 0, &table_name, tenant_cols.iter().map(|s| s.trim().to_string()).collect());
+                                catalog::insert_metadata(&root_name, "BASE", root_frame.seconds, &table_name, tenant_cols.iter().map(|s| s.trim().to_string()).collect());
                                 generate_hierarchy(&root_name, &actual_frames, tenant_cols.iter().map(|s| s.trim().to_string()).collect());
-                                let trigger_sql = format!("CREATE TRIGGER aspiral_track_{} AFTER INSERT OR UPDATE OR DELETE ON \"{}\" FOR EACH ROW EXECUTE FUNCTION aspiral_track_changes('{}')", table_name, table_name, root_name);
-                                let _ = Spi::run(&trigger_sql);
+                                
+                                for event in &["INSERT", "UPDATE", "DELETE"] {
+                                    let transition = match *event {
+                                        "INSERT" => "REFERENCING NEW TABLE AS new_table",
+                                        "UPDATE" => "REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table",
+                                        "DELETE" => "REFERENCING OLD TABLE AS old_table",
+                                        _ => ""
+                                    };
+                                    let trigger_sql = format!(
+                                        "CREATE TRIGGER aspiral_track_{base}_{event_lower} 
+                                         AFTER {event} ON \"{base}\" 
+                                         {transition}
+                                         FOR EACH STATEMENT EXECUTE FUNCTION aspiral_track_changes('{root}')",
+                                        base = table_name, event = event, event_lower = event.to_lowercase(),
+                                        transition = transition, root = root_name
+                                    );
+                                    let _ = Spi::run(&trigger_sql);
+                                }
                             },
                             Err(e) => warning!("Aspiral failed to create root view {}: {:?}", root_name, e),
                         }
@@ -351,6 +374,10 @@ unsafe fn get_grouping_columns(query: *mut pg_sys::Query) -> Vec<String> {
 pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     let metadata = catalog::get_metadata(base_name);
     let is_root = metadata.as_ref().map(|m| m.parent_view == "BASE").unwrap_or(false);
+
+    if is_root {
+        catalog::unify_changelog(base_name);
+    }
 
     if crate::refresh_incremental(base_name, where_clause.clone()) {
         if where_clause.is_none() && is_root {
