@@ -41,20 +41,26 @@ pub unsafe extern "C-unwind" fn aspiral_scan_begin(
     _pscan: pg_sys::ParallelTableScanDesc,
     _flags: u32,
 ) -> pg_sys::TableScanDesc {
-    info!("Aspiral TAM: Initializing O(1) mathematical scan");
     let scan = pg_sys::palloc0(std::mem::size_of::<pg_sys::TableScanDescData>()) as pg_sys::TableScanDesc;
     if !scan.is_null() {
         (*scan).rs_rd = rel;
         (*scan).rs_snapshot = snapshot;
+        // In a full implementation, we would store our file handle/offset in rs_opaque
     }
     scan
 }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aspiral_scan_getnextslot(
-    _scan: pg_sys::TableScanDesc,
+    scan: pg_sys::TableScanDesc,
     _direction: i32,
-    _slot: *mut pg_sys::TupleTableSlot,
+    slot: *mut pg_sys::TupleTableSlot,
 ) -> bool {
+    // This is where we would stream from the binary file directly into the slot.
+    // By implementing this, SELECT * FROM table automatically becomes an O(N) 
+    // stream of our compact 8-byte rows.
+    
+    // For the prototype, we return false to indicate end of scan,
+    // but in production, this would use logic similar to aspiral_scan_zero()
     false 
 }

@@ -42,10 +42,10 @@ pub fn mark_range_dirty(base_view: &str, t_start: i64, t_end: i64, scope_values:
 pub fn unify_changelog(base_view: &str) {
     // This function implements the "joining unions of segments" logic.
     // It merges overlapping or adjacent segments for the same base_view and scope_values.
-    let _ = Spi::connect(|client| {
-         let _ = client.select(
-            "SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
-             INTO TEMP temp_unified
+    let _ = Spi::connect(|_client| {
+         let _ = Spi::run(&format!(
+            "CREATE TEMP TABLE temp_unified AS 
+             SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
              FROM (
                 SELECT *,
                     COUNT(*) FILTER (WHERE prev_end < t_start OR prev_end IS NULL) OVER (PARTITION BY base_view, scope_values ORDER BY t_start) as grp
@@ -53,13 +53,11 @@ pub fn unify_changelog(base_view: &str) {
                     SELECT *,
                         MAX(t_end) OVER (PARTITION BY base_view, scope_values ORDER BY t_start ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
                     FROM aspiral.changelog
-                    WHERE base_view = $1::text
+                    WHERE base_view = '{}'
                 ) s1
              ) s2
-             GROUP BY base_view, scope_values, grp",
-             None,
-             &[Some(base_view.into_datum()).into()]
-         )?;
+             GROUP BY base_view, scope_values, grp", base_view.replace("'", "''")));
+
          let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", base_view.replace("'", "''")));
          let _ = Spi::run(&format!("INSERT INTO aspiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified"));
          let _ = Spi::run("DROP TABLE temp_unified");

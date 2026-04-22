@@ -1,72 +1,99 @@
--- Aspiral Storage Benchmark: Binary Packing and O(1) Access
--- Comparing Standard, Compact, and Block-Compressed formats across Ingestion and Query.
+-- Aspiral Storage Optimization Benchmark: Time-as-Address
+-- Demonstrating minimal storage footprint by removing redundant timestamps.
 
--- 1. SETUP
+-- 1. CLEANUP & SETUP
 DROP EXTENSION IF EXISTS aspiral CASCADE;
 CREATE EXTENSION aspiral;
-SET aspiral.kickoff_date = '2026-04-15';
 
-DROP TABLE IF EXISTS storage_raw CASCADE;
-CREATE TABLE storage_raw (
+-- Ensure we start from a clean state for binary files
+\! rm -rf /tmp/aspiral_main/*.bin
+
+DROP TABLE IF EXISTS storage_bench_delta CASCADE;
+CREATE TABLE storage_bench_delta (
     t bigint NOT NULL,
     tenant_id int NOT NULL,
-    price double precision
+    price double precision NOT NULL
 );
 
--- Ingest 1M rows
-INSERT INTO storage_raw (t, tenant_id, price)
-SELECT (i / 1000), (i % 1000), random() * 100
-FROM generate_series(0, 999999) i;
+-- Use 0.1s resolution
+SET aspiral.minimal_pace = 0.1;
+SET aspiral.kickoff_date = '2026-04-21';
 
--- 2. BENCHMARK EXECUTION
-DO $$
-DECLARE
-    start_time timestamptz;
-    main_oid int := 777888;
-BEGIN
-    RAISE NOTICE '--- Ingestion (Packing) Speed (1M Rows) ---';
-    
-    start_time := clock_timestamp();
-    PERFORM aspiral_pack_delta('storage_raw', main_oid);
-    RAISE NOTICE 'Standard Packing (64B): %', clock_timestamp() - start_time;
+-- 2. GENERATE DATA (10,000 points per device, 10 devices)
+-- Total 100,000 rows
+INSERT INTO storage_bench_delta (t, tenant_id, price)
+SELECT 
+    i / 10, -- t increments every 10 rows (10 devices per 0.1s slot)
+    i % 10, -- tenant_id 0-9
+    100 + sin(i::float/100)*10 + random()
+FROM generate_series(0, 99999) i;
 
-    start_time := clock_timestamp();
-    PERFORM aspiral_pack_delta_compact('storage_raw', main_oid);
-    RAISE NOTICE 'Compact Packing (16B):  %', clock_timestamp() - start_time;
+-- 3. PACK DATA
+\echo '--- Packing Data (Standard: 64 bytes) ---'
+SELECT aspiral_pack_delta('storage_bench_delta', 1001);
 
-    start_time := clock_timestamp();
-    PERFORM aspiral_pack_delta_blocks('storage_raw', main_oid);
-    RAISE NOTICE 'Block Packing (XOR):    %', clock_timestamp() - start_time;
+\echo '--- Packing Data (Zero-Timestamp: 8 bytes) ---'
+SELECT aspiral_pack_delta_zero('storage_bench_delta', 1001);
 
-    RAISE NOTICE '--- Random Point Read Performance (10k ops) ---';
-    
-    start_time := clock_timestamp();
-    FOR i IN 1..10000 LOOP
-        PERFORM aspiral_read_main(main_oid, (i % 1000)::bigint, (i % 1000)::bigint);
-    END LOOP;
-    RAISE NOTICE 'Read Standard (Random): %', clock_timestamp() - start_time;
+-- 4. STORAGE COMPARISON
+\echo '--- Storage Size Comparison ---'
+\! ls -lh /tmp/aspiral_main/1001.bin
+\! ls -lh /tmp/aspiral_main/1001_zero.bin
 
-    start_time := clock_timestamp();
-    FOR i IN 1..10000 LOOP
-        PERFORM aspiral_read_main_block_point(main_oid, (i % 1000)::bigint, (i % 1000)::bigint);
-    END LOOP;
-    RAISE NOTICE 'Read Block Pt (Random): %', clock_timestamp() - start_time;
+-- 5. VERIFY TIME RECONSTRUCTION
+\echo '--- Verifying Time Reconstruction (0.1s pace) ---'
+SELECT 
+    t as spiral_coordinate,
+    to_timestamptz(t) as reconstructed_time
+FROM storage_bench_delta 
+WHERE t < 5 AND tenant_id = 0
+ORDER BY t;
 
-    RAISE NOTICE '--- Sequential Range Read (Optimized Block vs. Naive) ---';
-    
-    start_time := clock_timestamp();
-    FOR i IN 1..100 LOOP
-        PERFORM aspiral_read_main_block_range(main_oid, i::bigint, 5::bigint);
-    END LOOP;
-    RAISE NOTICE 'Block Range (Optimized): %', clock_timestamp() - start_time;
-END $$;
+-- 6. VERIFY READ O(1)
+\echo '--- Verifying O(1) Zero-Timestamp Read ---'
+SELECT aspiral_read_main_zero(1001, 500, 5) as price_at_t500_dev5;
+SELECT price FROM storage_bench_delta WHERE t = 500 AND tenant_id = 5;
 
--- 3. ADAPTIVE LOCALITY TEST
-DO $$
-BEGIN
-    RAISE NOTICE '--- Testing Adaptive Z-Order Scaling ---';
-    RAISE NOTICE 'Scale for storage_raw: %', aspiral_zorder_adaptive(0, 'storage_raw', ARRAY['1']);
-END $$;
+-- 7. FULL SCAN VALIDATION
+\echo '--- Full Reconstruction Scan Comparison ---'
+-- Reconstruct all tuples and compare count/avg with original
+SELECT 
+    COUNT(*) as total_rows,
+    round(AVG(value)::numeric, 4) as avg_price
+FROM aspiral_scan_zero(1001);
 
--- 4. STORAGE FOOTPRINT
-\! ls -lh /tmp/aspiral_main/777888*.bin
+SELECT 
+    COUNT(*) as total_rows,
+    round(AVG(price)::numeric, 4) as avg_price
+FROM storage_bench_delta;
+
+-- 8. SCENARIO 2: Different Pace (1s)
+\echo '--- Scenario 2: 1s Pace Validation ---'
+DROP TABLE IF EXISTS storage_bench_1s CASCADE;
+CREATE TABLE storage_bench_1s (t bigint, tenant_id int, price double precision);
+
+SET aspiral.minimal_pace = 1.0;
+SET aspiral.kickoff_date = '2026-01-01';
+
+INSERT INTO storage_bench_1s (t, tenant_id, price)
+SELECT 
+    aspiral('2026-01-01 10:00:00Z'::timestamptz + (i * interval '1 second')),
+    (i % 5),
+    random() * 50
+FROM generate_series(0, 99) i;
+
+SELECT aspiral_pack_delta_zero('storage_bench_1s', 1002);
+
+-- Fetching back and rebuilding
+SELECT 
+    to_timestamptz(t) as time,
+    tenant_id,
+    round(value::numeric, 2) as val
+FROM aspiral_scan_zero(1002)
+LIMIT 5;
+
+-- 9. SAFETY CHECK: Pace Mismatch
+\echo '--- Safety Check: Pace Mismatch (Expected to fail) ---'
+SET aspiral.minimal_pace = 0.5;
+-- This should fail (return NULL or error) because the file 1002 was created with pace 1.0
+SELECT aspiral_read_main_zero(1002, 10, 0);

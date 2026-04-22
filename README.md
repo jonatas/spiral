@@ -70,6 +70,22 @@ Aspiral tracks "dirty buckets" in a transactional changelog to provide **Increme
 - **Cascading Logic**: Refreshing a parent view automatically triggers incremental updates for all downstream children.
 - **Self-Healing Dashboards**: Historical data corrections automatically flag those buckets for re-aggregation in the next refresh cycle.
 
+---
+
+### 5. Time-as-Address (8x Storage Reduction)
+For extremely high-density datasets where even a `bigint` timestamp is redundant, Aspiral can eliminate the timestamp column entirely from physical storage.
+
+- **Zero-Timestamp Storage**: The time and tenant identity are implicitly encoded in the physical address (file offset).
+- **8x Smaller Footprint**: Reduces row size from 64 bytes down to just **8 bytes** (only the value is stored).
+- **O(1) Direct Access**: Read any point in time for any tenant instantly using bitwise math, bypassing all PostgreSQL indexes.
+- **Safety Headers**: Every binary file includes an `ASPI` header validating the OID, Kickoff Date, and Resolution (Pace) to prevent data corruption.
+
+**Configuration:**
+```sql
+SET aspiral.minimal_pace = 0.1; -- 100ms resolution
+SET aspiral.kickoff_date = '2026-04-15';
+```
+
 ## 🏗 Architecture & Design Patterns
 
 ### 1. The Spiral Mapping (Time to Epoch)
@@ -86,6 +102,22 @@ Traditional IVM often struggles with high-volume updates because tracking every 
 Refreshing a root view automatically triggers a recursive, incremental update down the entire hierarchy (e.g., 1m -> 5m -> 1h). Each level only re-aggregates data from its direct parent for the specific segments that were flagged as dirty.
 
 ---
+
+### 6. Backup & Restore (SQL Dump Compatibility)
+Because optimized binary files live outside the standard PostgreSQL data directory, standard `pg_dump` will not capture them by default. 
+
+**To perform a backup:**
+Materialize the optimized storage back into a standard PostgreSQL table using the provided Set-Returning Function:
+```sql
+CREATE TABLE backup_ticks AS SELECT * FROM aspiral_scan_zero(ticks_oid);
+```
+Standard backup tools will then see and capture `backup_ticks`.
+
+**To restore:**
+After restoring the SQL dump, re-pack the data into the optimized format:
+```sql
+SELECT aspiral_pack_delta_zero('backup_ticks', new_ticks_oid);
+```
 
 ## 🚀 Performance & Scalability
 

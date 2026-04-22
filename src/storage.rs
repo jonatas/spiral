@@ -5,12 +5,41 @@ use std::path::PathBuf;
 
 pub const ROW_SIZE: usize = 64;
 pub const COMPACT_ROW_SIZE: usize = 16;
+pub const ZERO_ROW_SIZE: usize = 8;
+pub const HEADER_SIZE: u64 = 64;
 pub const BLOCK_SIZE: usize = 128;
 pub const POINTS_PER_BLOCK: i64 = 64;
 pub const MAX_TENANTS: usize = 1000;
 pub const BUNDLE_SIZE: usize = MAX_TENANTS * ROW_SIZE;
 pub const COMPACT_BUNDLE_SIZE: usize = MAX_TENANTS * COMPACT_ROW_SIZE;
+pub const ZERO_BUNDLE_SIZE: usize = MAX_TENANTS * ZERO_ROW_SIZE;
 pub const BLOCK_BUNDLE_SIZE: usize = MAX_TENANTS * BLOCK_SIZE;
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct StorageHeader {
+    pub magic: [u8; 4],      // 4
+    pub version: u32,        // 4
+    pub rel_oid: u32,        // 4
+    pub _align: u32,         // 4 (Pad to 8-byte boundary)
+    pub kickoff_epoch: i64,  // 8
+    pub minimal_pace: f64,   // 8
+    pub reserved: [u8; 28],  // 28 (Total 64)
+}
+
+impl StorageHeader {
+    pub fn new(rel_oid: u32, kickoff: i64, pace: f64) -> Self {
+        Self {
+            magic: *b"ASPI",
+            version: 1,
+            rel_oid,
+            _align: 0,
+            kickoff_epoch: kickoff,
+            minimal_pace: pace,
+            reserved: [0u8; 28],
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -28,6 +57,12 @@ pub struct PackedRow {
     pub t_delta: i32,    // 4
     pub tenant_id: i32,  // 4
     pub value: f64,      // 8 (Total 16)
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ZeroTimestampRow {
+    pub value: f64,      // 8
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +151,125 @@ pub fn aspiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
         
         Ok::<(), spi::Error>(())
     }).unwrap();
+}
+
+fn validate_header(file: &mut File, rel_oid: u32) -> Result<(), String> {
+    let mut header_buf = [0u8; HEADER_SIZE as usize];
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    file.read_exact(&mut header_buf).map_err(|e| e.to_string())?;
+    
+    let header: StorageHeader = unsafe { std::mem::transmute_copy(&header_buf) };
+    
+    if &header.magic != b"ASPI" { return Err("Invalid magic number".to_string()); }
+    if header.rel_oid != rel_oid { return Err(format!("OID mismatch: expected {}, got {}", rel_oid, header.rel_oid)); }
+    
+    let current_kickoff = crate::get_kickoff_epoch();
+    if header.kickoff_epoch != current_kickoff {
+        return Err(format!("Kickoff drift: file has {}, current is {}", header.kickoff_epoch, current_kickoff));
+    }
+    
+    let current_pace = crate::get_minimal_pace();
+    if (header.minimal_pace - current_pace).abs() > 1e-9 {
+        return Err(format!("Pace drift: file has {}, current is {}", header.minimal_pace, current_pace));
+    }
+    
+    Ok(())
+}
+
+#[pg_extern]
+pub fn aspiral_pack_delta_zero(delta_table_name: &str, main_rel_oid: i32) {
+    let path = get_storage_path(main_rel_oid, "_zero");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create(true)
+        .open(path)
+        .expect("Failed to open Zero Store file");
+
+    let kickoff = crate::get_kickoff_epoch();
+    let pace = crate::get_minimal_pace();
+
+    // 1. Initialize or validate header
+    if file.metadata().unwrap().len() < HEADER_SIZE {
+        let header = StorageHeader::new(main_rel_oid as u32, kickoff, pace);
+        let bytes: [u8; HEADER_SIZE as usize] = unsafe { std::mem::transmute(header) };
+        file.write_all(&bytes).unwrap();
+    } else {
+        validate_header(&mut file, main_rel_oid as u32).expect("Storage header validation failed");
+    }
+
+    Spi::connect(|client| {
+        let query = format!("SELECT t, tenant_id, price FROM {} ORDER BY t ASC", delta_table_name);
+        let tuple_table = client.select(&query, None, &[])?;
+
+        for row in tuple_table {
+            let t = row.get::<i64>(1)?.unwrap();
+            let tenant_id = row.get::<i64>(2)?.unwrap();
+            let value = row.get::<f64>(3)?.unwrap();
+
+            // Sanity bounds: reject points more than 100 years from kickoff
+            if t < 0 || t > (100.0 * 365.25 * 24.0 * 3600.0 / pace) as i64 {
+                warning!("Aspiral: Point at t={} is out of sanity bounds. Skipping.", t);
+                continue;
+            }
+
+            let offset = HEADER_SIZE + (t as u64 * ZERO_BUNDLE_SIZE as u64) + (tenant_id as u64 * ZERO_ROW_SIZE as u64);
+            
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        
+        Ok::<(), spi::Error>(())
+    }).unwrap();
+}
+
+#[pg_extern]
+pub fn aspiral_read_main_zero(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
+    let path = get_storage_path(main_rel_oid, "_zero");
+    let mut file = File::open(path).ok()?;
+    
+    validate_header(&mut file, main_rel_oid as u32).ok()?;
+
+    let offset = HEADER_SIZE + (t as u64 * ZERO_BUNDLE_SIZE as u64) + (tenant_id as u64 * ZERO_ROW_SIZE as u64);
+    let mut buffer = [0u8; ZERO_ROW_SIZE];
+    
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.read_exact(&mut buffer).ok()?;
+    
+    Some(f64::from_le_bytes(buffer))
+}
+
+#[pg_extern]
+pub fn aspiral_scan_zero(main_rel_oid: i32) -> TableIterator<'static, (name!(t, i64), name!(tenant_id, i32), name!(value, f64))> {
+    let path = get_storage_path(main_rel_oid, "_zero");
+    let mut file = File::open(path).expect("Failed to open Zero Store for scan");
+    
+    validate_header(&mut file, main_rel_oid as u32).expect("Storage header validation failed during scan");
+
+    let file_len = file.metadata().unwrap().len();
+    let mut current_offset: u64 = HEADER_SIZE;
+    
+    TableIterator::new(std::iter::from_fn(move || {
+        while current_offset < file_len {
+            let mut buffer = [0u8; ZERO_ROW_SIZE];
+            if file.read_exact(&mut buffer).is_err() { break; }
+            
+            let value = f64::from_le_bytes(buffer);
+            let offset = current_offset - HEADER_SIZE;
+            current_offset += ZERO_ROW_SIZE as u64;
+
+            // Reconstruct t and tenant_id from address
+            let t = (offset / ZERO_BUNDLE_SIZE as u64) as i64;
+            let tenant_id = ((offset % ZERO_BUNDLE_SIZE as u64) / ZERO_ROW_SIZE as u64) as i32;
+
+            if value.is_nan() || value == 0.0 {
+                continue;
+            }
+
+            return Some((t, tenant_id, value));
+        }
+        None
+    }))
 }
 
 #[pg_extern]
@@ -281,38 +435,33 @@ mod tests {
         assert_eq!(std::mem::size_of::<AspiralingRow>(), 64);
         
         let test_oid = 12345;
-        let path = get_storage_path(test_oid, "");
+        let path = get_storage_path(test_oid, "_zero");
         if path.exists() { let _ = fs::remove_file(&path); }
 
-        let mut file = OpenOptions::new().write(true).create(true).open(&path).unwrap();
+        let mut file = OpenOptions::new().write(true).read(true).create(true).open(&path).unwrap();
         
+        // Write dummy header
+        let header = StorageHeader::new(test_oid as u32, 1776211200, 1.0);
+        let h_bytes: [u8; HEADER_SIZE as usize] = unsafe { std::mem::transmute(header) };
+        file.write_all(&h_bytes).unwrap();
+
         let test_t = 100;
         let test_tenant = 5;
-        let test_val = 99.99;
+        let test_val = 99.99f64;
 
-        let offset = (test_t * BUNDLE_SIZE as i64) + (test_tenant * ROW_SIZE as i64);
-        let data = AspiralingRow {
-            t: test_t,
-            tenant_id: test_tenant as i32,
-            _align: 0,
-            value: test_val,
-            padding: [0u8; 40],
-        };
-
-        let bytes: [u8; ROW_SIZE] = unsafe { std::mem::transmute(data) };
-        file.seek(SeekFrom::Start(offset as u64)).unwrap();
-        file.write_all(&bytes).unwrap();
+        let offset = HEADER_SIZE + (test_t * ZERO_BUNDLE_SIZE as u64) + (test_tenant * ZERO_ROW_SIZE as u64);
+        
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&test_val.to_le_bytes()).unwrap();
         drop(file);
 
         let mut read_file = File::open(&path).unwrap();
-        let mut buffer = [0u8; ROW_SIZE];
-        read_file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        let mut buffer = [0u8; ZERO_ROW_SIZE];
+        read_file.seek(SeekFrom::Start(offset)).unwrap();
         read_file.read_exact(&mut buffer).unwrap();
-        let row: AspiralingRow = unsafe { std::mem::transmute(buffer) };
+        let val = f64::from_le_bytes(buffer);
         
-        assert_eq!(row.t, test_t);
-        assert_eq!(row.tenant_id, test_tenant as i32);
-        assert_eq!(row.value, test_val);
+        assert_eq!(val, test_val);
         
         let _ = fs::remove_file(&path);
     }

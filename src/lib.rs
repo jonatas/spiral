@@ -48,7 +48,7 @@ thread_local! {
     static KICKOFF_CACHE: RefCell<Option<(String, i64)>> = RefCell::new(None);
 }
 
-fn get_kickoff_epoch() -> i64 {
+pub fn get_kickoff_epoch() -> i64 {
     let kickoff = KICKOFF_DATE.get();
     let kickoff_str = match kickoff {
         Some(s) => s.to_string_lossy().into_owned(),
@@ -80,6 +80,10 @@ fn get_kickoff_epoch() -> i64 {
     
     KICKOFF_CACHE.with(|c| *c.borrow_mut() = Some((kickoff_str, val)));
     val
+}
+
+pub fn get_minimal_pace() -> f64 {
+    MINIMAL_PACE.get()
 }
 
 #[pg_extern(immutable, parallel_safe, name = "aspiral")]
