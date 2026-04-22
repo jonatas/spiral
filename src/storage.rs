@@ -59,6 +59,7 @@ pub struct PackedRow {
     pub value: f64,      // 8 (Total 16)
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct ZeroTimestampRow {

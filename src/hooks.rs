@@ -22,6 +22,9 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     dest: *mut pg_sys::DestReceiver,
     completion_tag: *mut pg_sys::QueryCompletion,
 ) {
+    let q_str = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
+    notice!("Aspiral Hook: Processing query: {:?}", &q_str[..std::cmp::min(100, q_str.len())]);
+
     if IN_UTILITY.with(|h| h.get()) {
         if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
             prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, completion_tag);
@@ -33,6 +36,9 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     IN_UTILITY.with(|h| h.set(true));
 
     let utility_stmt = (*pstmt).utilityStmt;
+    let node_type = if !utility_stmt.is_null() { unsafe { (*(utility_stmt as *mut pg_sys::Node)).type_ } } else { pg_sys::NodeTag::T_Invalid };
+    info!("Aspiral Hook: UtilityStmt type: {:?}", node_type);
+
     let mut frames_opt: Option<String> = None;
     let mut tenant_opt: Option<String> = None;
     let mut time_col_opt: Option<String> = Some("t".to_string());
@@ -42,42 +48,52 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     let mut is_matview = false;
     let mut aspiral_enabled = false;
     
+    let sql_text = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
+    if sql_text.to_lowercase().contains("-- aspiral: enabled") {
+        notice!("Aspiral Hook: Magic header found!");
+        aspiral_enabled = true;
+    }
+
     if !utility_stmt.is_null() {
         let node_type = (*(utility_stmt as *mut pg_sys::Node)).type_;
         if node_type == pg_sys::NodeTag::T_CreateTableAsStmt {
             let ctas = utility_stmt as *mut pg_sys::CreateTableAsStmt;
             if (*ctas).objtype == pg_sys::ObjectType::OBJECT_MATVIEW {
                 is_matview = true;
-                let into = (*ctas).into;
-                if !into.is_null() {
-                    let rel = (*into).rel;
-                    if !rel.is_null() { target_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned()); }
-                    let query = (*ctas).query as *mut pg_sys::Query;
-                    if !query.is_null() { scope_columns = get_grouping_columns(query); }
-                    let options = (*into).options;
-                    if !options.is_null() {
-                        for i in 0..(*options).length {
-                            let def_elem = pg_sys::list_nth(options, i as i32) as *mut pg_sys::DefElem;
-                            if !def_elem.is_null() {
-                                let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
-                                let defnamespace = if (*def_elem).defnamespace.is_null() { std::borrow::Cow::Borrowed("") } else { CStr::from_ptr((*def_elem).defnamespace).to_string_lossy() };
-                                if defnamespace == "aspiral" || defname == "aspiral" {
-                                    aspiral_enabled = true;
-                                    let arg = (*def_elem).arg as *mut pg_sys::Node;
-                                    if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
-                                        let val = CStr::from_ptr((*(arg as *mut pg_sys::String)).sval).to_string_lossy().into_owned();
-                                        match defname.as_ref() {
-                                            "frames" => frames_opt = Some(val),
-                                            "tenant" => tenant_opt = Some(val),
-                                            "time" => time_col_opt = Some(val),
-                                            _ => {}
-                                        }
+            }
+            let into = (*ctas).into;
+            if !into.is_null() {
+                let rel = (*into).rel;
+                if !rel.is_null() { target_name = Some(CStr::from_ptr((*rel).relname).to_string_lossy().into_owned()); }
+                let query = (*ctas).query as *mut pg_sys::Query;
+                if !query.is_null() { scope_columns = get_grouping_columns(query); }
+                let options = (*into).options;
+                if !options.is_null() {
+                    let mut new_options = std::ptr::null_mut();
+                    for i in 0..(*options).length {
+                        let def_elem = pg_sys::list_nth(options, i as i32) as *mut pg_sys::DefElem;
+                        if !def_elem.is_null() {
+                            let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
+                            let defnamespace = if (*def_elem).defnamespace.is_null() { std::borrow::Cow::Borrowed("") } else { CStr::from_ptr((*def_elem).defnamespace).to_string_lossy() };
+                            if defnamespace == "aspiral" || defname == "aspiral" || defname == "aspiral_enabled" || (defnamespace == "aspiral" && defname == "enabled") {
+                                notice!("Aspiral Hook (CTAS): Found aspiral option: {}.{}", defnamespace, defname);
+                                aspiral_enabled = true;
+                                let arg = (*def_elem).arg as *mut pg_sys::Node;
+                                if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
+                                    let val = CStr::from_ptr((*(arg as *mut pg_sys::String)).sval).to_string_lossy().into_owned();
+                                    match defname.as_ref() {
+                                        "frames" => frames_opt = Some(val),
+                                        "tenant" => tenant_opt = Some(val),
+                                        "time" => time_col_opt = Some(val),
+                                        _ => {}
                                     }
                                 }
+                            } else {
+                                new_options = pg_sys::lappend(new_options, def_elem as *mut std::ffi::c_void);
                             }
                         }
-                        (*into).options = std::ptr::null_mut();
                     }
+                    (*into).options = new_options;
                 }
             }
         } else if node_type == pg_sys::NodeTag::T_CreateStmt {
@@ -121,7 +137,8 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                     if !def_elem.is_null() {
                         let defname = CStr::from_ptr((*def_elem).defname).to_string_lossy();
                         let defnamespace = if (*def_elem).defnamespace.is_null() { std::borrow::Cow::Borrowed("") } else { CStr::from_ptr((*def_elem).defnamespace).to_string_lossy() };
-                        if defnamespace == "aspiral" || defname == "aspiral" {
+                        if defnamespace == "aspiral" || defname == "aspiral" || defname == "aspiral_enabled" || (defnamespace == "aspiral" && defname == "enabled") {
+                            notice!("Aspiral Hook (Create): Found aspiral option: {}.{}", defnamespace, defname);
                             aspiral_enabled = true;
                             let arg = (*def_elem).arg as *mut pg_sys::Node;
                             if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
@@ -133,7 +150,9 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                     _ => {}
                                 }
                             }
-                        } else { new_options = pg_sys::lappend(new_options, def_elem as *mut std::ffi::c_void); }
+                        } else { 
+                            new_options = pg_sys::lappend(new_options, def_elem as *mut std::ffi::c_void); 
+                        }
                     }
                 }
                 (*stmt).options = new_options;
@@ -147,21 +166,14 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
         }
     }
 
-    let frames_opt_final = frames_opt.clone();
-    let tenant_opt_final = tenant_opt.clone();
-    let time_col_opt_final = time_col_opt.clone();
-    let target_name_final = target_name.clone();
-    let is_matview_final = is_matview;
-    let scope_columns_final = scope_columns.clone();
-
     if aspiral_enabled {
         crate::bgworker::maybe_start_worker();
     }
 
     let mut handled_incrementally = false;
-    if let Some(name) = target_name_final.clone() {
+    if let Some(ref name) = target_name {
         if is_refresh {
-            handled_incrementally = reactive_refresh(&name, None);
+            handled_incrementally = reactive_refresh(name, None);
         }
     }
 
@@ -173,20 +185,20 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
         }
     }
 
-    if let Some(name) = target_name_final {
+    if let Some(name) = target_name {
         if !is_refresh {
-            if aspiral_enabled && tenant_opt_final.is_some() {
-                let tenant_str = tenant_opt_final.clone().unwrap();
+            if aspiral_enabled && tenant_opt.is_some() {
+                let tenant_str = tenant_opt.clone().unwrap();
                 let dimensions: Vec<String> = tenant_str.split(',').map(|s| s.trim().to_string()).collect();
-                let time_col = time_col_opt_final.clone().unwrap_or_else(|| "t".to_string());
+                let time_col = time_col_opt.clone().unwrap_or_else(|| "t".to_string());
                 crate::cluster_table_internal(&name, &time_col, dimensions);
             }
             let sql_text = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
-            if !is_matview_final && aspiral_enabled {
-                let actual_frames = frames_opt_final.unwrap_or_else(|| rollup::DEFAULT_FRAMES.to_string());
+            if !is_matview && aspiral_enabled {
+                let actual_frames = frames_opt.unwrap_or_else(|| rollup::DEFAULT_FRAMES.to_string());
                 let table_name = name.clone();
-                let time_col = time_col_opt_final.unwrap_or_else(|| "t".to_string());
-                let tenant_cols = tenant_opt_final.as_ref().map(|s| s.split(',').collect::<Vec<_>>()).unwrap_or_default();
+                let time_col = time_col_opt.unwrap_or_else(|| "t".to_string());
+                let tenant_cols = tenant_opt.as_ref().map(|s| s.split(',').collect::<Vec<_>>()).unwrap_or_default();
                 let mut projections = vec![format!("to_timestamptz((aspiral(\"{time_col}\")/{{0}})*{{0}}) as \"{time_col}\"")];
                 let mut groups = vec![format!("(aspiral(\"{time_col}\")/{{0}})*{{0}}")];
                 for tenant in &tenant_cols { let t = tenant.trim(); projections.push(format!("\"{t}\"")); groups.push(format!("\"{t}\"")); }
@@ -266,10 +278,10 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                         }
                     }
                 }
-            } else if is_matview_final {
-                if let Some(frames_str) = frames_opt_final {
-                    catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns_final.clone());
-                    generate_hierarchy(&name, &frames_str, scope_columns_final);
+            } else if is_matview {
+                if let Some(frames_str) = frames_opt {
+                    catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone());
+                    generate_hierarchy(&name, &frames_str, scope_columns);
                 }
             }
         }
@@ -285,6 +297,9 @@ thread_local! { static IN_HOOK: Cell<bool> = Cell::new(false); }
 pub unsafe extern "C-unwind" fn aspiral_planner_hook(
     parse: *mut pg_sys::Query, query_string: *const c_char, cursor_options: c_int, bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
+    let q_str = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
+    notice!("Aspiral Planner Hook: Processing query: {:?}", &q_str[..std::cmp::min(100, q_str.len())]);
+
     if IN_HOOK.with(|h| h.get()) {
         return if let Some(prev_hook) = PREV_PLANNER_HOOK { prev_hook(parse, query_string, cursor_options, bound_params) } else { pg_sys::standard_planner(parse, query_string, cursor_options, bound_params) };
     }
@@ -389,6 +404,7 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
 }
 
 pub unsafe fn init_hooks() {
+    notice!("Aspiral: Initializing hooks...");
     PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
     pg_sys::ProcessUtility_hook = Some(aspiral_process_utility_hook);
     PREV_PLANNER_HOOK = pg_sys::planner_hook;

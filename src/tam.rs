@@ -52,9 +52,9 @@ pub unsafe extern "C-unwind" fn aspiral_scan_begin(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aspiral_scan_getnextslot(
-    scan: pg_sys::TableScanDesc,
+    _scan: pg_sys::TableScanDesc,
     _direction: i32,
-    slot: *mut pg_sys::TupleTableSlot,
+    _slot: *mut pg_sys::TupleTableSlot,
 ) -> bool {
     // This is where we would stream from the binary file directly into the slot.
     // By implementing this, SELECT * FROM table automatically becomes an O(N) 

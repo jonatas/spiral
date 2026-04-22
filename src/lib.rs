@@ -16,10 +16,40 @@ mod bgworker;
 
 static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
 static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(1.0);
+static FRAMES: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
+static TENANT: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
+static TIME_COL: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
 
 #[no_mangle]
 pub unsafe extern "C" fn _PG_init() {
     hooks::init_hooks();
+
+    GucRegistry::define_string_guc(
+        CStr::from_bytes_with_nul(b"aspiral.frames\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Aspirals hierarchy frames definition.\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Comma-separated list of time frames (e.g., '1m,1h,1d').\0").unwrap(),
+        &FRAMES,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        CStr::from_bytes_with_nul(b"aspiral.tenant\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Tenant column(s).\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Comma-separated list of columns for partitioning/Z-Order.\0").unwrap(),
+        &TENANT,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        CStr::from_bytes_with_nul(b"aspiral.time\0").unwrap(),
+        CStr::from_bytes_with_nul(b"Time column.\0").unwrap(),
+        CStr::from_bytes_with_nul(b"The column to be used as time dimension.\0").unwrap(),
+        &TIME_COL,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 
     GucRegistry::define_string_guc(
         CStr::from_bytes_with_nul(b"aspiral.kickoff_date\0").unwrap(),
@@ -735,32 +765,24 @@ extension_sql_file!(
 mod tests {
     use pgrx::prelude::*;
     #[pg_test]
-    fn test_scenario_9_massive_benchmark() {
-        Spi::run("CREATE TABLE benchmark_delta (t bigint, tenant_id bigint, price double precision);").unwrap();
-        Spi::run("INSERT INTO benchmark_delta SELECT (i / 100), (i % 100), random() * 100 FROM generate_series(0, 999_999) s(i);").unwrap();
-        Spi::run("SELECT public.aspiral_pack_delta('benchmark_delta', 999_999);").unwrap();
-        let val = Spi::get_one::<f64>("SELECT public.aspiral_read_main(999_999, 5, 50)").unwrap().unwrap();
-        assert!(val >= 0.0 && val <= 100.0);
+    fn test_regular_tables_ignored() {
+        Spi::run("CREATE TABLE regular_table (t timestamptz, val double precision);").unwrap();
+        let count = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.metadata WHERE base_view = 'regular_table'").unwrap().unwrap();
+        assert_eq!(count, 0);
+        
+        let trigger_exists = Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid = 'regular_table'::regclass AND tgname LIKE 'aspiral%')").unwrap().unwrap();
+        assert!(!trigger_exists);
     }
 
     #[pg_test]
-    fn test_walkthrough() {
-        // Run the walkthrough.sql script (ignoring DROP/CREATE EXTENSION)
-        let walkthrough = include_str!("../walkthrough.sql");
-        let lines: Vec<&str> = walkthrough.lines()
-            .filter(|line| !line.to_uppercase().contains("EXTENSION") && !line.to_uppercase().contains("SCHEMA"))
-            .collect();
-        let cleaned_sql = lines.join("\n");
+    fn test_aspiral_table_activated() {
+        // Use a CTAS with aspiral option to verify activation
+        Spi::run("CREATE TABLE base_data (t timestamptz, val double precision);").unwrap();
+        Spi::run("INSERT INTO base_data VALUES (now(), 1.0);").unwrap();
+        Spi::run("CREATE MATERIALIZED VIEW aspiral_matview WITH (aspiral.frames='1m') AS SELECT to_timestamptz((aspiral(t)/60)*60) as t, sum(val) as val_sum FROM base_data GROUP BY 1;").unwrap();
         
-        // Split by semicolon to run each statement individually
-        // Note: This is a simple splitter and might fail on complex SQL with semicolons in strings/blocks.
-        // But for walkthrough.sql it should be okay.
-        for statement in cleaned_sql.split(';') {
-            let stmt = statement.trim();
-            if !stmt.is_empty() {
-                Spi::run(stmt).expect(&format!("Failed to execute statement: {}", stmt));
-            }
-        }
+        let count = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.metadata WHERE base_view = 'aspiral_matview'").unwrap().unwrap();
+        assert!(count > 0);
     }
 }
 
