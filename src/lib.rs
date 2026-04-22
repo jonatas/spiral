@@ -1,5 +1,4 @@
 use pgrx::prelude::*;
-use pgrx::pg_sys;
 
 pub mod catalog;
 pub mod hooks;

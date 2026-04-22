@@ -205,6 +205,5 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
         Ok::< (String, Vec<SourceDef>), spi::Error>((sql, sources))
     }).unwrap_or_else(|e| {
         error!("Aspiral failed to derive child SQL for {}: {:?}", parent_name, e);
-        ("".to_string(), vec![])
     })
 }

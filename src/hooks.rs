@@ -186,7 +186,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                 let table_name = name.clone();
                 let time_col = time_col_opt.unwrap_or_else(|| "t".to_string());
                 let tenant_cols = tenant_opt.as_ref().map(|s| s.split(',').collect::<Vec<_>>()).unwrap_or_default();
-                let mut projections = vec![format!("to_timestamptz((aspiral(\"{time_col}\")/{{0}})*{{0}}) as \"{time_col}\"")];
+                let mut projections = vec![format!("to_timestamp(((aspiral(\"{time_col}\")/{{0}})*{{0}})::double precision) as \"{time_col}\"")];
                 let mut groups = vec![format!("(aspiral(\"{time_col}\")/{{0}})*{{0}}")];
                 for tenant in &tenant_cols { let t = tenant.trim(); projections.push(format!("\"{t}\"")); groups.push(format!("\"{t}\"")); }
                 for line in q_str.lines() {
