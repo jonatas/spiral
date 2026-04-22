@@ -1,13 +1,22 @@
 -- Benchmark: Aspiral Transparent Query Acceleration
--- This script compares raw table aggregation vs. Aspiral's hierarchical cache
+SET client_min_messages TO NOTICE;
+
+-- Ensure the extension and library are loaded
+CREATE EXTENSION IF NOT EXISTS aspiral CASCADE;
+LOAD 'aspiral';
 
 SET aspiral.kickoff_date = '2026-04-15';
 
 -- 1. Setup
+DROP TABLE IF EXISTS accel_bench CASCADE;
 CREATE TABLE accel_bench (
     t timestamptz NOT NULL,
-    val double precision -- Aspiral: sum, count, avg
-) WITH (aspiral.frames = '1m,1h');
+    val double precision
+);
+
+-- Register Aspiral Hierarchy manually (more reliable than WITH for benchmarks)
+SELECT aspiral_register_view('accel_bench_ohlcv_1m', 'BASE', 60, 'accel_bench', ARRAY[]::text[]);
+SELECT aspiral_register_view('accel_bench_ohlcv_1h', 'accel_bench_ohlcv_1m', 3600, 'accel_bench', ARRAY[]::text[]);
 
 -- 2. Ingest 100,000 rows over 10 hours
 INSERT INTO accel_bench (t, val)
@@ -21,36 +30,30 @@ SELECT aspiral_refresh('accel_bench_ohlcv_1m');
 SELECT aspiral_refresh('accel_bench_ohlcv_1h');
 
 -- 4. Baseline Query (Non-accelerated)
--- We can disable the hook or just query a baseline table
+DROP TABLE IF EXISTS baseline_bench CASCADE;
 CREATE TABLE baseline_bench AS SELECT * FROM accel_bench;
 
 \timing on
 
 -- Test 1: Full Range Sum (10 hours)
--- Expected: Raw scans 36,000 rows. Aspiral scans 10 rows from _1h view.
 \echo '--- [BASELINE] Summing 10 hours of raw data ---'
-SELECT sum(val) FROM baseline_bench WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-15 10:00:00Z';
+SELECT sum(val) FROM baseline_bench WHERE t >= '2026-04-15 00:00:00Z'::timestamptz AND t < '2026-04-15 10:00:00Z'::timestamptz;
 
 \echo '--- [ASPIRAL] Summing 10 hours (Transparent Acceleration) ---'
-SELECT sum(val) FROM accel_bench WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-15 10:00:00Z';
+SELECT sum(val) FROM accel_bench WHERE t >= '2026-04-15 00:00:00Z'::timestamptz AND t < '2026-04-15 10:00:00Z'::timestamptz;
 
 -- Test 2: Partial Range (Mixed sources)
--- Query 5 hours and 30 minutes
 \echo '--- [BASELINE] Summing 5.5 hours of raw data ---'
-SELECT sum(val) FROM baseline_bench WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-15 05:30:00Z';
+SELECT sum(val) FROM baseline_bench WHERE t >= '2026-04-15 00:00:00Z'::timestamptz AND t < '2026-04-15 05:30:00Z'::timestamptz;
 
 \echo '--- [ASPIRAL] Summing 5.5 hours (Mixed 1h + 1m acceleration) ---'
-SELECT sum(val) FROM accel_bench WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-15 05:30:00Z';
+SELECT sum(val) FROM accel_bench WHERE t >= '2026-04-15 00:00:00Z'::timestamptz AND t < '2026-04-15 05:30:00Z'::timestamptz;
 
 -- Test 3: Average (Mathematical decomposition)
 \echo '--- [BASELINE] AVG over 10 hours ---'
-SELECT avg(val) FROM baseline_bench WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-15 10:00:00Z';
+SELECT avg(val) FROM baseline_bench WHERE t >= '2026-04-15 00:00:00Z'::timestamptz AND t < '2026-04-15 10:00:00Z'::timestamptz;
 
 \echo '--- [ASPIRAL] AVG over 10 hours (Transparent decomposition) ---'
-SELECT avg(val) FROM accel_bench WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-15 10:00:00Z';
+SELECT avg(val) FROM accel_bench WHERE t >= '2026-04-15 00:00:00Z'::timestamptz AND t < '2026-04-15 10:00:00Z'::timestamptz;
 
 \timing off
-
--- Cleanup
-DROP TABLE accel_bench CASCADE;
-DROP TABLE baseline_bench;

@@ -11,6 +11,11 @@ pub mod storage;
 
 pgrx::pg_module_magic!();
 
+#[pg_guard]
+pub unsafe extern "C-unwind" fn _PG_init() {
+    hooks::init_hooks();
+}
+
 #[pg_extern]
 fn aspiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
     let mut x = t as u32;
