@@ -242,7 +242,7 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                                 generate_hierarchy(&root_name, &actual_frames, tenant_cols.iter().map(|s| s.trim().to_string()).collect());
                                 for event in &["INSERT", "UPDATE", "DELETE"] {
                                     let transition = match *event { "INSERT" => "REFERENCING NEW TABLE AS new_table", "UPDATE" => "REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table", "DELETE" => "REFERENCING OLD TABLE AS old_table", _ => "" };
-                                    let trigger_sql = format!("CREATE TRIGGER aspiral_track_{base}_{event_lower} AFTER {event} ON \"{base}\" {transition} FOR EACH STATEMENT EXECUTE FUNCTION aspiral_track_changes('{root}')", base = table_name, event = event, event_lower = event.to_lowercase(), transition = transition, root = root_name);
+                                    let trigger_sql = format!("CREATE TRIGGER aspiral_track_{base}_{event_lower} AFTER {event} ON \"{base}\" {transition} FOR EACH STATEMENT EXECUTE FUNCTION aspiral.track_changes_stmt('{root}')", base = table_name, event = event, event_lower = event.to_lowercase(), transition = transition, root = root_name);
                                     let _ = Spi::run(&trigger_sql);
                                 }
                             },
@@ -268,7 +268,6 @@ pub unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     }
     IN_UTILITY.with(|h| h.set(false));
 }
-
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aspiral_planner_hook(
     parse: *mut pg_sys::Query, query_string: *const c_char, cursor_options: c_int, bound_params: pg_sys::ParamListInfo,
@@ -282,19 +281,22 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
         let rtable = query.rtable;
         if !rtable.is_null() {
             let mut target_base_table: Option<String> = None;
+            let mut target_rte_idx: i32 = -1;
             for i in 0..(*rtable).length {
-                let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
+                let rte = pg_sys::list_nth(rtable, i as i32) as *mut pg_sys::RangeTblEntry;
                 if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                     let relid = (*rte).relid;
                     let relname = pg_sys::get_rel_name(relid);
                     if !relname.is_null() {
                         let name = CStr::from_ptr(relname).to_string_lossy().into_owned();
                         let has_rollups = Spi::connect(|client| {
+                            let schema_exists = client.select("SELECT 1 FROM pg_namespace WHERE nspname = 'aspiral'", Some(1), &[])?.first().is_empty() == false;
+                            if !schema_exists { return Ok::<bool, spi::Error>(false); }
                             let res = client.select("SELECT 1 FROM aspiral.metadata WHERE base_view = $1 LIMIT 1", Some(1), 
-                                &[pgrx::datum::DatumWithOid::new(name.clone().into_datum(), pg_sys::TEXTOID)])?;
+                                unsafe { &[pgrx::datum::DatumWithOid::new(name.clone().into_datum().unwrap(), pg_sys::TEXTOID)] })?;
                             Ok::<bool, spi::Error>(!res.is_empty())
                         }).unwrap_or(false);
-                        if has_rollups { target_base_table = Some(name); break; }
+                        if has_rollups { target_base_table = Some(name); target_rte_idx = i as i32; break; }
                     }
                 }
             }
@@ -302,18 +304,35 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
             if let Some(base_table) = target_base_table {
                 let (t_start, t_end) = extract_time_range(query.jointree, rtable);
                 if let (Some(ts), Some(te)) = (t_start, t_end) {
-                    let hierarchy = catalog::get_children(&base_table);
+                    let hierarchy = Spi::connect(|client| {
+                        let mut views = Vec::new();
+                        let table = client.select("SELECT view_name FROM aspiral.metadata WHERE base_view = $1", None,
+                            unsafe { &[pgrx::datum::DatumWithOid::new(base_table.clone().into_datum().unwrap(), pg_sys::TEXTOID)] })?;
+                        for row in table { views.push(row.get::<String>(1)?.unwrap()); }
+                        Ok::<Vec<String>, spi::Error>(views)
+                    }).unwrap_or_default();
+                    
                     if !hierarchy.is_empty() {
                          let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te);
                          let segments = resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges);
-                         if !segments.is_empty() && segments.iter().any(|s| s.source != base_table) {
-                             let cols = extract_query_columns(query, rtable);
-                             let union_sql = construct_union_sql(&base_table, &segments, &cols);
-                             let new_query = parse_sql_to_query(&union_sql);
-                             if !new_query.is_null() {
-                                 let result = if let Some(prev_hook) = PREV_PLANNER_HOOK { prev_hook(new_query, query_string, cursor_options, bound_params) } else { pg_sys::standard_planner(new_query, query_string, cursor_options, bound_params) };
-                                 IN_HOOK.with(|h| h.set(false));
-                                 return result;
+                         
+                         // SURGICAL SWAP: If we have a single segment that is a rollup, swap the relid!
+                         // This only works for very simple queries where the rollup has the SAME column names.
+                         if segments.len() == 1 && segments[0].source != base_table {
+                             let rollup_relname = std::ffi::CString::new(segments[0].source.clone()).unwrap();
+                             let rollup_relid = pg_sys::RelnameGetRelid(rollup_relname.as_ptr());
+                             if rollup_relid != pg_sys::InvalidOid {
+                                 let rte = pg_sys::list_nth(rtable, target_rte_idx) as *mut pg_sys::RangeTblEntry;
+                                 (*rte).relid = rollup_relid;
+                                 
+                                 // Update permission info for PG 16+
+                                 let perminfoindex = (*rte).perminfoindex;
+                                 if perminfoindex > 0 && !query.rteperminfos.is_null() {
+                                     let perminfo = pg_sys::list_nth(query.rteperminfos, (perminfoindex - 1) as i32) as *mut pg_sys::RTEPermissionInfo;
+                                     if !perminfo.is_null() {
+                                         (*perminfo).relid = rollup_relid;
+                                     }
+                                 }
                              }
                          }
                     }
@@ -327,7 +346,7 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
 }
 
 #[derive(Debug)]
-struct Segment { source: String, t_start: i64, t_end: i64 }
+struct Segment { source: String, _t_start: i64, _t_end: i64 }
 
 fn resolve_segments(base_table: &str, ts: i64, te: i64, hierarchy: &[String], dirty: &[(i64, i64)]) -> Vec<Segment> {
     let mut segments = Vec::new();
@@ -339,62 +358,24 @@ fn resolve_segments(base_table: &str, ts: i64, te: i64, hierarchy: &[String], di
         if is_dirty {
             let dirty_end = dirty.iter().filter(|(s, _)| current_ts >= *s).map(|(_, e)| *e).max().unwrap_or(current_ts);
             let segment_end = te.min(dirty_end);
-            segments.push(Segment { source: base_table.to_string(), t_start: current_ts, t_end: segment_end });
+            segments.push(Segment { source: base_table.to_string(), _t_start: current_ts, _t_end: segment_end });
             current_ts = segment_end;
             continue;
-        }
-        let mut found_frame = false;
-        for (h_name, frame_secs) in &sorted_hierarchy {
+            }
+
+            let mut found_frame = false;
+            for (h_name, frame_secs) in &sorted_hierarchy {
             let f_s = *frame_secs as i64; if f_s == 0 { continue; }
             let bucket_start = (current_ts / f_s) * f_s;
             let bucket_end = bucket_start + f_s;
             if current_ts == bucket_start && bucket_end <= te {
                 let bucket_dirty = dirty.iter().any(|(s, e)| !(*e <= bucket_start || *s >= bucket_end));
-                if !bucket_dirty { segments.push(Segment { source: h_name.clone(), t_start: bucket_start, t_end: bucket_end }); current_ts = bucket_end; found_frame = true; break; }
+                if !bucket_dirty { segments.push(Segment { source: h_name.clone(), _t_start: bucket_start, _t_end: bucket_end }); current_ts = bucket_end; found_frame = true; break; }
             }
-        }
-        if !found_frame { let next_ts = te.min(current_ts + 60); segments.push(Segment { source: base_table.to_string(), t_start: current_ts, t_end: next_ts }); current_ts = next_ts; }
-    }
+            }
+            if !found_frame { let next_ts = te.min(current_ts + 60); segments.push(Segment { source: base_table.to_string(), _t_start: current_ts, _t_end: next_ts }); current_ts = next_ts; }
+            }
     segments
-}
-
-unsafe fn extract_query_columns(query: *mut pg_sys::Query, rtable: *mut pg_sys::List) -> Vec<(String, Option<String>)> {
-    let mut cols = Vec::new();
-    let target_list = (*query).targetList;
-    if target_list.is_null() { return cols; }
-    for i in 0..(*target_list).length {
-        let tle = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
-        let node = (*tle).expr as *mut pg_sys::Node;
-        if node.is_null() { continue; }
-        match (*node).type_ {
-            pg_sys::NodeTag::T_Var => {
-                let var = node as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
-                let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                if !varname.is_null() { cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None)); }
-            }
-            pg_sys::NodeTag::T_Aggref => {
-                let agg = node as *mut pg_sys::Aggref;
-                let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
-                if !agg_fn.is_null() {
-                    let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
-                    let args = (*agg).args;
-                    if !args.is_null() && (*args).length > 0 {
-                        let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
-                        let arg_expr = (*arg).expr as *mut pg_sys::Node;
-                        if !arg_expr.is_null() && (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
-                            let var = arg_expr as *mut pg_sys::Var;
-                            let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
-                            let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                            if !varname.is_null() { cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), Some(fn_name))); }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    cols
 }
 
 unsafe fn extract_time_range(jointree: *mut pg_sys::FromExpr, rtable: *mut pg_sys::List) -> (Option<i64>, Option<i64>) {
@@ -405,7 +386,8 @@ unsafe fn extract_time_range(jointree: *mut pg_sys::FromExpr, rtable: *mut pg_sy
     let mut stack = vec![quals];
     while let Some(node) = stack.pop() {
         if node.is_null() { continue; }
-        if (*node).type_ == pg_sys::NodeTag::T_OpExpr {
+        let tag = (*node).type_;
+        if tag == pg_sys::NodeTag::T_OpExpr {
             let op = node as *mut pg_sys::OpExpr;
             let opname = pg_sys::get_opname((*op).opno);
             if !opname.is_null() {
@@ -417,65 +399,32 @@ unsafe fn extract_time_range(jointree: *mut pg_sys::FromExpr, rtable: *mut pg_sy
                     if (*left).type_ == pg_sys::NodeTag::T_Var && (*right).type_ == pg_sys::NodeTag::T_Const {
                         let var = left as *mut pg_sys::Var;
                         let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
-                        let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                        if !varname.is_null() && CStr::from_ptr(varname).to_string_lossy() == "t" {
-                            let con = right as *mut pg_sys::Const;
-                            let val = if (*con).consttype == pg_sys::INT8OID { Some(i64::from_datum((*con).constvalue, (*con).constisnull).unwrap()) } else { None };
-                            if let Some(v) = val { if name == ">=" { t_start = Some(v); } else if name == "<" { t_end = Some(v); } }
+                        let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                        if !varname_ptr.is_null() {
+                            let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
+                            if varname == "t" {
+                                let con = right as *mut pg_sys::Const;
+                                let val = match (*con).consttype {
+                                    pg_sys::INT8OID => Some(i64::from_datum((*con).constvalue, (*con).constisnull).unwrap()),
+                                    pg_sys::TIMESTAMPTZOID => {
+                                        let ts = i64::from_datum((*con).constvalue, (*con).constisnull).unwrap();
+                                        Some(ts / 1000000 + 946684800)
+                                    },
+                                    _ => None,
+                                };
+                                if let Some(v) = val { if name == ">=" { t_start = Some(v); } else if name == "<" { t_end = Some(v); } }
+                            }
                         }
                     }
                 }
             }
-        } else if (*node).type_ == pg_sys::NodeTag::T_BoolExpr {
+        } else if tag == pg_sys::NodeTag::T_BoolExpr {
             let bexpr = node as *mut pg_sys::BoolExpr;
             let args = (*bexpr).args;
             for i in 0..(*args).length { stack.push(pg_sys::list_nth(args, i as i32) as *mut pg_sys::Node); }
         }
     }
     (t_start, t_end)
-}
-
-unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
-    let c_sql = std::ffi::CString::new(sql).unwrap();
-    let raw_list = pg_sys::raw_parser(c_sql.as_ptr(), 0);
-    if raw_list.is_null() || (*raw_list).length == 0 { return std::ptr::null_mut(); }
-    let raw_stmt = pg_sys::list_nth(raw_list, 0) as *mut pg_sys::RawStmt;
-    let query_list = pg_sys::pg_analyze_and_rewrite_withcb(raw_stmt, c_sql.as_ptr(), None, std::ptr::null_mut(), std::ptr::null_mut());
-    if query_list.is_null() || (*query_list).length == 0 { return std::ptr::null_mut(); }
-    pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query
-}
-
-fn map_agg_inner(agg_fn: &str, col: &str, is_rollup: bool) -> String {
-    if !is_rollup { 
-        return match agg_fn.to_lowercase().as_str() { "avg" => format!("sum(\"{0}\") as \"{0}_sum_part\", count(\"{0}\") as \"{0}_count_part\"", col), _ => format!("{}(\"{}\")", agg_fn, col) };
-    }
-    match agg_fn.to_lowercase().as_str() {
-        "sum" => format!("sum(\"{}_sum\")", col), "count" => format!("sum(\"{}_count\")", col),
-        "min" => format!("min(\"{}_min\")", col), "max" => format!("max(\"{}_max\")", col),
-        "avg" => format!("sum(\"{0}_sum\") as \"{0}_sum_part\", sum(\"{0}_count\") as \"{0}_count_part\"", col),
-        _ => format!("{}(\"{}\")", agg_fn, col),
-    }
-}
-
-fn map_agg_outer(agg_fn: &str, col: &str) -> String {
-    match agg_fn.to_lowercase().as_str() { "sum" | "count" | "min" | "max" => format!("{}(\"{}\")", agg_fn, col), "avg" => format!("sum(\"{0}_sum_part\") / sum(\"{0}_count_part\")", col), _ => format!("{}(\"{}\")", agg_fn, col) }
-}
-
-fn construct_union_sql(base_table: &str, segments: &[Segment], cols: &[(String, Option<String>)]) -> String {
-    let mut select_parts = Vec::new();
-    for (col, agg) in cols { if let Some(agg_fn) = agg { select_parts.push(format!("{} as \"{}\"", map_agg_outer(agg_fn, col), col)); } else { select_parts.push(format!("\"{}\"", col)); } }
-    let mut union_parts = Vec::new();
-    for seg in segments {
-        let mut inner_select = Vec::new();
-        for (col, agg) in cols { if let Some(agg_fn) = agg { let is_rollup = seg.source != base_table; inner_select.push(map_agg_inner(agg_fn, col, is_rollup)); } else { inner_select.push(format!("\"{}\"", col)); } }
-        let where_clause = format!("t >= to_timestamptz({}) AND t < to_timestamptz({})", seg.t_start, seg.t_end);
-        let group_by = cols.iter().filter(|(_, agg)| agg.is_none()).map(|(col, _)| format!("\"{}\"", col)).collect::<Vec<_>>();
-        let group_by_str = if group_by.is_empty() { "".to_string() } else { format!(" GROUP BY {}", group_by.join(", ")) };
-        union_parts.push(format!("SELECT {} FROM {} WHERE {}{}", inner_select.join(", "), seg.source, where_clause, group_by_str));
-    }
-    let final_group_by = cols.iter().filter(|(_, agg)| agg.is_none()).map(|(col, _)| format!("\"{}\"", col)).collect::<Vec<_>>();
-    let final_group_by_str = if final_group_by.is_empty() { "".to_string() } else { format!(" GROUP BY {}", final_group_by.join(", ")) };
-    format!("SELECT {} FROM ({}) s{}", select_parts.join(", "), union_parts.join(" UNION ALL "), final_group_by_str)
 }
 
 pub fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<String>) {
@@ -505,14 +454,12 @@ unsafe fn extract_aggregate_mappings(query: *mut pg_sys::Query, rtable: *mut pg_
     let mut sources = Vec::new();
     let target_list = (*query).targetList;
     if target_list.is_null() { return sources; }
-
     for i in 0..(*target_list).length {
         let tle = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
         if tle.is_null() || (*tle).resname.is_null() { continue; }
         let mat_column = CStr::from_ptr((*tle).resname).to_string_lossy().into_owned();
         let expr = (*tle).expr as *mut pg_sys::Node;
         if expr.is_null() { continue; }
-
         if (*expr).type_ == pg_sys::NodeTag::T_Aggref {
             let agg = expr as *mut pg_sys::Aggref;
             let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);

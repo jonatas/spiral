@@ -35,6 +35,22 @@ extension_sql!(
     );
     CREATE INDEX IF NOT EXISTS idx_aspiral_sources_lookup ON aspiral.sources(base_view, base_column, formula);
     
+    CREATE OR REPLACE FUNCTION aspiral.track_changes_stmt() RETURNS trigger AS $$
+    BEGIN
+        IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
+            RAISE NOTICE 'Aspiral Trigger: Tracking INSERT/UPDATE on %', TG_ARGV[0];
+            INSERT INTO aspiral.changelog (base_view, t_start, t_end, scope_values)
+            SELECT TG_ARGV[0], MIN(aspiral(t)), MAX(aspiral(t)), '{}'::jsonb FROM new_table;
+        END IF;
+        IF (TG_OP = 'DELETE' OR TG_OP = 'UPDATE') THEN
+            RAISE NOTICE 'Aspiral Trigger: Tracking DELETE/UPDATE on %', TG_ARGV[0];
+            INSERT INTO aspiral.changelog (base_view, t_start, t_end, scope_values)
+            SELECT TG_ARGV[0], MIN(aspiral(t)), MAX(aspiral(t)), '{}'::jsonb FROM old_table;
+        END IF;
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+
     -- Hybrid view to show both manual sources and potentially rules/views
     CREATE OR REPLACE VIEW aspiral.available_sources AS
     SELECT view_name, base_view, frame_seconds, base_column, formula, mat_column, args
