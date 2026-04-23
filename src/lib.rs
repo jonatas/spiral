@@ -1,4 +1,5 @@
 use pgrx::prelude::*;
+use std::cell::Cell;
 
 pub mod catalog;
 pub mod hooks;
@@ -10,8 +11,13 @@ pub mod storage;
 
 pgrx::pg_module_magic!();
 
+extension_sql_file!("../sql/aspiral.sql", name = "aspiral_setup");
+
+thread_local! {
+    pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
+}
+
 #[pg_guard]
-#[no_mangle]
 pub unsafe extern "C-unwind" fn _PG_init() {
     hooks::init_hooks();
 }
@@ -74,98 +80,123 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimensions: Vec<
 
 #[pg_extern]
 fn refresh_incremental(view_name: &str, extra_where: default!(Option<String>, "NULL")) -> bool {
+    let metadata_all = Spi::get_one::<i64>("SELECT count(*) FROM aspiral.metadata").unwrap().unwrap_or(0);
+    notice!("Aspiral: refresh_incremental starting for '{}', total metadata rows: {}", view_name, metadata_all);
+    
     let metadata = catalog::get_metadata(view_name);
-    if metadata.is_none() { return false; }
+    if metadata.is_none() { 
+        notice!("Aspiral: refresh_incremental failed - no metadata for '{}' (total metadata rows: {})", view_name, metadata_all);
+        return false; 
+    }
     let metadata = metadata.unwrap();
     let frame_seconds = metadata.frame_seconds;
     let parent_view = metadata.parent_view;
     let scope_cols_raw = metadata.scope_columns;
     let scope_cols: Vec<String> = scope_cols_raw.iter().map(|c| format!("\"{}\"", c)).collect();
     
-    let mut current_meta = catalog::get_metadata(view_name);
-    let mut changelog_key = view_name.to_string();
-    while let Some(ref m) = current_meta {
-        if m.parent_view == "BASE" { break; }
-        changelog_key = m.parent_view.clone();
-        current_meta = catalog::get_metadata(&changelog_key);
+    notice!("Aspiral: refresh_incremental starting for '{}', parent_view='{}'", view_name, parent_view);
+    
+    let changelog_key = metadata.base_view.clone();
+
+    let source_table = if parent_view == "BASE" {
+        let res = Spi::get_one_with_args::<String>(
+            "SELECT base_view FROM aspiral.metadata WHERE view_name = $1",
+            &[unsafe { pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID) }]
+        );
+        
+        match res {
+            Ok(Some(v)) => {
+                notice!("Aspiral: refresh_incremental {} source_table lookup result: {}", view_name, v);
+                v
+            },
+            Ok(None) => {
+                notice!("Aspiral: refresh_incremental {} source_table lookup result: NONE", view_name);
+                panic!("No base_view found for {}", view_name);
+            },
+            Err(e) => {
+                notice!("Aspiral: refresh_incremental {} source_table get_one error: {:?}", view_name, e);
+                panic!("Error getting base_view for {}", view_name);
+            }
+        }
+    } else {
+        parent_view.clone()
+    };
+
+    notice!("Aspiral: refresh_incremental {} from {}", view_name, source_table);
+
+    let cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\""));
+    let all_cols: Vec<String> = Spi::connect(|client| {
+        Ok::<Vec<String>, spi::Error>(client.select(&cols_query, None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap()).collect())
+    }).unwrap_or_default();
+
+    if all_cols.is_empty() {
+        notice!("Aspiral: refresh_incremental failed - no columns for '{}'", view_name);
+        return false;
     }
 
-    let result = Spi::connect(|client| {
-        let source_table = if parent_view == "BASE" {
-            client.select("SELECT base_view FROM aspiral.metadata WHERE view_name = $1", None, 
-                unsafe { &[pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)] })?.get_one::<String>()?.unwrap()
-        } else {
-            parent_view.clone()
-        };
+    let update_cols: Vec<String> = all_cols.iter()
+        .filter(|&c| c != "t" && !scope_cols_raw.contains(c))
+        .map(|c| format!("\"{}\"", c)).collect();
 
-        let cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\""));
-        let all_cols: Vec<String> = client.select(&cols_query, None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap()).collect();
+    let (sql_child, _) = rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
+    let select_part = sql_child.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
 
-        if all_cols.is_empty() {
-            return Ok::<bool, spi::Error>(false);
-        }
+    let mut on_clause = vec!["target.t::timestamptz = source.t::timestamptz".to_string()];
+    for col in &scope_cols { on_clause.push(format!("target.{} = source.{}", col, col)); }
+    let update_set = update_cols.iter().map(|c| format!("{} = source.{}", c, c)).collect::<Vec<_>>().join(", ");
 
-        let update_cols: Vec<String> = all_cols.iter()
-            .filter(|&c| c != "t" && !scope_cols_raw.contains(c))
-            .map(|c| format!("\"{}\"", c)).collect();
+    let mut source_where = if scope_cols_raw.is_empty() {
+        notice!("Aspiral: refresh_incremental joining changelog for '{}' (no scope)", changelog_key);
+        format!(
+            "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
+                AND aspiral(t) >= (c.t_start/{0})*{0} 
+                AND aspiral(t) < ((c.t_end/{0})+1)*{0}
+                AND c.scope_values = '{{}}'::jsonb",
+            frame_seconds,
+            changelog_key = changelog_key.replace("'", "''")
+        )
+    } else {
+        notice!("Aspiral: refresh_incremental joining changelog for '{}' with scope", changelog_key);
+        let scope_cols_json = scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"::text", s, s)).collect::<Vec<_>>().join(", ");
+        format!(
+            "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
+                AND aspiral(t) >= (c.t_start/{0})*{0} 
+                AND aspiral(t) < ((c.t_end/{0})+1)*{0}
+                AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
+            frame_seconds,
+            scope_cols_json,
+            changelog_key = changelog_key.replace("'", "''")
+        )
+    };
+    if let Some(ref extra) = extra_where { source_where.push_str(&format!(" WHERE ({})", extra)); }
 
-        let (sql_child, _) = rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
-        let select_part = sql_child.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
+    let group_by_clause = if scope_cols.is_empty() { "1".to_string() } else { format!("1, {}", scope_cols.join(", ")) };
 
-        let mut on_clause = vec!["target.t = source.t".to_string()];
-        for col in &scope_cols { on_clause.push(format!("target.{} = source.{}", col, col)); }
-        let update_set = update_cols.iter().map(|c| format!("{} = source.{}", c, c)).collect::<Vec<_>>().join(", ");
+    let merge_sql = format!(
+        "MERGE INTO \"{view_name}\" AS target
+            USING (
+                SELECT {select_part} FROM \"{source_table}\" 
+                {source_where}
+                GROUP BY {group_by_clause}
+            ) AS source
+            ON ({on_clause})
+            WHEN MATCHED THEN UPDATE SET {update_set}
+            WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
+        view_name = view_name, select_part = select_part, source_table = source_table, source_where = source_where, group_by_clause = group_by_clause, on_clause = on_clause.join(" AND "),
+        update_set = if update_set.is_empty() { "t = source.t" } else { &update_set },
+        all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
+        source_cols_joined = all_cols.iter().map(|c| format!("source.\"{}\"", c)).collect::<Vec<_>>().join(", ")
+    );
 
-        let mut source_where = if scope_cols_raw.is_empty() {
-            notice!("Aspiral: refresh_incremental joining changelog for '{}' (no scope)", changelog_key);
-            format!(
-                "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
-                 AND aspiral(t) >= (c.t_start/{0})*{0} 
-                 AND aspiral(t) < ((c.t_end/{0})+1)*{0}
-                 AND c.scope_values = '{{}}'::jsonb",
-                frame_seconds,
-                changelog_key = changelog_key.replace("'", "''")
-            )
-        } else {
-            notice!("Aspiral: refresh_incremental joining changelog for '{}' with scope", changelog_key);
-            let scope_cols_json = scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"::text", s, s)).collect::<Vec<_>>().join(", ");
-            format!(
-                "JOIN aspiral.changelog c ON c.base_view = '{changelog_key}' 
-                 AND aspiral(t) >= (c.t_start/{0})*{0} 
-                 AND aspiral(t) < ((c.t_end/{0})+1)*{0}
-                 AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
-                frame_seconds,
-                scope_cols_json,
-                changelog_key = changelog_key.replace("'", "''")
-            )
-        };
-        if let Some(ref extra) = extra_where { source_where.push_str(&format!(" WHERE ({})", extra)); }
+    let changelog_count = Spi::get_one_with_args::<i64>("SELECT count(*) FROM aspiral.changelog WHERE base_view = $1", 
+        &[unsafe { pgrx::datum::DatumWithOid::new(changelog_key.clone().into_datum().unwrap(), pg_sys::TEXTOID) }]).unwrap().unwrap_or(0);
+    notice!("Aspiral: changelog count for {} is {}", changelog_key, changelog_count);
 
-        let group_by_clause = if scope_cols.is_empty() { "1".to_string() } else { format!("1, {}", scope_cols.join(", ")) };
+    SKIP_ACCELERATION.with(|s| s.set(true));
+    Spi::run(&merge_sql).unwrap();
+    SKIP_ACCELERATION.with(|s| s.set(false));
 
-        let merge_sql = format!(
-            "MERGE INTO \"{view_name}\" AS target
-             USING (
-                 SELECT {select_part} FROM \"{source_table}\" 
-                 {source_where}
-                 GROUP BY {group_by_clause}
-             ) AS source
-             ON ({on_clause})
-             WHEN MATCHED THEN UPDATE SET {update_set}
-             WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
-            view_name = view_name, select_part = select_part, source_table = source_table, source_where = source_where, group_by_clause = group_by_clause, on_clause = on_clause.join(" AND "),
-            update_set = if update_set.is_empty() { "t = source.t" } else { &update_set },
-            all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
-            source_cols_joined = all_cols.iter().map(|c| format!("source.\"{}\"", c)).collect::<Vec<_>>().join(", ")
-        );
-
-        let chunks = merge_sql.as_bytes().chunks(500);
-        for chunk in chunks {
-            notice!("Aspiral: merge_sql part: {}", std::str::from_utf8(chunk).unwrap());
-        }
-        let _ = Spi::run(&merge_sql);
-        Ok(true)
-    }).unwrap_or(false);
+    let result = true;
 
     if result {
         let children = catalog::get_children(view_name);
@@ -183,6 +214,7 @@ fn aspiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL")
 
 #[pg_extern]
 fn aspiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>) {
+    notice!("Aspiral: registering view '{}', parent='{}', base='{}'", view_name, parent_view, base_view);
     let source_table = if parent_view == "BASE" { base_view } else { parent_view };
     let (sql, sources) = rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
     
@@ -192,6 +224,7 @@ fn aspiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32,
     }
 
     catalog::insert_metadata(view_name, parent_view, frame_seconds, base_view, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
+    notice!("Aspiral: view '{}' metadata inserted", view_name);
     for src in sources { catalog::insert_source(view_name, base_view, frame_seconds, &src.base_column, &src.formula, &src.mat_column, pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); }
     if parent_view == "BASE" {
         for event in &["INSERT", "UPDATE", "DELETE"] {
@@ -208,13 +241,14 @@ fn aspiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32,
                 "CREATE TRIGGER aspiral_track_{base_view}_{event_lower} 
                  AFTER {event} ON \"{base_view}\" 
                  {transition}
-                 FOR EACH STATEMENT EXECUTE FUNCTION aspiral.track_changes_stmt('{view_name}')",
+                 FOR EACH STATEMENT EXECUTE FUNCTION aspiral.track_changes_stmt('{base_view}')",
                 base_view = base_view, event = event, event_lower = event.to_lowercase(),
-                transition = transition, view_name = view_name
+                transition = transition
             );
             let _ = Spi::run(&trigger_sql);
         }
     }
+    notice!("Aspiral: view '{}' registration complete", view_name);
 }
 
 pub fn get_kickoff_epoch() -> i64 {
@@ -252,6 +286,14 @@ mod tests {
 
         // Ingest 100k rows
         Spi::run("INSERT INTO stress_raw (t, val) SELECT '2026-04-15 00:00:00Z'::timestamptz + (n || ' seconds')::interval, random() * 100 FROM generate_series(0, 100000) n;").unwrap();
+
+        let count_raw = Spi::get_one::<i64>("SELECT count(*) FROM stress_raw WHERE aspiral(t) >= 1776211200 AND aspiral(t) < 1776311220").unwrap().unwrap_or(0);
+        notice!("Aspiral TEST: raw count matching 1776211200..1776311220 is {}", count_raw);
+
+        let count_raw_all = Spi::get_one::<i64>("SELECT count(*) FROM stress_raw").unwrap().unwrap_or(0);
+        let min_t = Spi::get_one::<i64>("SELECT MIN(aspiral(t)) FROM stress_raw").unwrap().unwrap_or(0);
+        let max_t = Spi::get_one::<i64>("SELECT MAX(aspiral(t)) FROM stress_raw").unwrap().unwrap_or(0);
+        notice!("Aspiral TEST: total raw count is {}, min_t={}, max_t={}", count_raw_all, min_t, max_t);
 
         Spi::run("SELECT aspiral_refresh('stress_raw_ohlcv_1m');").unwrap();
         Spi::run("SELECT aspiral_refresh('stress_raw_ohlcv_1h');").unwrap();

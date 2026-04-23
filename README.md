@@ -62,7 +62,34 @@ Aspiral solves the "Composite Index Trap" by interleaving the bits of Time and T
 
 ---
 
-### 4. Reactive Backfill Engine & IVM
+### 4. Ultimate Transparent Acceleration (Multi-Tier Slicing)
+Aspiral features a sophisticated **Hierarchical Planner Hook** that intercepts standard SQL queries against your raw tables and automatically rewrites them to use the most efficient rollup tiers available.
+
+- **Intelligent Slicing**: If you query a 7-day range, Aspiral automatically slices it into **6 full days** from the Daily rollup, **23 hours** from the Hourly rollup, and **59 minutes** from the Minutely rollup, using **Raw Data** only for the remaining seconds.
+- **Automatic Timezone Alignment**: Queries in non-UTC timezones (e.g. `EST`, `BRT`) are automatically handled. Aspiral detects the session offset and shifts the slicing boundaries to maximize rollup usage for any regional timezone.
+- **Dirty-Data Precision**: Unlike traditional caches that invalidate entire ranges, Aspiral's **Dirty-Data Slicer** identifies exactly which buckets have been modified (late-arriving data) and surgically routes *only those segments* back to the raw table.
+- **Double-Sided Join Acceleration**: When joining two time-series tables, Aspiral **propagates time constraints** across the join condition. It can simultaneously accelerate both sides of a join, replacing massive raw table scans with tiny, optimized rollup scans.
+- **Zero-Interference Policy**: Aspiral is built for safety. If a query contains unsupported logic (e.g., unmapped aggregates or complex window functions), the system silently and safely bypasses acceleration, defaulting to standard PostgreSQL execution.
+
+**Example Transparent Rewrite (Internal):**
+```sql
+-- User writes:
+SELECT sum(val) FROM sensor_raw 
+WHERE t >= '2026-04-15 00:00:00' AND t < '2026-04-15 01:30:05';
+
+-- Aspiral executes:
+SELECT sum(val) FROM (
+    SELECT val FROM sensor_raw_1h WHERE ... -- 1 Hour tier
+    UNION ALL
+    SELECT val FROM sensor_raw_1m WHERE ... -- 30 Min tier
+    UNION ALL
+    SELECT val FROM sensor_raw WHERE ...    -- 5 Sec raw fallback
+) accelerated_data;
+```
+
+---
+
+### 5. Reactive Backfill Engine & IVM
 Aspiral tracks "dirty buckets" in a transactional changelog to provide **Incremental View Maintenance (IVM)**.
 
 - **Surgical Updates**: Instead of rebuilding entire views, Aspiral identifies exactly which time buckets changed and patches only those records. This provides massive performance gains for backfills or late-arriving data.
@@ -101,9 +128,15 @@ Traditional IVM often struggles with high-volume updates because tracking every 
 ### 3. Cascading Hierarchical Refresh
 Refreshing a root view automatically triggers a recursive, incremental update down the entire hierarchy (e.g., 1m -> 5m -> 1h). Each level only re-aggregates data from its direct parent for the specific segments that were flagged as dirty.
 
+### 4. Surgical Subquery Grafting
+The Hierarchical Planner doesn't just replace tables; it **grafts subqueries**. When a raw table is targeted for acceleration, Aspiral replaces its entry in the PostgreSQL Range Table with an `RTE_SUBQUERY` node. This subquery contains the optimized `UNION ALL` of rollups. This allows the outer query's JOINS, CTEs, and Window Functions to remain perfectly valid while the data source itself is optimized.
+
+### 5. Join Constraint Propagation
+In multi-table queries, Aspiral performs a recursive walk of the **JoinTree**. If it detects an equijoin on time (e.g., `a.t = b.t`) where only one side has a defined range, Aspiral **propagates the constraint** to the other side. This enables the simultaneous acceleration of multiple independent time-series datasets in a single join operation.
+
 ---
 
-### 6. Backup & Restore (SQL Dump Compatibility)
+### 7. Backup & Restore (SQL Dump Compatibility)
 Because optimized binary files live outside the standard PostgreSQL data directory, standard `pg_dump` will not capture them by default. 
 
 **To perform a backup:**
