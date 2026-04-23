@@ -201,9 +201,22 @@ CREATE TABLE ticks (
 REFRESH MATERIALIZED VIEW ticks_ohlcv_1m;
 ```
 
-## ⚙️ Production Setup
+## ⚙️ Experimental Setup
 
-For Aspiral's background worker and certain hooks to function correctly in production, you must add `aspiral` to your `shared_preload_libraries` in `postgresql.conf`:
+Aspiral is currently being tested on **PostgreSQL 16, 17, and 18**.
+
+### Local Development
+To run the framework locally with your preferred PostgreSQL version:
+
+```bash
+# For PostgreSQL 16
+cargo pgrx run pg16
+
+# For PostgreSQL 18
+cargo pgrx run pg18 --no-default-features --features pg18
+```
+
+For certain hooks to function correctly, you must add `aspiral` to your `shared_preload_libraries` in `postgresql.conf`:
 
 ```ini
 shared_preload_libraries = 'aspiral'
