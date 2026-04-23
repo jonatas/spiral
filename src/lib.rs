@@ -250,14 +250,20 @@ mod tests {
         Spi::run("SELECT aspiral_register_view('stress_raw_ohlcv_1h', 'stress_raw_ohlcv_1m', 3600, 'stress_raw', ARRAY[]::text[]);").unwrap();
         Spi::run("SELECT aspiral_register_view('stress_raw_ohlcv_1d', 'stress_raw_ohlcv_1h', 86400, 'stress_raw', ARRAY[]::text[]);").unwrap();
 
-        // Ingest 10k rows
-        Spi::run("INSERT INTO stress_raw (t, val) SELECT '2026-04-15 00:00:00Z'::timestamptz + (n || ' seconds')::interval, random() * 100 FROM generate_series(0, 10000) n;").unwrap();
+        // Ingest 100k rows
+        Spi::run("INSERT INTO stress_raw (t, val) SELECT '2026-04-15 00:00:00Z'::timestamptz + (n || ' seconds')::interval, random() * 100 FROM generate_series(0, 100000) n;").unwrap();
 
         Spi::run("SELECT aspiral_refresh('stress_raw_ohlcv_1m');").unwrap();
         Spi::run("SELECT aspiral_refresh('stress_raw_ohlcv_1h');").unwrap();
+        Spi::run("SELECT aspiral_refresh('stress_raw_ohlcv_1d');").unwrap();
 
-        let total_sum = Spi::get_one::<f64>("SELECT sum(val) FROM stress_raw WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-15 01:00:00Z'").unwrap().expect("Acceleration failed to return data");
+        let start = std::time::Instant::now();
+        let total_sum = Spi::get_one::<f64>("SELECT sum(val) FROM stress_raw WHERE t >= '2026-04-15 00:00:00Z' AND t < '2026-04-20 00:00:00Z'").unwrap().expect("Acceleration failed to return data");
+        let duration = start.elapsed();
+
+        notice!("Accelerated Query (100k rows) took: {:?}", duration);
         assert!(total_sum > 0.0);
+        assert!(duration.as_millis() < 100); 
     }}
 
 #[cfg(test)]
