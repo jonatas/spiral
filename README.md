@@ -1,11 +1,11 @@
-# Aspiral: Time-Series Evolution in PostgreSQL
+# Aspiral: Time-Series Experimental Framework
 
-**Aspiral** is a PostgreSQL extension designed for massive-scale time-series data. It reimagines time as an evolving spiral, optimizing for both storage footprint and hierarchical statistical rollups.
+**Aspiral** is a PostgreSQL extension for experimenting with time-series data at scale. It serves as a playground for learning PostgreSQL internals while testing ideas for storage footprints and hierarchical rollups.
 
-## 🚀 Core Features
+## 🚀 Key Features (Experimental)
 
 ### 1. Magic Comments (Zero-Config Pipelines)
-Define your entire analytics pipeline directly within your `CREATE TABLE` statement. Aspiral parses SQL comments and intelligently scans your schema to automatically generate materialized view hierarchies.
+Define analytics pipelines directly within your `CREATE TABLE` statement. Aspiral parses SQL comments to generate materialized view hierarchies for testing.
 
 ```sql
 CREATE TABLE sensor_readings (
@@ -62,14 +62,14 @@ Aspiral solves the "Composite Index Trap" by interleaving the bits of Time and T
 
 ---
 
-### 4. Ultimate Transparent Acceleration (Multi-Tier Slicing)
-Aspiral features a sophisticated **Hierarchical Planner Hook** that intercepts standard SQL queries against your raw tables and automatically rewrites them to use the most efficient rollup tiers available.
+### 4. Transparent Query Acceleration (Hierarchical Slicing)
+Aspiral includes an experimental **Planner Hook** that intercepts SQL queries against raw tables and attempts to rewrite them using available rollup tiers.
 
-- **Intelligent Slicing**: If you query a 7-day range, Aspiral automatically slices it into **6 full days** from the Daily rollup, **23 hours** from the Hourly rollup, and **59 minutes** from the Minutely rollup, using **Raw Data** only for the remaining seconds.
-- **Automatic Timezone Alignment**: Queries in non-UTC timezones (e.g. `EST`, `BRT`) are automatically handled. Aspiral detects the session offset and shifts the slicing boundaries to maximize rollup usage for any regional timezone.
-- **Dirty-Data Precision**: Unlike traditional caches that invalidate entire ranges, Aspiral's **Dirty-Data Slicer** identifies exactly which buckets have been modified (late-arriving data) and surgically routes *only those segments* back to the raw table.
-- **Double-Sided Join Acceleration**: When joining two time-series tables, Aspiral **propagates time constraints** across the join condition. It can simultaneously accelerate both sides of a join, replacing massive raw table scans with tiny, optimized rollup scans.
-- **Zero-Interference Policy**: Aspiral is built for safety. If a query contains unsupported logic (e.g., unmapped aggregates or complex window functions), the system silently and safely bypasses acceleration, defaulting to standard PostgreSQL execution.
+- **Range Slicing**: Automatically attempts to slice a query into segments matching available rollups (e.g., using Daily, Hourly, and Minutely tiers where they align).
+- **Timezone Alignment**: Detects session offsets to adjust slicing boundaries for non-UTC queries.
+- **Dirty-Data Handling**: Attempts to identify modified buckets in the changelog and routes those specific segments back to the raw table for accuracy.
+- **Join Acceleration**: Propagates time constraints across join conditions to try and accelerate multiple tables in a single query.
+- **Safety Fallback**: If a query uses unsupported logic (unmapped aggregates, complex functions), the hook stays out of the way and defaults to standard PostgreSQL execution.
 
 **Example Transparent Rewrite (Internal):**
 ```sql
@@ -152,24 +152,20 @@ After restoring the SQL dump, re-pack the data into the optimized format:
 SELECT aspiral_pack_delta_zero('backup_ticks', new_ticks_oid);
 ```
 
-## 🚀 Performance & Scalability
+## 🚀 Experimental Performance
 
-Aspiral is engineered for high-throughput ingestion and instant analytics on billion-row datasets.
+Aspiral is currently an experimental prototype. Early benchmarks show potential for significant speedups by reducing the amount of data scanned.
 
-### Benchmarks (10M - 100M Rows)
-- **Ingestion Throughput**: ~2,000,000 rows/s (Unlogged, Bulk Load).
-- **Query Latency (P95)**: 
-    - **PostgreSQL Baseline**: 865ms (Full Table Scan/Sort).
-    - **Aspiral (Pre-aggregated Sketch)**: **0.08ms**.
-    - **Speedup**: **~10,000x** faster for complex quantiles.
-- **Incremental Refresh**: 
-    - Backfills and late-arriving data are handled via **Dirty Bucket Tracking**, avoiding full table rebuilds.
-    - Cascading updates ensure that a change in raw data only re-aggregates the affected 1-minute buckets and propagates the "deltas" up the hierarchy.
+### Current Benchmarks (Research Environment)
+- **Ingestion**: Testing up to ~2M rows/s in bulk load scenarios.
+- **Acceleration**: Significant latency reduction when queries align perfectly with rollup boundaries.
+- **Safety**: Designed with a "Zero-Interference" policy—falling back to raw data whenever accuracy cannot be guaranteed by the experimental logic.
 
-### Massive Load Best Practices
-1. **Bulk Load First**: For initial migration of 1B+ rows, ingest data *before* creating the view hierarchy for maximum speed.
-2. **Expression Indexing**: Aspiral automatically uses expression indexes on `aspiral(t)` to speed up initial aggregations.
-3. **Z-Order Clustering**: For multi-tenant dashboards, use `aspiral.tenant` in your view definitions to enable bit-interleaved clustering.
+---
+
+## 🛠 Project Status & Vision
+
+This project is an **experiment** built to explore PostgreSQL internals. It is not production-ready. Feedback and support are welcome as I test these ideas and evolve the framework toward more robust implementations.
 
 ---
 

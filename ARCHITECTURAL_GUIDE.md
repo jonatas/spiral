@@ -1,53 +1,36 @@
-# Aspiral: Architectural Guide & Performance Catalog
+# Aspiral: Experimental Architecture Overview
 
-Aspiral provides transparent hierarchical query acceleration. However, it is designed for specific workloads and has built-in safety fallbacks for unsupported scenarios.
+This document outlines the internal ideas being tested in Aspiral. These mechanisms are part of an experimental framework for exploring PostgreSQL internals.
 
-## When to use Aspiral
-- **High-Volume Time-Series:** 10M+ rows where sequential scans are too slow.
-- **Hierarchical Analysis:** Queries covering mixed ranges (e.g., "Last 7 days" + "Last 10 minutes").
-- **Multi-Tenant IoT:** Data scoped by dimensions like `device_id` or `sensor_type`.
-- **Read-Heavy Workloads:** Dashboards and analytics where aggregate results are reused.
+## Query Acceleration (Experimental)
 
-## When Regular Tables are better
-- **Small Datasets:** If your table has < 100k rows, PostgreSQL's Seq Scan is often faster than the overhead of slicing.
-- **Frequent Historical Updates:** If you constantly update random points in the past, the `aspiral.changelog` will become fragmented, forcing frequent "Dirty Fallbacks" to the raw table.
-- **Complex Relational Queries:** Queries using heavy Window Functions, non-standard aggregates, or complex JOINs that don't involve time.
+Aspiral tests ideas for transparent hierarchical query acceleration. It is currently designed for specific research workloads and includes safety fallbacks.
 
-## Known Architectural Constraints & Issues
+## Performance Catalog (Observations)
+- **High-Volume Time-Series:** Testing 10M+ row scenarios where sequential scans are slow.
+- **Hierarchical Slicing:** Exploring mixed-range queries (e.g., "7 days" + "10 minutes").
+- **Multi-Tenant Scoping:** Testing bit-interleaved clustering (Z-Order) for tenant dimensions.
+
+## Current Limitations & Research Areas
 
 ### 1. Supported Aggregates
-Aspiral currently only accelerates: `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, and `TDIGEST`.
-- **Inconsistency:** Unmapped aggregates (e.g., `STDDEV`, `VARIANCE`) will trigger a **Transparent Fallback** to the raw table. This ensures 100% accuracy but loses the acceleration benefit.
+Currently testing: `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, and `TDIGEST`.
+- **Note:** Unmapped aggregates trigger a fallback to the raw table to maintain accuracy.
 
-### 2. Filter Propagation
-- **Issue:** Filters on columns that are NOT part of the `aspiral_scope` or the Time column (`t`) currently trigger a fallback.
-- **Reason:** Pushing arbitrary filters into a `UNION ALL` subquery while maintaining rollup mathematical correctness is a complex task for future versions.
+### 2. Filter Push-down
+Arbitrary filters on non-scope columns are a complex research area. Currently, these filters trigger a safe fallback to standard PostgreSQL execution.
 
-### 3. CTEs and Complex Subqueries
-- **Issue:** Tables wrapped in `WITH` (CTEs) or certain nested subqueries are currently bypassed.
-- **Reason:** The planner hook presently inspects the top-level Range Table. Deep recursion into the Query AST for CTE acceleration is planned for stabilization.
+### 3. Subquery & CTE Handling
+The planner hook currently inspects the top-level Range Table. Deep recursion for CTE acceleration is an area for future exploration.
 
-### 4. Precision & Rounding
-- **Constraint:** `AVG` is computed as `SUM(sum_col) / SUM(count_col)`. While mathematically sound, slight floating-point differences may occur compared to a raw scan due to the order of operations in rollups.
+## Timezone-Aware Slicing (Experimental)
 
-## Timezone-Aware Acceleration
+Aspiral explores ways to handle non-UTC queries by shifting slicing boundaries based on session offsets.
 
-Aspiral handles non-UTC queries with surgical precision. Time-series data is stored in UTC, but users often query in their local timezones (e.g., `America/Sao_Paulo`).
+### Current Approach
+When a session offset is detected, the slicer attempts to:
+1. Align the "Body" of the query with full UTC Daily buckets.
+2. Use finer rollups (Hourly/Minutely) for the "Head" and "Tail" offsets.
 
-### The Slicing Strategy
-When a session is set to a non-UTC timezone, Aspiral detects the current offset and shifts its greedy slicer accordingly:
-1. **Head Segment:** Uses the finest rollup (Hourly/Minutely) to cover the offset "head" (the hours before the first full UTC day).
-2. **Body Segment:** Uses the Daily tier for all full UTC days in the middle of the requested range.
-3. **Tail Segment:** Uses the finest rollup to cover the remaining hours at the end.
-
-This ensures that even a query with a `-3h` offset still benefits from Daily rollups for the bulk of its range, rather than falling back to Raw data.
-
-### Example
-**Query:** `2026-04-15 00:00:00-03` to `2026-04-17 00:00:00-03`
-**Aspiral Plan:**
-- 21 Hours from `HOURLY ROLLUP` (Head)
-- 1 Day from `DAILY ROLLUP` (Body)
-- 3 Hours from `HOURLY ROLLUP` (Tail)
-
-## Safety & Stability Guarantee
-Aspiral is designed with a **Zero-Interference** policy. If the system cannot 100% guarantee a correct accelerated plan (due to unmapped logic, dirty regions, or complex ASTs), it will **silently and safely bypass** to standard PostgreSQL execution.
+## Safety & Research Policy
+Aspiral follows a **Zero-Interference** research policy. If the experimental logic cannot guarantee a correct plan, it defaults to standard PostgreSQL execution.
