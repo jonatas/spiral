@@ -119,6 +119,12 @@ pub fn aspiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
 
 extension_sql!(
     r#"
+    CREATE OR REPLACE FUNCTION aspiral_stats_mean(double precision) RETURNS double precision AS 'SELECT $1' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION aspiral_stats_stddev(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION aspiral_stats_variance(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION aspiral_stats_skewness(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION aspiral_stats_kurtosis(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+
     CREATE AGGREGATE aspiral_stats(double precision) (
         SFUNC = aspiral_stats_accum,
         STYPE = jsonb,

@@ -1,5 +1,4 @@
 use pgrx::prelude::*;
-use pgrx::pg_sys;
 use pgrx::datum::DatumWithOid;
 
 pub struct Metadata {

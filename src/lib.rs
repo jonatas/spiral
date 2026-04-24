@@ -59,6 +59,8 @@ fn aspiral_is_loaded() -> bool {
 #[pg_extern]
 fn aspiral(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
     let micros = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
+    // PostgreSQL epoch is 2000-01-01. Unix epoch is 1970-01-01.
+    // Offset is 946684800 seconds.
     (micros / 1000000) + 946684800
 }
 
@@ -188,10 +190,9 @@ fn refresh_incremental(view_name: &str, extra_where: default!(Option<String>, "N
         source_cols_joined = all_cols.iter().map(|c| format!("source.\"{}\"", c)).collect::<Vec<_>>().join(", ")
     );
 
-    let changelog_count = Spi::get_one_with_args::<i64>("SELECT count(*) FROM aspiral.changelog WHERE base_view = $1", 
+    let _changelog_count = Spi::get_one_with_args::<i64>("SELECT count(*) FROM aspiral.changelog WHERE base_view = $1", 
         &[unsafe { pgrx::datum::DatumWithOid::new(changelog_key.clone().into_datum().unwrap(), pg_sys::TEXTOID) }]).unwrap().unwrap_or(0);
-    notice!("Aspiral: changelog count for {} is {}", changelog_key, changelog_count);
-
+    notice!("Aspiral: refresh_incremental {} merge_sql: {}", view_name, merge_sql);
     SKIP_ACCELERATION.with(|s| s.set(true));
     Spi::run(&merge_sql).unwrap();
     SKIP_ACCELERATION.with(|s| s.set(false));
@@ -205,6 +206,57 @@ fn refresh_incremental(view_name: &str, extra_where: default!(Option<String>, "N
         }
     }
     result
+}
+
+#[pg_extern]
+fn aspiral_to_epoch(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
+    aspiral(t)
+}
+
+#[pg_extern]
+fn aspiral_from_epoch(epoch: i64) -> pgrx::datum::TimestampWithTimeZone {
+    // Unix epoch starts 946684800 seconds before PG epoch
+    let micros = (epoch - 946684800) * 1000000;
+    unsafe { pgrx::datum::TimestampWithTimeZone::from_datum(micros.into_datum().unwrap(), false).unwrap() }
+}
+
+#[pg_extern]
+fn aspiral_purge(base_table: &str) {
+    let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", base_table.replace("'", "''")));
+    notice!("Aspiral: Changelog purged for '{}'", base_table);
+}
+
+#[pg_extern]
+fn aspiral_status(base_table: &str) -> pgrx::JsonB {
+    Spi::connect(|client| {
+        let mut status = serde_json::Map::new();
+        
+        // 1. Hierarchy info
+        let mut views = Vec::new();
+        let table = client.select("SELECT view_name, frame_seconds, parent_view FROM aspiral.metadata WHERE base_view = $1 ORDER BY frame_seconds ASC", None,
+            unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] })?;
+        
+        for row in table {
+            let mut v_info = serde_json::Map::new();
+            let v_name = row.get::<String>(1)?.unwrap();
+            v_info.insert("frame_seconds".to_string(), serde_json::Value::from(row.get::<i32>(2)?.unwrap()));
+            v_info.insert("parent".to_string(), serde_json::Value::from(row.get::<String>(3)?.unwrap()));
+            
+            // Get row count for each view
+            let count = client.select(&format!("SELECT count(*) FROM \"{}\"", v_name.replace("\"", "\"\"")), Some(1), &[])?.get_one::<i64>()?.unwrap_or(0);
+            v_info.insert("row_count".to_string(), serde_json::Value::from(count));
+            
+            views.push(serde_json::Value::Object(v_info));
+        }
+        status.insert("hierarchy".to_string(), serde_json::Value::Array(views));
+
+        // 2. Dirtiness info
+        let dirty_count = client.select("SELECT count(*) FROM aspiral.changelog WHERE base_view = $1", Some(1),
+            unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] })?.get_one::<i64>()?.unwrap_or(0);
+        status.insert("dirty_segments_count".to_string(), serde_json::Value::from(dirty_count));
+
+        Ok::<pgrx::JsonB, spi::Error>(pgrx::JsonB(serde_json::Value::Object(status)))
+    }).unwrap()
 }
 
 #[pg_extern(name = "aspiral_refresh")]

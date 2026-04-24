@@ -1,9 +1,8 @@
--- Comprehensive IoT Storage & Query Benchmark
--- Comparing Standard, Compact, and Block formats across Ingestion, Storage, and Query (Sequential vs Random).
-
+-- Comprehensive IoT Storage & Query Benchmark (Side-by-Side Comparison)
+SET client_min_messages TO WARNING;
 DROP EXTENSION IF EXISTS aspiral CASCADE;
 CREATE EXTENSION aspiral;
-SET aspiral.kickoff_date = '2026-04-15';
+SET aspiral.kickoff_date = '2025-01-01';
 
 DROP TABLE IF EXISTS delta_iot CASCADE;
 CREATE TABLE delta_iot (
@@ -12,85 +11,68 @@ CREATE TABLE delta_iot (
     price double precision
 );
 
+-- Results tracking table
+CREATE TEMP TABLE bench_results (
+    format TEXT,
+    metric TEXT,
+    val_text TEXT,
+    val_num FLOAT
+);
+
 -- 1M rows of IoT data
+\echo '--- [STAGE 1] Ingesting 1M rows for storage testing ---'
 INSERT INTO delta_iot (t, tenant_id, price)
-SELECT 
-    (i / 1000), -- time in seconds
-    (i % 1000), -- 1000 tenants
-    random() * 100
-FROM generate_series(0, 999999) i;
+SELECT (i / 1000), (i % 1000), random() * 100 FROM generate_series(0, 999999) i;
 
 DO $$
 DECLARE
-    start_time timestamptz;
+    s_t timestamptz;
     main_oid int := 987654;
-    res float;
-    res_arr float[];
+    dur interval;
 BEGIN
-    RAISE NOTICE '========== 1. INGESTION (PACKING) SPEED ==========';
-    
-    start_time := clock_timestamp();
-    PERFORM aspiral_pack_delta('delta_iot', main_oid);
-    RAISE NOTICE 'Standard Packing (64-byte): %', clock_timestamp() - start_time;
+    -- 1. Ingestion
+    s_t := clock_timestamp(); PERFORM aspiral_pack_delta('delta_iot', main_oid); dur := clock_timestamp() - s_t;
+    INSERT INTO bench_results VALUES ('Standard', 'Ingestion Time', dur::text, extract(epoch from dur));
 
-    start_time := clock_timestamp();
-    PERFORM aspiral_pack_delta_compact('delta_iot', main_oid);
-    RAISE NOTICE 'Compact Packing (16-byte):  %', clock_timestamp() - start_time;
+    s_t := clock_timestamp(); PERFORM aspiral_pack_delta_compact('delta_iot', main_oid); dur := clock_timestamp() - s_t;
+    INSERT INTO bench_results VALUES ('Compact', 'Ingestion Time', dur::text, extract(epoch from dur));
 
-    start_time := clock_timestamp();
-    PERFORM aspiral_pack_delta_blocks('delta_iot', main_oid);
-    RAISE NOTICE 'Block Packing (XOR):        %', clock_timestamp() - start_time;
+    s_t := clock_timestamp(); PERFORM aspiral_pack_delta_blocks('delta_iot', main_oid); dur := clock_timestamp() - s_t;
+    INSERT INTO bench_results VALUES ('Block (XOR)', 'Ingestion Time', dur::text, extract(epoch from dur));
 
-    RAISE NOTICE '';
-    RAISE NOTICE '========== 2. RANDOM SINGLE-POINT READ (CPU Overhead) ==========';
-    -- 10,000 random point reads.
-    
-    start_time := clock_timestamp();
-    FOR i IN 1..10000 LOOP
-        PERFORM aspiral_read_main(main_oid, (i % 1000)::bigint, (i % 1000)::bigint);
-    END LOOP;
-    RAISE NOTICE 'Read Standard (Random): %', clock_timestamp() - start_time;
+    -- 2. Random Read (10k)
+    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM aspiral_read_main(main_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    INSERT INTO bench_results VALUES ('Standard', 'Random Read (10k)', dur::text, extract(epoch from dur));
 
-    start_time := clock_timestamp();
-    FOR i IN 1..10000 LOOP
-        PERFORM aspiral_read_main_compact(main_oid, (i % 1000)::bigint, (i % 1000)::bigint);
-    END LOOP;
-    RAISE NOTICE 'Read Compact (Random):  %', clock_timestamp() - start_time;
+    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM aspiral_read_main_compact(main_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    INSERT INTO bench_results VALUES ('Compact', 'Random Read (10k)', dur::text, extract(epoch from dur));
 
-    start_time := clock_timestamp();
-    FOR i IN 1..10000 LOOP
-        PERFORM aspiral_read_main_block_point(main_oid, (i % 1000)::bigint, (i % 1000)::bigint);
-    END LOOP;
-    RAISE NOTICE 'Read Block Pt (Random): % (Includes XOR Loop overhead)', clock_timestamp() - start_time;
+    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM aspiral_read_main_block_point(main_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    INSERT INTO bench_results VALUES ('Block (XOR)', 'Random Read (10k)', dur::text, extract(epoch from dur));
 
-    RAISE NOTICE '';
-    RAISE NOTICE '========== 3. SEQUENTIAL RANGE READ (64 Points) ==========';
-    -- Fetching 64 points for a single sensor (one block).
-    
-    start_time := clock_timestamp();
-    FOR i IN 1..100 LOOP
-        FOR t_step IN 0..63 LOOP
-            PERFORM aspiral_read_main_compact(main_oid, (i * 64 + t_step)::bigint, 5::bigint);
-        END LOOP;
-    END LOOP;
-    RAISE NOTICE 'Compact Range (Naive Loop): % (6,400 seeks)', clock_timestamp() - start_time;
-
-    start_time := clock_timestamp();
-    FOR i IN 1..100 LOOP
-        FOR t_step IN 0..63 LOOP
-            PERFORM aspiral_read_main_block_point(main_oid, (i * 64 + t_step)::bigint, 5::bigint);
-        END LOOP;
-    END LOOP;
-    RAISE NOTICE 'Block Range (Naive Loop):   % (6,400 seeks + O(N^2) XOR overhead)', clock_timestamp() - start_time;
-
-    start_time := clock_timestamp();
-    FOR i IN 1..100 LOOP
-        PERFORM aspiral_read_main_block_range(main_oid, i::bigint, 5::bigint);
-    END LOOP;
-    RAISE NOTICE 'Block Range (Optimized):   % (100 seeks + O(N) sequential XOR)', clock_timestamp() - start_time;
-
+    -- 3. Range Read (6,400 points)
+    s_t := clock_timestamp(); FOR i IN 1..100 LOOP PERFORM aspiral_read_main_block_range(main_oid, i::bigint, 5::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    INSERT INTO bench_results VALUES ('Block (XOR)', 'Range Read (Optimized)', dur::text, extract(epoch from dur));
 END $$;
 
-RAISE NOTICE '';
-RAISE NOTICE '========== 4. STORAGE FOOTPRINT ==========';
-\! ls -lh /tmp/aspiral_main/987654*.bin
+-- 4. Storage Sizes
+INSERT INTO bench_results (format, metric, val_num, val_text)
+SELECT 'Standard', 'Storage Size', pg_size_bytes(size), size FROM (SELECT pg_ls_dir('/tmp/aspiral_main/') as name) s, LATERAL (SELECT (pg_stat_file('/tmp/aspiral_main/' || name)).size::text as size WHERE name = '987654.bin') f;
+
+INSERT INTO bench_results (format, metric, val_num, val_text)
+SELECT 'Compact', 'Storage Size', pg_size_bytes(size), size FROM (SELECT pg_ls_dir('/tmp/aspiral_main/') as name) s, LATERAL (SELECT (pg_stat_file('/tmp/aspiral_main/' || name)).size::text as size WHERE name = '987654_compact.bin') f;
+
+INSERT INTO bench_results (format, metric, val_num, val_text)
+SELECT 'Block (XOR)', 'Storage Size', pg_size_bytes(size), size FROM (SELECT pg_ls_dir('/tmp/aspiral_main/') as name) s, LATERAL (SELECT (pg_stat_file('/tmp/aspiral_main/' || name)).size::text as size WHERE name = '987654_blocks.bin') f;
+
+\echo ''
+\echo '--- ASPIRAL SIDE-BY-SIDE STORAGE COMPARISON ---'
+SELECT 
+    metric,
+    MAX(val_text) FILTER (WHERE format = 'Standard') as "Baseline (Standard)",
+    MAX(val_text) FILTER (WHERE format = 'Compact') as "Compact",
+    MAX(val_text) FILTER (WHERE format = 'Block (XOR)') as "Aspiral Block (XOR)",
+    ROUND((MAX(val_num) FILTER (WHERE format = 'Standard') / NULLIF(MAX(val_num) FILTER (WHERE format = 'Block (XOR)'), 0))::numeric, 1) || 'x' as "Improvement"
+FROM bench_results
+GROUP BY metric
+ORDER BY metric DESC;

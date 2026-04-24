@@ -25,8 +25,8 @@ unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     qc: *mut pg_sys::QueryCompletion,
 ) {
     if IN_UTILITY.with(|h| h.get()) {
-        if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
-            prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+        if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
+            prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
         } else {
             pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
         }
@@ -41,41 +41,48 @@ unsafe extern "C-unwind" fn aspiral_process_utility_hook(
             let stmt = utility_stmt as *mut pg_sys::CreateStmt;
             let rel = (*stmt).relation;
             let name = CStr::from_ptr((*rel).relname).to_string_lossy().into_owned();
-            
-            let mut frames_str = String::new();
-            let mut scope_columns = Vec::new();
-            
             let query_str = CStr::from_ptr(query_string).to_string_lossy();
-            if query_str.contains("aspiral_hierarchy") {
-                let re_frames = regex::Regex::new(r"aspiral_hierarchy\s*=\s*'([^']+)'").unwrap();
-                if let Some(m) = re_frames.captures(&query_str) {
-                    frames_str = m.get(1).unwrap().as_str().to_string();
-                }
-                let re_scope = regex::Regex::new(r"aspiral_scope\s*=\s*'([^']+)'").unwrap();
-                if let Some(m) = re_scope.captures(&query_str) {
-                    scope_columns = m.get(1).unwrap().as_str().split(',').map(|s| s.trim().to_string()).collect();
+            
+            // MAGIC COMMENT DETECTION
+            if query_str.contains("Aspiral:") || query_str.contains("aspiral_hierarchy") {
+                if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
+                    prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+                } else {
+                    pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
                 }
 
-                if !frames_str.is_empty() {
-                    if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
-                        prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
-                    } else {
-                        pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
-                    }
-                    
-                    let sources = extract_aggregate_mappings((*pstmt).utilityStmt as *mut pg_sys::Query, std::ptr::null_mut());
-                    catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
-                    for src in sources { 
-                        catalog::insert_source(&name, &name, 0, &src.base_column, &src.formula, &src.mat_column, pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); 
-                    }
-                    generate_hierarchy(&name, &frames_str, scope_columns);
-                }
+                // 2. Parse frames or use defaults
+                let re_frames = regex::Regex::new(r"aspiral_hierarchy\s*=\s*'([^']+)'").unwrap();
+                let frames_str = re_frames.captures(&query_str)
+                    .map(|m| m.get(1).unwrap().as_str().to_string())
+                    .unwrap_or_else(|| "1m, 1h, 1d".to_string());
+
+                // 3. Detect Scope (Tenant) columns via Foreign Keys
+                let scope_columns = Spi::connect(|client| {
+                    let q = format!("
+                        SELECT a.attname::text 
+                        FROM pg_constraint c 
+                        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+                        WHERE c.contype = 'f' AND c.conrelid = '\"{}\"'::regclass", name.replace("\"", "\"\""));
+                    Ok::<Vec<String>, spi::Error>(client.select(&q, None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap()).collect())
+                }).unwrap_or_default();
+
+                // 4. Register the BASE table metadata
+                catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
+                
+                // 5. Generate the entire hierarchy automatically
+                generate_hierarchy(&name, &frames_str, scope_columns);
+                
+                notice!("Aspiral: Automatically registered hierarchy ({}) for '{}'", frames_str, name);
+                
+                IN_UTILITY.with(|h| h.set(false));
+                return;
             }
         }
     }
     
-    if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
-        prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+    if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
+        prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
     } else {
         pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
     }
@@ -91,11 +98,8 @@ struct TimeRange {
 unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> (std::collections::HashMap<i32, TimeRange>, i64) {
     let mut constraints: std::collections::HashMap<i32, TimeRange> = std::collections::HashMap::new();
     let mut equalities: Vec<(i32, i32)> = Vec::new();
-    let mut tz_offset = 0i64;
 
-    // Detect session offset using pgrx GUC access to see the actual user session state.
-    let tz_name = Spi::get_one::<String>("SELECT current_setting('TimeZone')").unwrap_or(Some("UTC".to_string())).unwrap_or("UTC".to_string());
-    tz_offset = Spi::get_one::<f64>(&format!("SELECT EXTRACT(EPOCH FROM (now() AT TIME ZONE '{}')) - EXTRACT(EPOCH FROM (now() AT TIME ZONE 'UTC'))", tz_name))
+    let tz_offset = Spi::get_one::<f64>("SELECT EXTRACT(EPOCH FROM (now() AT TIME ZONE current_setting('TimeZone'))) - EXTRACT(EPOCH FROM (now() AT TIME ZONE 'UTC'))")
         .unwrap_or(Some(0.0)).unwrap_or(0.0) as i64;
     
     if jointree.is_null() { return (constraints, tz_offset); }
@@ -118,11 +122,18 @@ unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sy
                 stack.push((*join).larg);
                 stack.push((*join).rarg);
             }
+            pg_sys::NodeTag::T_BoolExpr => {
+                let bexpr = node as *mut pg_sys::BoolExpr;
+                let args = (*bexpr).args;
+                if !args.is_null() {
+                    for i in 0..(*args).length { stack.push(pg_sys::list_nth(args, i as i32) as *mut pg_sys::Node); }
+                }
+            }
             pg_sys::NodeTag::T_OpExpr => {
                 let op = node as *mut pg_sys::OpExpr;
-                let opname = pg_sys::get_opname((*op).opno);
-                if opname.is_null() { continue; }
-                let name = CStr::from_ptr(opname).to_string_lossy();
+                let opname_ptr = pg_sys::get_opname((*op).opno);
+                if opname_ptr.is_null() { continue; }
+                let opname = CStr::from_ptr(opname_ptr).to_string_lossy();
                 let args = (*op).args;
                 if args.is_null() || (*args).length != 2 { continue; }
                 
@@ -153,12 +164,12 @@ unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sy
                         };
                         if let Some(v) = val {
                             let range = constraints.entry((*var).varno).or_default();
-                            if name == ">=" { range.start = Some(v); }
-                            else if name == "<" { range.end = Some(v); }
+                            if opname == ">=" { range.start = Some(v); }
+                            else if opname == "<" { range.end = Some(v); }
                         }
                     }
                 }
-                else if (*left).type_ == pg_sys::NodeTag::T_Var && (*right).type_ == pg_sys::NodeTag::T_Var && name == "=" {
+                else if (*left).type_ == pg_sys::NodeTag::T_Var && (*right).type_ == pg_sys::NodeTag::T_Var && opname == "=" {
                     let v1 = left as *mut pg_sys::Var;
                     let v2 = right as *mut pg_sys::Var;
                     let rte1 = pg_sys::list_nth(rtable, ((*v1).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
@@ -166,15 +177,9 @@ unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sy
                     let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
                     let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
                     if !n1.is_null() && !n2.is_null() && CStr::from_ptr(n1).to_string_lossy() == "t" && CStr::from_ptr(n2).to_string_lossy() == "t" {
-                        notice!("Aspiral: Detected time equality between RTE #{} and RTE #{}", (*v1).varno, (*v2).varno);
                         equalities.push(((*v1).varno, (*v2).varno));
                     }
                 }
-            }
-            pg_sys::NodeTag::T_BoolExpr => {
-                let bexpr = node as *mut pg_sys::BoolExpr;
-                let args = (*bexpr).args;
-                for i in 0..(*args).length { stack.push(pg_sys::list_nth(args, i as i32) as *mut pg_sys::Node); }
             }
             _ => {}
         }
@@ -218,8 +223,6 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
                     if !relname.is_null() {
                         let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
                         let hierarchy = Spi::connect(|client| {
-                            let schema_exists = client.select("SELECT 1 FROM pg_namespace WHERE nspname = 'aspiral'", Some(1), &[])?.first().is_empty() == false;
-                            if !schema_exists { return Ok::<Vec<String>, spi::Error>(vec![]); }
                             let mut views = Vec::new();
                             let table = client.select("SELECT view_name FROM aspiral.metadata WHERE base_view = $1", None,
                                 unsafe { &[pgrx::datum::DatumWithOid::new(base_table.clone().into_datum().unwrap(), pg_sys::TEXTOID)] })?;
@@ -279,10 +282,13 @@ struct Segment { source: String, _t_start: i64, _t_end: i64 }
 
 fn resolve_segments(base_table: &str, ts: i64, te: i64, hierarchy: &[String], dirty: &[(i64, i64)], offset_seconds: i64) -> Vec<Segment> {
     let mut segments = Vec::new();
+    
     let mut sorted_hierarchy: Vec<(String, i32)> = hierarchy.iter()
         .filter_map(|h| catalog::get_metadata(h).map(|m| (h.clone(), m.frame_seconds)))
+        .filter(|h| h.1 > 0)
         .collect();
     sorted_hierarchy.sort_by_key(|h| -h.1);
+
     let mut pool = vec![(ts, te)];
     for (d_s, d_e) in dirty {
         let mut new_pool = Vec::new();
@@ -302,7 +308,7 @@ fn resolve_segments(base_table: &str, ts: i64, te: i64, hierarchy: &[String], di
             let mut found_tier = false;
             for (h_name, frame_secs) in &sorted_hierarchy {
                 let f_s = *frame_secs as i64;
-                if f_s == 0 { continue; }
+                if f_s <= 0 { continue; }
                 let bucket_start = ((curr + offset_seconds) / f_s) * f_s - offset_seconds;
                 let bucket_end = bucket_start + f_s;
                 if curr == bucket_start && bucket_end <= clean_e {
@@ -314,6 +320,11 @@ fn resolve_segments(base_table: &str, ts: i64, te: i64, hierarchy: &[String], di
             }
             if !found_tier {
                 let f_s = sorted_hierarchy.last().map(|h| h.1 as i64).unwrap_or(60);
+                if f_s <= 0 { 
+                    let seg_end = clean_e;
+                    segments.push(Segment { source: base_table.to_string(), _t_start: curr, _t_end: seg_end });
+                    break;
+                }
                 let next_boundary = ((curr + offset_seconds + f_s) / f_s) * f_s - offset_seconds;
                 let segment_end = clean_e.min(next_boundary);
                 segments.push(Segment { source: base_table.to_string(), _t_start: curr, _t_end: segment_end });
@@ -342,7 +353,8 @@ pub fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<
         let child_name = format!("{}_{}", base_prefix, frame.name);
         if child_name == current_parent { continue; }
         let (sql, sources) = rollup::derive_child_sql(&child_name, &current_parent, frame.seconds, &scope_columns);
-        match Spi::run(&sql) { 
+        let idempotent_sql = sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        match Spi::run(&idempotent_sql) { 
             Ok(_) => { 
                 catalog::insert_metadata(&child_name, &current_parent, frame.seconds, base_name, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); 
                 for src in sources {
@@ -353,41 +365,6 @@ pub fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<
             Err(e) => warning!("Aspiral failed to create child view {}: {:?}", child_name, e), 
         }
     }
-}
-
-unsafe fn extract_aggregate_mappings(query: *mut pg_sys::Query, rtable: *mut pg_sys::List) -> Vec<rollup::SourceDef> {
-    let mut sources = Vec::new();
-    let target_list = (*query).targetList;
-    if target_list.is_null() { return sources; }
-    for i in 0..(*target_list).length {
-        let tle = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
-        if tle.is_null() || (*tle).resname.is_null() { continue; }
-        let mat_column = CStr::from_ptr((*tle).resname).to_string_lossy().into_owned();
-        let expr = (*tle).expr as *mut pg_sys::Node;
-        if expr.is_null() { continue; }
-        if (*expr).type_ == pg_sys::NodeTag::T_Aggref {
-            let agg = expr as *mut pg_sys::Aggref;
-            let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
-            if !agg_fn.is_null() {
-                let formula = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
-                let args = (*agg).args;
-                if !args.is_null() && (*args).length > 0 {
-                    let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
-                    let arg_expr = (*arg).expr as *mut pg_sys::Node;
-                    if !arg_expr.is_null() && (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
-                        let var = arg_expr as *mut pg_sys::Var;
-                        let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
-                        let base_col_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                        if !base_col_ptr.is_null() {
-                            let base_column = CStr::from_ptr(base_col_ptr).to_string_lossy().into_owned();
-                            sources.push(rollup::SourceDef { base_column, formula, mat_column });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    sources
 }
 
 unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
@@ -499,7 +476,18 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     let is_root = metadata.as_ref().map(|m| m.parent_view == "BASE").unwrap_or(false);
     let real_base = metadata.as_ref().map(|m| m.base_view.clone()).unwrap_or_else(|| base_name.to_string());
     notice!("Aspiral: reactive_refresh for '{}', is_root={}, base_view={}", base_name, is_root, real_base);
-    if is_root { catalog::unify_changelog(&real_base); }
+    
+    if is_root { 
+        // Bootstrap: If changelog is empty for this base table, insert a full range to force initial materialization
+        let count: i64 = Spi::get_one_with_args("SELECT count(*) FROM aspiral.changelog WHERE base_view = $1", 
+            &[unsafe { pgrx::datum::DatumWithOid::new(real_base.clone().into_datum().unwrap(), pg_sys::TEXTOID) }]).unwrap().unwrap();
+        if count == 0 {
+            // Use a massive range to ensure all existing data is captured
+            let bootstrap_sql = format!("INSERT INTO aspiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"));
+            let _ = Spi::run(&bootstrap_sql);
+        }
+        catalog::unify_changelog(&real_base); 
+    }
     let success = crate::refresh_incremental(base_name, where_clause.clone());
     if success {
         notice!("Aspiral: refresh_incremental for '{}' succeeded", base_name);
@@ -510,6 +498,71 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
         return true;
     }
     false
+}
+
+#[pg_extern]
+pub fn aspiral_explain(query_sql: &str) -> String {
+    unsafe {
+        let query_string = std::ffi::CString::new(query_sql).unwrap();
+        let raw_parsetree_list = pg_sys::raw_parser(query_string.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
+        if raw_parsetree_list.is_null() || (*raw_parsetree_list).length == 0 {
+            return "Error: Could not parse query.".to_string();
+        }
+        let raw_parse_tree = pg_sys::list_nth(raw_parsetree_list, 0) as *mut pg_sys::RawStmt;
+        let query_list = pg_sys::pg_analyze_and_rewrite_fixedparams(raw_parse_tree, query_string.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut());
+        if query_list.is_null() || (*query_list).length == 0 {
+            return "Error: Could not analyze query.".to_string();
+        }
+        let query = pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query;
+        let rtable = (*query).rtable;
+        
+        let mut report = String::new();
+        let (constraint_map, tz_offset) = build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
+
+        for i in 0..(*rtable).length {
+            let varno = (i + 1) as i32;
+            let rte = pg_sys::list_nth(rtable, i as i32) as *mut pg_sys::RangeTblEntry;
+            if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION { continue; }
+            
+            let relname = pg_sys::get_rel_name((*rte).relid);
+            if relname.is_null() { continue; }
+            let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
+            
+            let hierarchy = Spi::connect(|client| {
+                let mut views = Vec::new();
+                let table = client.select("SELECT view_name FROM aspiral.metadata WHERE base_view = $1", None,
+                    &[pgrx::datum::DatumWithOid::new(base_table.clone().into_datum().unwrap(), pg_sys::TEXTOID)])?;
+                for row in table { views.push(row.get::<String>(1)?.unwrap()); }
+                Ok::<Vec<String>, spi::Error>(views)
+            }).unwrap_or_default();
+
+            if hierarchy.is_empty() {
+                report.push_str(&format!("Table '{}': No Aspiral hierarchy found.\n", base_table));
+                continue;
+            }
+
+            if let Some(range) = constraint_map.get(&varno) {
+                if let (Some(ts), Some(te)) = (range.start, range.end) {
+                    let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te);
+                    let segments = resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset);
+                    
+                    report.push_str(&format!("--- Aspiral Slicing Plan for '{}' ---\n", base_table));
+                    report.push_str(&format!("Range: {} to {} (Offset: {}s)\n", format_epoch(ts), format_epoch(te), tz_offset));
+                    for (seg_idx, seg) in segments.iter().enumerate() {
+                        let tier = if seg.source == base_table { "RAW" } else { "ROLLUP" };
+                        report.push_str(&format!("  Segment #{}: {} -> {} | Source: {} ({})\n", 
+                            seg_idx + 1, format_epoch(seg._t_start), format_epoch(seg._t_end), seg.source, tier));
+                    }
+                } else {
+                    report.push_str(&format!("Table '{}': Time column 't' detected but range is not static/bounded.\n", base_table));
+                }
+            } else {
+                report.push_str(&format!("Table '{}': No time constraints detected on 't'.\n", base_table));
+            }
+        report.push_str("\n");
+        }
+        report
+    }
 }
 
 pub unsafe fn init_hooks() {

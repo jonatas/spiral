@@ -179,11 +179,11 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
         let scope_cols_str = scope_columns.iter().map(|s| format!("\"{}\"", s.trim())).collect::<Vec<_>>().join(", ");
 
         let index_sql = if scope_columns.is_empty() {
-            format!("CREATE UNIQUE INDEX idx_u_{child_name} ON {child_name}(t)")
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t)")
         } else {
             // Use Z-Order for clustered multi-tenant access
             format!(
-                "CREATE INDEX idx_z_{child_name} ON {child_name} (
+                "CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (
                     aspiral_zorder(aspiral(t), ARRAY[{scope_cols_str}]::text[])
                 )"
             )
