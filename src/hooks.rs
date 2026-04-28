@@ -14,7 +14,7 @@ thread_local! {
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn aspiral_process_utility_hook(
+unsafe extern "C-unwind" fn spiral_process_utility_hook(
     pstmt: *mut pg_sys::PlannedStmt,
     query_string: *const c_char,
     read_only_tree: bool,
@@ -37,22 +37,44 @@ unsafe extern "C-unwind" fn aspiral_process_utility_hook(
     let utility_stmt = (*pstmt).utilityStmt;
     if !utility_stmt.is_null() {
         let tag = (*utility_stmt).type_;
-        if tag == pg_sys::NodeTag::T_CreateStmt {
-            let stmt = utility_stmt as *mut pg_sys::CreateStmt;
-            let rel = (*stmt).relation;
-            let name = CStr::from_ptr((*rel).relname).to_string_lossy().into_owned();
-            let query_str = CStr::from_ptr(query_string).to_string_lossy();
-            
-            // MAGIC COMMENT DETECTION
-            if query_str.contains("Aspiral:") || query_str.contains("aspiral_hierarchy") {
+        if tag == pg_sys::NodeTag::T_CreateStmt || tag == pg_sys::NodeTag::T_ViewStmt || tag == pg_sys::NodeTag::T_CreateTableAsStmt {
+            let (rel, name) = match tag {
+                pg_sys::NodeTag::T_CreateStmt => {
+                    let stmt = utility_stmt as *mut pg_sys::CreateStmt;
+                    ((*stmt).relation, CStr::from_ptr((*(*stmt).relation).relname).to_string_lossy().into_owned())
+                },
+                pg_sys::NodeTag::T_CreateTableAsStmt => {
+                    let stmt = utility_stmt as *mut pg_sys::CreateTableAsStmt;
+                    let into = (*stmt).into;
+                    ((*into).rel, CStr::from_ptr((*(*into).rel).relname).to_string_lossy().into_owned())
+                },
+                _ => (std::ptr::null_mut(), String::new()),
+            };
+
+            if rel.is_null() {
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
                 } else {
                     pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
                 }
+                IN_UTILITY.with(|h| h.set(false));
+                return;
+            }
+
+            let query_str = CStr::from_ptr(query_string).to_string_lossy();
+            notice!("Spiral: Utility hook caught CREATE relation '{}', query_str length={}", name, query_str.len());
+            
+            if query_str.contains("Spiral:") || query_str.contains("spiral_hierarchy") {
+                notice!("Spiral: Magic comments found, calling standard_ProcessUtility...");
+                if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
+                    prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+                } else {
+                    pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+                }
+                notice!("Spiral: standard_ProcessUtility returned, processing hierarchy...");
 
                 // 2. Parse frames or use defaults
-                let re_frames = regex::Regex::new(r"aspiral_hierarchy\s*=\s*'([^']+)'").unwrap();
+                let re_frames = regex::Regex::new(r"spiral_hierarchy\s*=\s*'([^']+)'").unwrap();
                 let frames_str = re_frames.captures(&query_str)
                     .map(|m| m.get(1).unwrap().as_str().to_string())
                     .unwrap_or_else(|| "1m, 1h, 1d".to_string());
@@ -67,16 +89,25 @@ unsafe extern "C-unwind" fn aspiral_process_utility_hook(
                     Ok::<Vec<String>, spi::Error>(client.select(&q, None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap()).collect())
                 }).unwrap_or_default();
 
+                let re_col = regex::Regex::new(r"(\w+)\s+[\w\(\) ]+,?\s*--\s*Spiral:\s*([^\n\r]+)").unwrap();
+                let mut captured_cols = Vec::new();
+                for cap in re_col.captures_iter(&query_str) {
+                    captured_cols.push((cap[1].to_string(), cap[2].to_string()));
+                }
+                
                 // 4. Register the BASE table metadata
                 catalog::insert_metadata(&name, "BASE", 0, &name, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
                 
                 // 5. Generate the entire hierarchy automatically
-                generate_hierarchy(&name, &frames_str, scope_columns);
+                notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
+                generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols);
                 
-                notice!("Aspiral: Automatically registered hierarchy ({}) for '{}'", frames_str, name);
+                notice!("Spiral: Successfully registered hierarchy for '{}'", name);
                 
                 IN_UTILITY.with(|h| h.set(false));
                 return;
+            } else {
+                notice!("Spiral: No magic comments in '{}', following standard path.", name);
             }
         }
     }
@@ -90,13 +121,14 @@ unsafe extern "C-unwind" fn aspiral_process_utility_hook(
 }
 
 #[derive(Default, Clone, Debug)]
-struct TimeRange {
+struct QueryConstraints {
     start: Option<i64>,
     end: Option<i64>,
+    scopes: std::collections::HashMap<String, String>,
 }
 
-unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> (std::collections::HashMap<i32, TimeRange>, i64) {
-    let mut constraints: std::collections::HashMap<i32, TimeRange> = std::collections::HashMap::new();
+unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> (std::collections::HashMap<i32, QueryConstraints>, i64) {
+    let mut constraints: std::collections::HashMap<i32, QueryConstraints> = std::collections::HashMap::new();
     let mut equalities: Vec<(i32, i32)> = Vec::new();
 
     let tz_offset = Spi::get_one::<f64>("SELECT EXTRACT(EPOCH FROM (now() AT TIME ZONE current_setting('TimeZone'))) - EXTRACT(EPOCH FROM (now() AT TIME ZONE 'UTC'))")
@@ -152,20 +184,36 @@ unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sy
                     let var = var_node as *mut pg_sys::Var;
                     let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32) as *mut pg_sys::RangeTblEntry;
                     let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                    if !varname_ptr.is_null() && CStr::from_ptr(varname_ptr).to_string_lossy() == "t" {
+                    if !varname_ptr.is_null() {
+                        let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
                         let con = right as *mut pg_sys::Const;
-                        let val = match (*con).consttype {
-                            pg_sys::INT8OID => Some(i64::from_datum((*con).constvalue, (*con).constisnull).unwrap()),
-                            pg_sys::TIMESTAMPTZOID => {
-                                let ts = i64::from_datum((*con).constvalue, (*con).constisnull).unwrap();
-                                Some(ts / 1000000 + 946684800)
-                            },
-                            _ => None,
-                        };
-                        if let Some(v) = val {
-                            let range = constraints.entry((*var).varno).or_default();
-                            if opname == ">=" { range.start = Some(v); }
-                            else if opname == "<" { range.end = Some(v); }
+                        
+                        if varname == "t" {
+                            let val = match (*con).consttype {
+                                pg_sys::INT8OID => Some(i64::from_datum((*con).constvalue, (*con).constisnull).unwrap()),
+                                pg_sys::TIMESTAMPTZOID => {
+                                    let ts = i64::from_datum((*con).constvalue, (*con).constisnull).unwrap();
+                                    Some(ts / 1000000 + 946684800)
+                                },
+                                _ => None,
+                            };
+                            if let Some(v) = val {
+                                let qc = constraints.entry((*var).varno).or_default();
+                                if opname == ">=" { qc.start = Some(v); }
+                                else if opname == "<" { qc.end = Some(v); }
+                            }
+                        } else if opname == "=" {
+                            // Possible scope column
+                            let val = match (*con).consttype {
+                                pg_sys::TEXTOID => Some(String::from_datum((*con).constvalue, (*con).constisnull).unwrap()),
+                                pg_sys::INT4OID => Some(i32::from_datum((*con).constvalue, (*con).constisnull).unwrap().to_string()),
+                                pg_sys::INT8OID => Some(i64::from_datum((*con).constvalue, (*con).constisnull).unwrap().to_string()),
+                                _ => None,
+                            };
+                            if let Some(v) = val {
+                                let qc = constraints.entry((*var).varno).or_default();
+                                qc.scopes.insert(varname.into_owned(), v);
+                            }
                         }
                     }
                 }
@@ -192,8 +240,18 @@ unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sy
             let r2 = constraints.get(v2).cloned().unwrap_or_default();
             let new_start = r1.start.or(r2.start);
             let new_end = r1.end.or(r2.end);
-            if new_start != r1.start || new_end != r1.end { constraints.insert(*v1, TimeRange { start: new_start, end: new_end }); changed = true; }
-            if new_start != r2.start || new_end != r2.end { constraints.insert(*v2, TimeRange { start: new_start, end: new_end }); changed = true; }
+            if new_start != r1.start || new_end != r1.end { 
+                let qc = constraints.entry(*v1).or_default();
+                qc.start = new_start;
+                qc.end = new_end;
+                changed = true; 
+            }
+            if new_start != r2.start || new_end != r2.end { 
+                let qc = constraints.entry(*v2).or_default();
+                qc.start = new_start;
+                qc.end = new_end;
+                changed = true; 
+            }
         }
         if !changed { break; }
     }
@@ -201,7 +259,7 @@ unsafe fn build_time_constraints(jointree: *mut pg_sys::Node, rtable: *mut pg_sy
 }
 
 #[pg_guard]
-pub unsafe extern "C-unwind" fn aspiral_planner_hook(
+pub unsafe extern "C-unwind" fn spiral_planner_hook(
     parse: *mut pg_sys::Query, query_string: *const c_char, cursor_options: c_int, bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
     if IN_HOOK.with(|h| h.get()) || crate::SKIP_ACCELERATION.with(|s| s.get()) {
@@ -224,20 +282,36 @@ pub unsafe extern "C-unwind" fn aspiral_planner_hook(
                         let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
                         let hierarchy = Spi::connect(|client| {
                             let mut views = Vec::new();
-                            let table = client.select("SELECT view_name FROM aspiral.metadata WHERE base_view = $1", None,
+                            // Safety check: Ensure the metadata table exists before querying
+                            let table_exists = client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.len() > 0;
+                            if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
+
+                            let table = client.select("SELECT view_name FROM spiral.metadata WHERE base_view = $1", None,
                                 unsafe { &[pgrx::datum::DatumWithOid::new(base_table.clone().into_datum().unwrap(), pg_sys::TEXTOID)] })?;
                             for row in table { views.push(row.get::<String>(1)?.unwrap()); }
                             Ok::<Vec<String>, spi::Error>(views)
                         }).unwrap_or_default();
                         
                         if !hierarchy.is_empty() {
-                             if let Some(range) = constraint_map.get(&varno) {
-                                 if let (Some(ts), Some(te)) = (range.start, range.end) {
-                                     let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te);
+                             if let Some(qc) = constraint_map.get(&varno) {
+                                 if let (Some(ts), Some(te)) = (qc.start, qc.end) {
+                                     // Build scope_values JsonB from qc.scopes if they match view's scope_columns
+                                     let metadata_obj = catalog::get_metadata(&base_table);
+                                     let scope_values = metadata_obj.as_ref().and_then(|m| {
+                                         let mut map = serde_json::Map::new();
+                                         for col in &m.scope_columns {
+                                             if let Some(val) = qc.scopes.get(col) {
+                                                 map.insert(col.clone(), serde_json::Value::String(val.clone()));
+                                             }
+                                         }
+                                         if map.is_empty() { None } else { Some(pgrx::JsonB(serde_json::Value::Object(map))) }
+                                     });
+
+                                     let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
                                      let segments = resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset);
                                      
                                      if !segments.is_empty() && (segments.len() > 1 || segments[0].source != base_table) {
-                                         notice!("Aspiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
+                                         notice!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
                                          
                                          let query_cols = extract_query_columns_simple(query, rtable);
                                          let mut cols = Vec::new();
@@ -343,16 +417,100 @@ fn resolve_segments(base_table: &str, ts: i64, te: i64, hierarchy: &[String], di
     final_segments
 }
 
-pub fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<String>) {
+pub fn generate_hierarchy_internal(base_name: &str, frames_str: &str, scope_columns: Vec<String>, custom_cols: Vec<(String, String)>) {
+    notice!("Spiral: Entering generate_hierarchy_internal for '{}', frames='{}'", base_name, frames_str);
     let mut frames = rollup::parse_frames(frames_str);
     frames.sort_by_key(|f| f.seconds);
     let re = regex::Regex::new(r"_\d+[smhdwmon]$").unwrap();
     let base_prefix = if let Some(m) = re.find(base_name) { &base_name[..m.start()] } else { base_name };
     let mut current_parent = base_name.to_string();
-    for frame in frames {
+    
+    for (i, frame) in frames.iter().enumerate() {
         let child_name = format!("{}_{}", base_prefix, frame.name);
         if child_name == current_parent { continue; }
-        let (sql, sources) = rollup::derive_child_sql(&child_name, &current_parent, frame.seconds, &scope_columns);
+        
+        let mut sources = Vec::new();
+        let mut select_parts = vec![format!("to_timestamp(((spiral(t) / {0}) * {0})::double precision) as t", frame.seconds)];
+        let mut group_parts = vec![format!("(spiral(t) / {0}) * {0}", frame.seconds)];
+        let mut seen_cols = std::collections::HashSet::new();
+        seen_cols.insert("t".to_string());
+
+        for s in &scope_columns {
+            if seen_cols.insert(s.clone()) {
+                select_parts.push(format!("\"{}\"", s));
+                group_parts.push(format!("\"{}\"", s));
+            }
+        }
+
+        if i == 0 {
+            // First level: Use custom magic comments
+            for (col, formula) in &custom_cols {
+                let formula_lower = formula.to_lowercase();
+                if formula_lower.contains("stats") {
+                     let mat = format!("{}_stats", col);
+                     if seen_cols.insert(mat.clone()) {
+                        select_parts.push(format!("spiral_stats(\"{}\") as \"{}\"", col, mat));
+                        sources.push(rollup::SourceDef { base_column: col.clone(), formula: "stats".to_string(), mat_column: mat });
+                     }
+                }
+                if formula_lower.contains("ohlc") {
+                     let mat = format!("{}_ohlcv", col);
+                     if seen_cols.insert(mat.clone()) {
+                        select_parts.push(format!("first(\"{}\", spiral(t)) as \"{}_o\", max(\"{}\") as \"{}_h\", min(\"{}\") as \"{}_l\", last(\"{}\", spiral(t)) as \"{}_c\", sum(\"{}\") as \"{}_v\"", col, mat, col, mat, col, mat, col, mat, col, mat));
+                        sources.push(rollup::SourceDef { base_column: col.clone(), formula: "ohlcv".to_string(), mat_column: mat });
+                     }
+                }
+                if formula_lower.contains("sketch") || formula_lower.contains("quantile") {
+                     let mat = format!("{}_sketch", col);
+                     if seen_cols.insert(mat.clone()) {
+                        select_parts.push(format!("spiral_sketch(\"{}\") as \"{}\"", col, mat));
+                        sources.push(rollup::SourceDef { base_column: col.clone(), formula: "sketch".to_string(), mat_column: mat });
+                     }
+                }
+            }
+            // Add other columns as sum by default
+            Spi::connect(|client| {
+                let q = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", base_name.replace("\"", "\"\""));
+                let cols = client.select(&q, None, &[]).unwrap();
+                for row in cols {
+                    let col = row.get::<String>(1).unwrap().unwrap();
+                    if !seen_cols.contains(&col) && col != "t" {
+                        if seen_cols.insert(col.clone()) {
+                            select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
+                            sources.push(rollup::SourceDef { base_column: col.clone(), formula: "sum".to_string(), mat_column: col });
+                        }
+                    }
+                }
+            });
+        } else {
+            // Higher levels: derive from parent
+            let (_, parent_sources) = rollup::derive_child_sql(&child_name, &current_parent, frame.seconds, &scope_columns);
+            for src in parent_sources {
+                if !seen_cols.insert(src.mat_column.clone()) { continue; }
+                if src.formula == "stats" {
+                    select_parts.push(format!("spiral_stats_merge(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
+                } else if src.formula == "sketch" {
+                    select_parts.push(format!("spiral_sketch_merge(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
+                } else if src.formula == "ohlcv" {
+                    let c = &src.mat_column;
+                    select_parts.push(format!("first(\"{}_o\", spiral(t)) as \"{}_o\", max(\"{}_h\") as \"{}_h\", min(\"{}_l\") as \"{}_l\", last(\"{}_c\", spiral(t)) as \"{}_c\", sum(\"{}_v\") as \"{}_v\"", c, c, c, c, c, c, c, c, c, c));
+                } else {
+                    select_parts.push(format!("sum(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
+                }
+                sources.push(src);
+            }
+        }
+
+        let scope_cols_str = scope_columns.iter().map(|s| format!("\"{}\"", s.trim())).collect::<Vec<_>>().join(", ");
+        let index_sql = if scope_columns.is_empty() {
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t)")
+        } else {
+            format!("CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[]))")
+        };
+
+        let sql = format!("CREATE TABLE {child_name} AS SELECT {select_cols} FROM {parent_name} WHERE 1=0 GROUP BY {group_by}; {index_sql};",
+            child_name = child_name, select_cols = select_parts.join(", "), parent_name = current_parent, group_by = group_parts.join(", "), index_sql = index_sql);
+
         let idempotent_sql = sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         match Spi::run(&idempotent_sql) { 
             Ok(_) => { 
@@ -362,7 +520,7 @@ pub fn generate_hierarchy(base_name: &str, frames_str: &str, scope_columns: Vec<
                 }
                 current_parent = child_name; 
             }, 
-            Err(e) => warning!("Aspiral failed to create child view {}: {:?}", child_name, e), 
+            Err(e) => warning!("Spiral failed to create child view {}: {:?}", child_name, e), 
         }
     }
 }
@@ -442,7 +600,7 @@ fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols
                 let is_rollup = seg.source != base_table; 
                 let mapped = if is_rollup {
                     Spi::connect(|client| {
-                        client.select("SELECT mat_column FROM aspiral.sources WHERE view_name = $1 AND base_column = $2 AND formula = $3 LIMIT 1", None,
+                        client.select("SELECT mat_column FROM spiral.sources WHERE view_name = $1 AND base_column = $2 AND formula = $3 LIMIT 1", None,
                             unsafe { &[
                                 pgrx::datum::DatumWithOid::new(seg.source.clone().into_datum().unwrap(), pg_sys::TEXTOID),
                                 pgrx::datum::DatumWithOid::new(col.clone().into_datum().unwrap(), pg_sys::TEXTOID),
@@ -454,7 +612,7 @@ fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols
                 inner_select.push(format!("{} as \"{}\"", map_agg_inner(agg_fn, &mapped, is_rollup), col)); 
             } else { if col != "t" { inner_select.push(format!("\"{}\"", col)); } } 
         }
-        let where_clause = format!("aspiral(t) >= {} AND aspiral(t) < {}", seg._t_start, seg._t_end);
+        let where_clause = format!("spiral(t) >= {} AND spiral(t) < {}", seg._t_start, seg._t_end);
         let group_by_str = if seg.source == base_table {
             let group_by = cols.iter().filter(|(c, agg)| agg.is_none() && c != "t").map(|(col, _)| format!("\"{}\"", col)).collect::<Vec<_>>();
             if group_by.is_empty() { "".to_string() } else { format!(" GROUP BY {}", group_by.join(", ")) }
@@ -472,36 +630,42 @@ fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols
 }
 
 pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
+    notice!("Spiral: reactive_refresh entered for '{}', where_clause={:?}", base_name, where_clause);
     let metadata = catalog::get_metadata(base_name);
     let is_root = metadata.as_ref().map(|m| m.parent_view == "BASE").unwrap_or(false);
     let real_base = metadata.as_ref().map(|m| m.base_view.clone()).unwrap_or_else(|| base_name.to_string());
-    notice!("Aspiral: reactive_refresh for '{}', is_root={}, base_view={}", base_name, is_root, real_base);
     
     if is_root { 
         // Bootstrap: If changelog is empty for this base table, insert a full range to force initial materialization
-        let count: i64 = Spi::get_one_with_args("SELECT count(*) FROM aspiral.changelog WHERE base_view = $1", 
+        let count: i64 = Spi::get_one_with_args("SELECT count(*) FROM spiral.changelog WHERE base_view = $1", 
             &[unsafe { pgrx::datum::DatumWithOid::new(real_base.clone().into_datum().unwrap(), pg_sys::TEXTOID) }]).unwrap().unwrap();
         if count == 0 {
-            // Use a massive range to ensure all existing data is captured
-            let bootstrap_sql = format!("INSERT INTO aspiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"));
+            let bootstrap_sql = format!("INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"));
             let _ = Spi::run(&bootstrap_sql);
         }
         catalog::unify_changelog(&real_base); 
+
+        // Capture IDs to be refreshed
+        let _ = Spi::run(&format!("CREATE TEMP TABLE refreshing_changelog AS SELECT ctid as old_ctid FROM spiral.changelog WHERE base_view = '{}'", real_base.replace("'", "''")));
     }
-    let success = crate::refresh_incremental(base_name, where_clause.clone());
-    if success {
-        notice!("Aspiral: refresh_incremental for '{}' succeeded", base_name);
-        if where_clause.is_none() && is_root { 
-            let del_sql = format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", real_base.replace("'", "''"));
-            let _ = Spi::run(&del_sql); 
+
+    let success = crate::refresh_incremental(base_name, where_clause.clone(), 0);
+    
+    if success && is_root {
+        if where_clause.is_none() { 
+            let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
         }
-        return true;
     }
-    false
+    
+    if is_root {
+        let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
+    }
+    
+    success
 }
 
 #[pg_extern]
-pub fn aspiral_explain(query_sql: &str) -> String {
+pub fn spiral_explain(query_sql: &str) -> String {
     unsafe {
         let query_string = std::ffi::CString::new(query_sql).unwrap();
         let raw_parsetree_list = pg_sys::raw_parser(query_string.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
@@ -530,23 +694,27 @@ pub fn aspiral_explain(query_sql: &str) -> String {
             
             let hierarchy = Spi::connect(|client| {
                 let mut views = Vec::new();
-                let table = client.select("SELECT view_name FROM aspiral.metadata WHERE base_view = $1", None,
+                let table_exists = client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.len() > 0;
+                if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
+
+                let table = client.select("SELECT view_name FROM spiral.metadata WHERE base_view = $1", None,
                     &[pgrx::datum::DatumWithOid::new(base_table.clone().into_datum().unwrap(), pg_sys::TEXTOID)])?;
                 for row in table { views.push(row.get::<String>(1)?.unwrap()); }
                 Ok::<Vec<String>, spi::Error>(views)
             }).unwrap_or_default();
 
             if hierarchy.is_empty() {
-                report.push_str(&format!("Table '{}': No Aspiral hierarchy found.\n", base_table));
+                report.push_str(&format!("Table '{}': No Spiral hierarchy found.\n", base_table));
                 continue;
             }
 
             if let Some(range) = constraint_map.get(&varno) {
                 if let (Some(ts), Some(te)) = (range.start, range.end) {
-                    let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te);
+                    let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, None);
+
                     let segments = resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset);
                     
-                    report.push_str(&format!("--- Aspiral Slicing Plan for '{}' ---\n", base_table));
+                    report.push_str(&format!("--- Spiral Slicing Plan for '{}' ---\n", base_table));
                     report.push_str(&format!("Range: {} to {} (Offset: {}s)\n", format_epoch(ts), format_epoch(te), tz_offset));
                     for (seg_idx, seg) in segments.iter().enumerate() {
                         let tier = if seg.source == base_table { "RAW" } else { "ROLLUP" };
@@ -567,7 +735,7 @@ pub fn aspiral_explain(query_sql: &str) -> String {
 
 pub unsafe fn init_hooks() {
     PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
-    pg_sys::ProcessUtility_hook = Some(aspiral_process_utility_hook);
+    pg_sys::ProcessUtility_hook = Some(spiral_process_utility_hook);
     PREV_PLANNER_HOOK = pg_sys::planner_hook;
-    pg_sys::planner_hook = Some(aspiral_planner_hook);
+    pg_sys::planner_hook = Some(spiral_planner_hook);
 }

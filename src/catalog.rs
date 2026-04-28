@@ -13,7 +13,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     Spi::connect(|client| {
         let row = unsafe {
             client.select(
-                "SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM aspiral.metadata WHERE view_name = $1",
+                "SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata WHERE view_name = $1",
                 None,
                 &[DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value())]
             ).unwrap().first()
@@ -29,7 +29,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
             columns_metadata: row.get::<pgrx::JsonB>(5).unwrap().unwrap(),
         }))
     }).unwrap_or_else(|e| {
-        notice!("Aspiral: get_metadata error for '{}': {:?}", view_name, e);
+        notice!("Spiral: get_metadata error for '{}': {:?}", view_name, e);
         None
     })
 }
@@ -39,7 +39,7 @@ pub fn get_children(view_name: &str) -> Vec<String> {
         let mut children = Vec::new();
         let tuple_table = unsafe {
             client.select(
-                "SELECT view_name FROM aspiral.metadata WHERE parent_view = $1 ORDER BY frame_seconds ASC",
+                "SELECT view_name FROM spiral.metadata WHERE parent_view = $1 ORDER BY frame_seconds ASC",
                 None,
                 &[DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value())]
             ).unwrap()
@@ -50,16 +50,16 @@ pub fn get_children(view_name: &str) -> Vec<String> {
         }
         Ok::<Vec<String>, spi::Error>(children)
     }).unwrap_or_else(|e| {
-        notice!("Aspiral: get_children error for '{}': {:?}", view_name, e);
+        notice!("Spiral: get_children error for '{}': {:?}", view_name, e);
         vec![]
     })
 }
 
-pub fn is_aspiral_relation(name: &str) -> bool {
+pub fn is_spiral_relation(name: &str) -> bool {
     Spi::connect(|client| {
         let row = unsafe {
             client.select(
-                "SELECT 1 FROM aspiral.metadata WHERE view_name = $1",
+                "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
                 None,
                 &[DatumWithOid::new(name.into_datum(), PgBuiltInOids::TEXTOID.value())]
             ).unwrap().first()
@@ -71,7 +71,7 @@ pub fn is_aspiral_relation(name: &str) -> bool {
 pub fn insert_metadata(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>, columns_metadata: pgrx::JsonB) {
     unsafe {
         Spi::run_with_args(
-            "INSERT INTO aspiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata) 
+            "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata) 
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
             &[
@@ -89,7 +89,7 @@ pub fn insert_metadata(view_name: &str, parent_view: &str, frame_seconds: i32, b
 pub fn insert_source(view_name: &str, base_view: &str, frame_seconds: i32, base_column: &str, formula: &str, mat_column: &str, metadata: pgrx::JsonB) {
     unsafe {
         Spi::run_with_args(
-            "INSERT INTO aspiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, metadata) 
+            "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, metadata) 
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (view_name, base_column, formula) DO UPDATE SET base_view = EXCLUDED.base_view, frame_seconds = EXCLUDED.frame_seconds, mat_column = EXCLUDED.mat_column, metadata = EXCLUDED.metadata",
             &[
@@ -115,33 +115,46 @@ pub fn unify_changelog(base_view: &str) {
                 FROM (
                     SELECT *,
                         MAX(t_end) OVER (PARTITION BY base_view, scope_values ORDER BY t_start ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
-                    FROM aspiral.changelog
+                    FROM spiral.changelog
                     WHERE base_view = '{}'
                 ) s1
              ) s2
              GROUP BY base_view, scope_values, grp", base_view.replace("'", "''")));
 
-         let _ = Spi::run(&format!("DELETE FROM aspiral.changelog WHERE base_view = '{}'", base_view.replace("'", "''")));
-         let _ = Spi::run(&format!("INSERT INTO aspiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified"));
+         let _ = Spi::run(&format!("DELETE FROM spiral.changelog WHERE base_view = '{}'", base_view.replace("'", "''")));
+         let _ = Spi::run(&format!("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified"));
          let _ = Spi::run("DROP TABLE temp_unified");
          Ok::<(), spi::Error>(())
     });
 }
 
-pub fn get_dirty_ranges(base_view: &str, ts: i64, te: i64) -> Vec<(i64, i64)> {
+pub fn get_dirty_ranges(base_view: &str, ts: i64, te: i64, scope_values: Option<pgrx::JsonB>) -> Vec<(i64, i64)> {
     Spi::connect(|client| {
         let mut ranges = Vec::new();
-        let tuple_table = unsafe {
-            client.select(
-                "SELECT t_start, t_end FROM aspiral.changelog WHERE base_view = $1 AND NOT (t_end < $2 OR t_start > $3) ORDER BY t_start",
-                None,
-                &[
-                    DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(ts.into_datum().unwrap(), PgBuiltInOids::INT8OID.value()),
-                    DatumWithOid::new(te.into_datum().unwrap(), PgBuiltInOids::INT8OID.value()),
-                ]
-            ).unwrap()
+        let sql = if scope_values.is_some() {
+            format!("SELECT t_start, t_end FROM spiral.changelog 
+                     WHERE base_view = $1 
+                       AND NOT (t_end < $2 OR t_start > $3)
+                       AND (scope_values = '{{}}'::jsonb OR scope_values = $4)
+                     ORDER BY t_start")
+        } else {
+            format!("SELECT t_start, t_end FROM spiral.changelog 
+                     WHERE base_view = $1 
+                       AND NOT (t_end < $2 OR t_start > $3)
+                     ORDER BY t_start")
         };
+
+        let mut args = Vec::new();
+        unsafe {
+            args.push(DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()));
+            args.push(DatumWithOid::new(ts.into_datum().unwrap(), PgBuiltInOids::INT8OID.value()));
+            args.push(DatumWithOid::new(te.into_datum().unwrap(), PgBuiltInOids::INT8OID.value()));
+            if let Some(sv) = scope_values {
+                args.push(DatumWithOid::new(sv.into_datum(), PgBuiltInOids::JSONBOID.value()));
+            }
+        }
+
+        let tuple_table = client.select(&sql, None, &args).unwrap();
         for row in tuple_table {
             let s = row.get::<i64>(1).unwrap().unwrap();
             let e = row.get::<i64>(2).unwrap().unwrap();
