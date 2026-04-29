@@ -1,12 +1,12 @@
-SET aspiral.kickoff_date = '2026-04-15';
+SET spiral.kickoff_date = '2026-04-15';
 
 CREATE TABLE metrics (
     t timestamptz NOT NULL,
     device_id text NOT NULL,
-    val double precision -- Aspiral: ohlc, sum
+    val double precision -- Spiral: ohlc, sum
 ) WITH (
-    aspiral.frames = '1m',
-    aspiral.tenant = 'device_id'
+    spiral.frames = '1m',
+    spiral.tenant = 'device_id'
 );
 
 -- Ingest initial data
@@ -15,7 +15,7 @@ INSERT INTO metrics (t, device_id, val) VALUES
 ('2026-04-15 10:00:55Z', 'A', 20.0);
 
 -- Refresh
-SELECT aspiral_refresh('metrics_ohlcv_1m');
+SELECT spiral_refresh('metrics_ohlcv_1m');
 
 -- Check initial state
 SELECT t, device_id, val_o, val_h, val_l, val_c, val_sum 
@@ -26,10 +26,10 @@ UPDATE metrics SET val = 15.0 WHERE t = '2026-04-15 10:00:05Z' AND device_id = '
 
 -- Check changelog
 SELECT base_view, to_timestamptz(t_start), to_timestamptz(t_end), scope_values 
-FROM aspiral.changelog;
+FROM spiral.changelog;
 
 -- Refresh again
-SELECT aspiral_refresh('metrics_ohlcv_1m');
+SELECT spiral_refresh('metrics_ohlcv_1m');
 
 -- Check updated state
 SELECT t, device_id, val_o, val_h, val_l, val_c, val_sum 
@@ -40,12 +40,12 @@ DELETE FROM metrics WHERE t = '2026-04-15 10:00:55Z' AND device_id = 'A';
 
 -- Check changelog
 SELECT base_view, to_timestamptz(t_start), to_timestamptz(t_end), scope_values 
-FROM aspiral.changelog;
+FROM spiral.changelog;
 
 -- Refresh again (incremental MERGE should handle deletion by re-aggregating from parent)
 -- Note: MERGE in refresh_incremental doesn't handle deletions from the source table unless the source is empty for that bucket.
--- In Aspiral, it re-aggregates from the parent (or base table).
-SELECT aspiral_refresh('metrics_ohlcv_1m');
+-- In Spiral, it re-aggregates from the parent (or base table).
+SELECT spiral_refresh('metrics_ohlcv_1m');
 
 -- Check final state
 SELECT t, device_id, val_o, val_h, val_l, val_c, val_sum 

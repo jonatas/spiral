@@ -78,14 +78,14 @@ impl StatsState {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn aspiral_stats_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
+pub fn spiral_stats_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
     let mut s = state.map(|j| serde_json::from_value::<StatsState>(j.0).unwrap()).unwrap_or_default();
     s.add(val);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn aspiral_stats_combine(state1: Option<pgrx::JsonB>, state2: Option<pgrx::JsonB>) -> pgrx::JsonB {
+pub fn spiral_stats_combine(state1: Option<pgrx::JsonB>, state2: Option<pgrx::JsonB>) -> pgrx::JsonB {
     let mut s1 = state1.map(|j| serde_json::from_value::<StatsState>(j.0).unwrap()).unwrap_or_default();
     let s2 = state2.map(|j| serde_json::from_value::<StatsState>(j.0).unwrap()).unwrap_or_default();
     s1.merge(&s2);
@@ -93,52 +93,165 @@ pub fn aspiral_stats_combine(state1: Option<pgrx::JsonB>, state2: Option<pgrx::J
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn aspiral_stats_mean(state: pgrx::JsonB) -> f64 {
+pub fn spiral_stats_mean(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0).unwrap().mean()
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn aspiral_stats_variance(state: pgrx::JsonB) -> f64 {
+pub fn spiral_stats_variance(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0).unwrap().variance()
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn aspiral_stats_stddev(state: pgrx::JsonB) -> f64 {
+pub fn spiral_stats_stddev(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0).unwrap().stddev()
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn aspiral_stats_skewness(state: pgrx::JsonB) -> f64 {
+pub fn spiral_stats_skewness(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0).unwrap().skewness()
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn aspiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
+pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0).unwrap().kurtosis()
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SketchState {
+    pub centroids: Vec<(f64, f64)>,
+    pub sum: f64,
+    pub count: f64,
+    pub max: f64,
+    pub min: f64,
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
+    let mut s = state.map(|j| serde_json::from_value::<SketchState>(j.0).unwrap()).unwrap_or_else(|| {
+        SketchState {
+            max: f64::MIN,
+            min: f64::MAX,
+            ..Default::default()
+        }
+    });
+    
+    // Simple centroid addition for now
+    if let Some(c) = s.centroids.iter_mut().find(|c| (c.0 - val).abs() < 1e-9) {
+        c.1 += 1.0;
+    } else if s.centroids.len() < 100 {
+        s.centroids.push((val, 1.0));
+    } else {
+        // Merge into nearest
+        let mut nearest_idx = 0;
+        let mut min_dist = f64::MAX;
+        for (i, c) in s.centroids.iter().enumerate() {
+            let dist = (c.0 - val).abs();
+            if dist < min_dist {
+                min_dist = dist;
+                nearest_idx = i;
+            }
+        }
+        let c = &mut s.centroids[nearest_idx];
+        let new_weight = c.1 + 1.0;
+        c.0 = (c.0 * c.1 + val) / new_weight;
+        c.1 = new_weight;
+    }
+
+    s.sum += val;
+    s.count += 1.0;
+    if val > s.max { s.max = val; }
+    if val < s.min { s.min = val; }
+    
+    pgrx::JsonB(serde_json::to_value(s).unwrap())
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_sketch_combine(state1: Option<pgrx::JsonB>, state2: Option<pgrx::JsonB>) -> pgrx::JsonB {
+    let mut s1 = state1.map(|j| serde_json::from_value::<SketchState>(j.0).unwrap()).unwrap_or_else(|| SketchState { max: f64::MIN, min: f64::MAX, ..Default::default() });
+    let s2 = state2.map(|j| serde_json::from_value::<SketchState>(j.0).unwrap()).unwrap_or_else(|| SketchState { max: f64::MIN, min: f64::MAX, ..Default::default() });
+    
+    if s2.count == 0.0 { return pgrx::JsonB(serde_json::to_value(s1).unwrap()); }
+    if s1.count == 0.0 { return pgrx::JsonB(serde_json::to_value(s2).unwrap()); }
+
+    for (val, weight) in s2.centroids {
+        if let Some(c) = s1.centroids.iter_mut().find(|c| (c.0 - val).abs() < 1e-9) {
+            c.1 += weight;
+        } else if s1.centroids.len() < 100 {
+            s1.centroids.push((val, weight));
+        } else {
+             let mut nearest_idx = 0;
+             let mut min_dist = f64::MAX;
+             for (i, c) in s1.centroids.iter().enumerate() {
+                 let dist = (c.0 - val).abs();
+                 if dist < min_dist { min_dist = dist; nearest_idx = i; }
+             }
+             let c = &mut s1.centroids[nearest_idx];
+             let new_weight = c.1 + weight;
+             c.0 = (c.0 * c.1 + val * weight) / new_weight;
+             c.1 = new_weight;
+        }
+    }
+
+    s1.sum += s2.sum;
+    s1.count += s2.count;
+    if s2.max > s1.max { s1.max = s2.max; }
+    if s2.min < s1.min { s1.min = s2.min; }
+    
+    pgrx::JsonB(serde_json::to_value(s1).unwrap())
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
+    let mut s = serde_json::from_value::<SketchState>(state.0).unwrap();
+    if s.count == 0.0 { return 0.0; }
+    s.centroids.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    
+    let target = q * s.count;
+    let mut cum = 0.0;
+    for (val, weight) in s.centroids {
+        cum += weight;
+        if cum >= target { return val; }
+    }
+    s.max
 }
 
 extension_sql!(
     r#"
-    CREATE OR REPLACE FUNCTION aspiral_stats_mean(double precision) RETURNS double precision AS 'SELECT $1' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
-    CREATE OR REPLACE FUNCTION aspiral_stats_stddev(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
-    CREATE OR REPLACE FUNCTION aspiral_stats_variance(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
-    CREATE OR REPLACE FUNCTION aspiral_stats_skewness(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
-    CREATE OR REPLACE FUNCTION aspiral_stats_kurtosis(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION spiral_stats_mean(double precision) RETURNS double precision AS 'SELECT $1' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION spiral_stats_stddev(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION spiral_stats_variance(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION spiral_stats_skewness(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+    CREATE OR REPLACE FUNCTION spiral_stats_kurtosis(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
 
-    CREATE AGGREGATE aspiral_stats(double precision) (
-        SFUNC = aspiral_stats_accum,
+    CREATE AGGREGATE spiral_stats(double precision) (
+        SFUNC = spiral_stats_accum,
         STYPE = jsonb,
-        COMBINEFUNC = aspiral_stats_combine,
+        COMBINEFUNC = spiral_stats_combine,
         PARALLEL = SAFE
     );
     
-    CREATE AGGREGATE aspiral_stats_merge(jsonb) (
-        SFUNC = aspiral_stats_combine,
+    CREATE AGGREGATE spiral_stats_merge(jsonb) (
+        SFUNC = spiral_stats_combine,
         STYPE = jsonb,
-        COMBINEFUNC = aspiral_stats_combine,
+        COMBINEFUNC = spiral_stats_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_sketch(double precision) (
+        SFUNC = spiral_sketch_accum,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_sketch_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_sketch_merge(jsonb) (
+        SFUNC = spiral_sketch_combine,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_sketch_combine,
         PARALLEL = SAFE
     );
     "#,
-    name = "create_aspiral_stats_aggregates",
-    requires = [ aspiral_stats_accum, aspiral_stats_combine ]
+    name = "create_spiral_stats_aggregates",
+    requires = [ spiral_stats_accum, spiral_stats_combine, spiral_sketch_accum, spiral_sketch_combine ]
 );

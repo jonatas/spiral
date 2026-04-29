@@ -1,13 +1,13 @@
 -- Testing the Ultimate Caching System (Transparent Query Acceleration)
-SET aspiral.kickoff_date = '2026-04-15';
+SET spiral.kickoff_date = '2026-04-15';
 
 CREATE TABLE cache_test (
     t timestamptz NOT NULL,
     tenant_id int,
-    val double precision -- Aspiral: sum, count, avg, min, max
+    val double precision -- Spiral: sum, count, avg, min, max
 ) WITH (
-    aspiral.frames = '1m,1h',
-    aspiral.tenant = 'tenant_id'
+    spiral.frames = '1m,1h',
+    spiral.tenant = 'tenant_id'
 );
 
 -- Ingest data for two hours
@@ -21,11 +21,11 @@ INSERT INTO cache_test (t, tenant_id, val) VALUES
 ('2026-04-15 11:05:05Z', 1, 50.0);
 
 -- Materialize views
-SELECT aspiral_refresh('cache_test_ohlcv_1m');
-SELECT aspiral_refresh('cache_test_ohlcv_1h');
+SELECT spiral_refresh('cache_test_ohlcv_1m');
+SELECT spiral_refresh('cache_test_ohlcv_1h');
 
 -- Verify they are clean (changelog should be empty for base_view)
-SELECT count(*) FROM aspiral.changelog WHERE base_view = 'cache_test';
+SELECT count(*) FROM spiral.changelog WHERE base_view = 'cache_test';
 
 -- 1. Test: Full Hour Query (Should use 1h rollup)
 -- We expect the notice from the planner hook to show acceleration
@@ -49,7 +49,7 @@ INSERT INTO cache_test (t, tenant_id, val) VALUES
 ('2026-04-15 10:00:30Z', 1, 100.0);
 
 -- Changelog should now have this bucket
-SELECT count(*) FROM aspiral.changelog WHERE base_view = 'cache_test';
+SELECT count(*) FROM spiral.changelog WHERE base_view = 'cache_test';
 
 -- Query again: The result should be correct (10+100+20+30) = 160
 SELECT sum(val) FROM cache_test
@@ -77,8 +77,8 @@ GROUP BY tenant_id;
 -- Insert data for another hour
 INSERT INTO cache_test (t, tenant_id, val) VALUES
 ('2026-04-15 12:00:05Z', 1, 60.0);
-SELECT aspiral_refresh('cache_test_ohlcv_1m');
-SELECT aspiral_refresh('cache_test_ohlcv_1h');
+SELECT spiral_refresh('cache_test_ohlcv_1m');
+SELECT spiral_refresh('cache_test_ohlcv_1h');
 
 SELECT sum(val) FROM cache_test
 WHERE t >= '2026-04-15 10:00:00Z' AND t < '2026-04-15 13:00:00Z';

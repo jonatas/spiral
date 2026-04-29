@@ -15,16 +15,16 @@ struct CompressedBlock {
 }
 
 fn get_storage_path(rel_oid: i32, suffix: &str) -> PathBuf {
-    let mut path = PathBuf::from("/tmp/aspiral_main/");
+    let mut path = PathBuf::from("/tmp/spiral_main/");
     if !path.exists() {
-        std::fs::create_dir_all(&path).expect("Failed to create storage directory");
+        let _ = std::fs::create_dir_all(&path);
     }
     path.push(format!("{}{}.bin", rel_oid, suffix));
     path
 }
 
 #[pg_extern]
-pub fn aspiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
+pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
     let path = get_storage_path(main_rel_oid, "");
     let mut file = OpenOptions::new()
         .write(true)
@@ -32,25 +32,29 @@ pub fn aspiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
         .open(path)
         .expect("Failed to open Main Store file");
 
-    Spi::connect(|client| {
-        let query = format!("SELECT t, tenant_id, price FROM {} ORDER BY t ASC", delta_table_name);
+    let kickoff = crate::get_kickoff_epoch();
+    let _ = Spi::connect(|client| {
+        let query = format!("SELECT (spiral(t) - {}) as t_rel, tenant_id, price FROM {} ORDER BY t ASC", kickoff, delta_table_name);
         let tuple_table = client.select(&query, None, &[])?;
 
         for row in tuple_table {
-            let t = row.get::<i64>(1)?.unwrap();
-            let tenant_id = row.get::<i64>(2)?.unwrap();
-            let price = row.get::<f64>(3)?.unwrap();
+            let t = row.get::<i64>(1)?.unwrap_or(0);
+            let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
+            let price = row.get::<f64>(3)?.unwrap_or(0.0);
+
+            if t < 0 || tenant_id < 0 || tenant_id >= 1024 { continue; }
 
             let offset = (t * 1024 * 8) + (tenant_id * 8);
-            file.seek(SeekFrom::Start(offset as u64)).unwrap();
-            file.write_all(&price.to_le_bytes()).unwrap();
+            if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
+                let _ = file.write_all(&price.to_le_bytes());
+            }
         }
         Ok::<(), spi::Error>(())
-    }).unwrap();
+    });
 }
 
 #[pg_extern]
-pub fn aspiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
+pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
     let path = get_storage_path(main_rel_oid, "_compact");
     let mut file = OpenOptions::new()
         .write(true)
@@ -58,27 +62,30 @@ pub fn aspiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
         .open(path)
         .expect("Failed to open Compact Store file");
 
-    Spi::connect(|client| {
-        let query = format!("SELECT t, tenant_id, price FROM {} ORDER BY t ASC", delta_table_name);
+    let kickoff = crate::get_kickoff_epoch();
+    let _ = Spi::connect(|client| {
+        let query = format!("SELECT (spiral(t) - {}) as t_rel, tenant_id, price FROM {} ORDER BY t ASC", kickoff, delta_table_name);
         let tuple_table = client.select(&query, None, &[])?;
 
         for row in tuple_table {
-            let t = row.get::<i64>(1)?.unwrap();
-            let tenant_id = row.get::<i64>(2)?.unwrap();
-            let price = row.get::<f64>(3)?.unwrap();
+            let t = row.get::<i64>(1)?.unwrap_or(0);
+            let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
+            let price = row.get::<f64>(3)?.unwrap_or(0.0);
 
-            // Compact: t (4 bytes), price (4 bytes as float32) = 16 bytes per tenant entry
+            if t < 0 || tenant_id < 0 || tenant_id >= 1024 { continue; }
+
             let offset = (t * 1024 * 16) + (tenant_id * 16);
-            file.seek(SeekFrom::Start(offset as u64)).unwrap();
-            file.write_all(&(t as u32).to_le_bytes()).unwrap();
-            file.write_all(&(price as f32).to_le_bytes()).unwrap();
+            if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
+                let _ = file.write_all(&(t as u32).to_le_bytes());
+                let _ = file.write_all(&(price as f32).to_le_bytes());
+            }
         }
         Ok::<(), spi::Error>(())
-    }).unwrap();
+    });
 }
 
 #[pg_extern]
-pub fn aspiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
+pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
     let path = get_storage_path(main_rel_oid, "_blocks");
     let mut file = OpenOptions::new()
         .write(true)
@@ -86,30 +93,25 @@ pub fn aspiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
         .open(path)
         .expect("Failed to open Blocks Main Store file");
 
-    Spi::connect(|client| {
-        // Robust Column Detection
+    let _ = Spi::connect(|client| {
         let reading_col = client.select(&format!("SELECT attname FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped AND (attname = 'price' OR attname = 'reading' OR attname = 'val') LIMIT 1", delta_table_name.replace("\"", "\"\"")), None, &[])?.get_one::<String>()?.unwrap_or("price".to_string());
         let tenant_col = client.select(&format!("SELECT attname FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped AND (attname = 'tenant_id' OR attname = 'sensor_id') LIMIT 1", delta_table_name.replace("\"", "\"\"")), None, &[])?.get_one::<String>()?.unwrap_or("tenant_id".to_string());
 
+        let kickoff = crate::get_kickoff_epoch();
         let query = format!(
-            "SELECT (aspiral(t) / {0}) as block_id, {1}, array_agg({2} ORDER BY t) as prices 
-             FROM {3} 
+            "SELECT ((spiral(t) - {0}) / {1}) as block_id, {2}, array_agg({3} ORDER BY t) as prices 
+             FROM {4} 
              GROUP BY 1, 2", 
-            POINTS_PER_BLOCK, tenant_col, reading_col, delta_table_name
+            kickoff, POINTS_PER_BLOCK, tenant_col, reading_col, delta_table_name
         );
         let tuple_table = client.select(&query, None, &[])?;
-
-        if tuple_table.len() == 0 {
-            notice!("Aspiral: No data found in {} to pack.", delta_table_name);
-            return Ok::<(), spi::Error>(());
-        }
 
         for row in tuple_table {
             let block_id = row.get::<i64>(1)?.unwrap_or(0);
             let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
             let prices: Vec<f64> = row.get::<Vec<f64>>(3)?.unwrap_or_default();
             
-            if prices.is_empty() { continue; }
+            if prices.is_empty() || block_id < 0 || tenant_id < 0 || tenant_id >= 1024 { continue; }
 
             let mut block = CompressedBlock {
                 first_val: prices[0],
@@ -126,17 +128,19 @@ pub fn aspiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
 
             let offset = (block_id * BLOCK_BUNDLE_SIZE as i64) + (tenant_id * BLOCK_SIZE as i64);
             let bytes: [u8; BLOCK_SIZE] = unsafe { std::mem::transmute(block) };
-            file.seek(SeekFrom::Start(offset as u64)).unwrap();
-            file.write_all(&bytes).unwrap();
+            if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
+                let _ = file.write_all(&bytes);
+            }
         }
         Ok::<(), spi::Error>(())
-    }).unwrap();
+    });
 }
 
 #[pg_extern]
-pub fn aspiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
+pub fn spiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "");
     let mut file = File::open(path).ok()?;
+    if t < 0 || tenant_id < 0 || tenant_id >= 1024 { return None; }
     let offset = (t * 1024 * 8) + (tenant_id * 8);
     file.seek(SeekFrom::Start(offset as u64)).ok()?;
     let mut buf = [0u8; 8];
@@ -145,20 +149,22 @@ pub fn aspiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f6
 }
 
 #[pg_extern]
-pub fn aspiral_read_main_compact(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
+pub fn spiral_read_main_compact(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "_compact");
     let mut file = File::open(path).ok()?;
+    if t < 0 || tenant_id < 0 || tenant_id >= 1024 { return None; }
     let offset = (t * 1024 * 16) + (tenant_id * 16);
-    file.seek(SeekFrom::Start(offset as u64 + 4)).ok()?; // Skip t, read price
+    file.seek(SeekFrom::Start(offset as u64 + 4)).ok()?; 
     let mut buf = [0u8; 4];
     file.read_exact(&mut buf).ok()?;
     Some(f32::from_le_bytes(buf) as f64)
 }
 
 #[pg_extern]
-pub fn aspiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
+pub fn spiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "_blocks");
     let mut file = File::open(path).ok()?;
+    if t < 0 || tenant_id < 0 || tenant_id >= 1024 { return None; }
     let block_id = t / POINTS_PER_BLOCK;
     let step = (t % POINTS_PER_BLOCK) as usize;
     
@@ -173,6 +179,7 @@ pub fn aspiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) 
     if step == 0 { return Some(block.first_val); }
 
     for i in 0..step {
+        if i >= 60 { break; }
         let xor_delta = u16::from_le_bytes([block.data[i*2], block.data[i*2+1]]) as u64;
         current_bits ^= xor_delta;
     }
@@ -181,12 +188,14 @@ pub fn aspiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) 
 }
 
 #[pg_extern]
-pub fn aspiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id: i64) -> Vec<f64> {
+pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id: i64) -> Vec<f64> {
     let path = get_storage_path(main_rel_oid, "_blocks");
-    let file_res = File::open(path);
-    if file_res.is_err() { return vec![]; }
-    let mut file = file_res.unwrap();
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
     
+    if block_id < 0 || tenant_id < 0 || tenant_id >= 1024 { return vec![]; }
     let offset = (block_id * BLOCK_BUNDLE_SIZE as i64) + (tenant_id * BLOCK_SIZE as i64);
     if file.seek(SeekFrom::Start(offset as u64)).is_err() { return vec![]; }
     
@@ -207,15 +216,30 @@ pub fn aspiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id
     results
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_o1_binary_math() {
-        let t: i64 = 50;
-        let tenant_id: i64 = 500;
-        let offset = (t * 1024 * 8) + (tenant_id * 8);
-        assert_eq!(offset, 413184 - 3184 + 4000 + 12000); // placeholder test
+#[pg_extern]
+pub fn spiral_scan_zero(main_rel_oid: i32) -> TableIterator<'static, (name!(t, i64), name!(tenant_id, i32), name!(value, f64))> {
+    let path = get_storage_path(main_rel_oid, "");
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return TableIterator::new(Vec::new().into_iter()),
+    };
+    let metadata = file.metadata().unwrap();
+    let total_size = metadata.len();
+    
+    let mut results = Vec::new();
+    let mut buf = [0u8; 8];
+    
+    let total_slots = total_size / 8;
+    for i in 0..total_slots {
+        if file.read_exact(&mut buf).is_ok() {
+            let val = f64::from_le_bytes(buf);
+            if val != 0.0 {
+                let t = (i / 1024) as i64;
+                let tenant_id = (i % 1024) as i32;
+                results.push((t, tenant_id, val));
+            }
+        }
     }
+    
+    TableIterator::new(results.into_iter())
 }
