@@ -13,23 +13,23 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
         .split(',')
         .map(|s| {
             let s = s.trim();
-            let seconds = if s.ends_with('s') {
-                s[..s.len() - 1].parse::<i32>().unwrap_or(0)
-            } else if s.ends_with('m') {
-                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 60
-            } else if s.ends_with('h') {
-                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 3600
-            } else if s.ends_with('d') {
-                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 86400
-            } else if s.ends_with('w') {
-                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 604800
-            } else if s.ends_with('M') {
-                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 2592000 // 30 days
+            let seconds = if let Some(stripped) = s.strip_suffix('s') {
+                stripped.parse::<i32>().unwrap_or(0)
+            } else if let Some(stripped) = s.strip_suffix('m') {
+                stripped.parse::<i32>().unwrap_or(0) * 60
+            } else if let Some(stripped) = s.strip_suffix('h') {
+                stripped.parse::<i32>().unwrap_or(0) * 3600
+            } else if let Some(stripped) = s.strip_suffix('d') {
+                stripped.parse::<i32>().unwrap_or(0) * 86400
+            } else if let Some(stripped) = s.strip_suffix('w') {
+                stripped.parse::<i32>().unwrap_or(0) * 604800
+            } else if let Some(stripped) = s.strip_suffix('M') {
+                stripped.parse::<i32>().unwrap_or(0) * 2592000 // 30 days
             } else {
                 s.parse::<i32>().unwrap_or(0)
             };
-            let name = if s.ends_with('M') {
-                format!("{}mon", &s[..s.len() - 1])
+            let name = if let Some(stripped) = s.strip_suffix('M') {
+                format!("{}mon", stripped)
             } else {
                 s.to_string()
             };
@@ -53,11 +53,11 @@ pub fn derive_child_sql(
     scope_columns: &[String],
 ) -> (String, Vec<SourceDef>) {
     Spi::connect(|client| {
-        let exists = client.select(
+        let exists = !client.select(
             "SELECT 1 FROM pg_class WHERE relname = $1",
             Some(1),
             unsafe { &[pgrx::datum::DatumWithOid::new(child_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
-        )?.first().is_empty() == false;
+        )?.first().is_empty();
 
         let source_for_cols = if exists { child_name } else { parent_name };
 
@@ -74,11 +74,11 @@ pub fn derive_child_sql(
         let mut group_by = vec!["(spiral(t) / {0}) * {0}".replace("{0}", &frame_seconds.to_string())];
         let mut sources = Vec::new();
 
-        let parent_is_view = client.select(
+        let parent_is_view = !client.select(
             "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
             Some(1),
             unsafe { &[pgrx::datum::DatumWithOid::new(parent_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
-        )?.first().is_empty() == false;
+        )?.first().is_empty();
 
         for row in columns {
             let col = row.get::<String>(1)?.unwrap();

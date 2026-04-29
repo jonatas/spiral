@@ -147,7 +147,7 @@ pub fn unify_changelog(base_view: &str) {
             "DELETE FROM spiral.changelog WHERE base_view = '{}'",
             base_view.replace("'", "''")
         ));
-        let _ = Spi::run(&format!("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified"));
+        let _ = Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified");
         let _ = Spi::run("DROP TABLE temp_unified");
         Ok::<(), spi::Error>(())
     });
@@ -162,20 +162,16 @@ pub fn get_dirty_ranges(
     Spi::connect(|client| {
         let mut ranges = Vec::new();
         let sql = if scope_values.is_some() {
-            format!(
-                "SELECT t_start, t_end FROM spiral.changelog
+            "SELECT t_start, t_end FROM spiral.changelog
                      WHERE base_view = $1
                        AND NOT (t_end < $2 OR t_start > $3)
-                       AND (scope_values = '{{}}'::jsonb OR scope_values = $4)
-                     ORDER BY t_start"
-            )
+                       AND (scope_values = '{}'::jsonb OR scope_values = $4)
+                     ORDER BY t_start".to_string()
         } else {
-            format!(
-                "SELECT t_start, t_end FROM spiral.changelog
+            "SELECT t_start, t_end FROM spiral.changelog
                      WHERE base_view = $1
                        AND NOT (t_end < $2 OR t_start > $3)
-                     ORDER BY t_start"
-            )
+                     ORDER BY t_start".to_string()
         };
 
         let mut args = Vec::new();

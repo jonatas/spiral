@@ -6,6 +6,8 @@ use pgrx::prelude::*;
         CREATE FUNCTION spiral_tam_handler(internal) RETURNS table_am_handler LANGUAGE c AS 'MODULE_PATHNAME', 'spiral_tam_handler_wrapper' STRICT;
         CREATE ACCESS METHOD spiral TYPE TABLE HANDLER spiral_tam_handler;
     ")]
+/// # Safety
+/// This function is unsafe because it interacts with PostgreSQL C internals.
 pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
     let routine =
         pgrx::PgMemoryContexts::TopMemoryContext.palloc_struct::<pg_sys::TableAmRoutine>();

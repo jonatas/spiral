@@ -14,6 +14,7 @@ thread_local! {
 }
 
 #[pg_guard]
+#[allow(clippy::too_many_arguments)]
 unsafe extern "C-unwind" fn spiral_process_utility_hook(
     pstmt: *mut pg_sys::PlannedStmt,
     query_string: *const c_char,
@@ -266,7 +267,7 @@ unsafe fn build_time_constraints(
                 if !(*from).fromlist.is_null() {
                     let list = (*from).fromlist;
                     for i in 0..(*list).length {
-                        stack.push(pg_sys::list_nth(list, i as i32) as *mut pg_sys::Node);
+                        stack.push(pg_sys::list_nth(list, i) as *mut pg_sys::Node);
                     }
                 }
             }
@@ -283,7 +284,7 @@ unsafe fn build_time_constraints(
                 let args = (*bexpr).args;
                 if !args.is_null() {
                     for i in 0..(*args).length {
-                        stack.push(pg_sys::list_nth(args, i as i32) as *mut pg_sys::Node);
+                        stack.push(pg_sys::list_nth(args, i) as *mut pg_sys::Node);
                     }
                 }
             }
@@ -441,8 +442,8 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                 build_time_constraints(query.jointree as *mut pg_sys::Node, rtable);
 
             for i in 0..(*rtable).length {
-                let varno = (i + 1) as i32;
-                let rte = pg_sys::list_nth(rtable, i as i32) as *mut pg_sys::RangeTblEntry;
+                let varno = i + 1 ;
+                let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
                 if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                     let relid = (*rte).relid;
                     let relname = pg_sys::get_rel_name(relid);
@@ -451,7 +452,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                         let hierarchy = Spi::connect(|client| {
                             let mut views = Vec::new();
                             // Safety check: Ensure the metadata table exists before querying
-                            let table_exists = client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.len() > 0;
+                            let table_exists = !client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.is_empty();
                             if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
 
                             let table = client.select("SELECT view_name FROM spiral.metadata WHERE base_view = $1", None,
@@ -750,8 +751,8 @@ pub fn generate_hierarchy_internal(
                 let cols = client.select(&q, None, &[]).unwrap();
                 for row in cols {
                     let col = row.get::<String>(1).unwrap().unwrap();
-                    if !seen_cols.contains(&col) && col != "t" {
-                        if seen_cols.insert(col.clone()) {
+                    if !seen_cols.contains(&col) && col != "t"
+                        && seen_cols.insert(col.clone()) {
                             select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
                             sources.push(rollup::SourceDef {
                                 base_column: col.clone(),
@@ -759,7 +760,6 @@ pub fn generate_hierarchy_internal(
                                 mat_column: col,
                             });
                         }
-                    }
                 }
             });
         } else {
@@ -885,7 +885,7 @@ unsafe fn extract_query_columns_simple(
         return cols;
     }
     for i in 0..(*target_list).length {
-        let tle = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
+        let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
         let node = (*tle).expr as *mut pg_sys::Node;
         if node.is_null() {
             continue;
@@ -1061,11 +1061,10 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
 
     let success = crate::refresh_incremental(base_name, where_clause.clone(), 0);
 
-    if success && is_root {
-        if where_clause.is_none() {
+    if success && is_root
+        && where_clause.is_none() {
             let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
         }
-    }
 
     if is_root {
         let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
@@ -1104,8 +1103,8 @@ pub fn spiral_explain(query_sql: &str) -> String {
             build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
 
         for i in 0..(*rtable).length {
-            let varno = (i + 1) as i32;
-            let rte = pg_sys::list_nth(rtable, i as i32) as *mut pg_sys::RangeTblEntry;
+            let varno = i + 1 ;
+            let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
             if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
                 continue;
             }
@@ -1118,7 +1117,7 @@ pub fn spiral_explain(query_sql: &str) -> String {
 
             let hierarchy = Spi::connect(|client| {
                 let mut views = Vec::new();
-                let table_exists = client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.len() > 0;
+                let table_exists = !client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.is_empty();
                 if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
 
                 let table = client.select("SELECT view_name FROM spiral.metadata WHERE base_view = $1", None,
@@ -1179,12 +1178,14 @@ pub fn spiral_explain(query_sql: &str) -> String {
                     base_table
                 ));
             }
-            report.push_str("\n");
+            report.push('\n');
         }
         report
     }
 }
 
+/// # Safety
+/// This function is unsafe because it modifies global PostgreSQL hook pointers.
 pub unsafe fn init_hooks() {
     PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
     pg_sys::ProcessUtility_hook = Some(spiral_process_utility_hook);

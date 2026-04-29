@@ -29,6 +29,7 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(path)
         .expect("Failed to open Main Store file");
 
@@ -45,7 +46,7 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
             let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
             let price = row.get::<f64>(3)?.unwrap_or(0.0);
 
-            if t < 0 || tenant_id < 0 || tenant_id >= 1024 {
+            if t < 0 || !(0..1024).contains(&tenant_id) {
                 continue;
             }
 
@@ -64,6 +65,7 @@ pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(path)
         .expect("Failed to open Compact Store file");
 
@@ -80,7 +82,7 @@ pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
             let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
             let price = row.get::<f64>(3)?.unwrap_or(0.0);
 
-            if t < 0 || tenant_id < 0 || tenant_id >= 1024 {
+            if t < 0 || !(0..1024).contains(&tenant_id) {
                 continue;
             }
 
@@ -100,6 +102,7 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(path)
         .expect("Failed to open Blocks Main Store file");
 
@@ -121,7 +124,7 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
             let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
             let prices: Vec<f64> = row.get::<Vec<f64>>(3)?.unwrap_or_default();
 
-            if prices.is_empty() || block_id < 0 || tenant_id < 0 || tenant_id >= 1024 {
+            if prices.is_empty() || block_id < 0 || !(0..1024).contains(&tenant_id) {
                 continue;
             }
 
@@ -154,7 +157,7 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
 pub fn spiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "");
     let mut file = File::open(path).ok()?;
-    if t < 0 || tenant_id < 0 || tenant_id >= 1024 {
+    if t < 0 || !(0..1024).contains(&tenant_id) {
         return None;
     }
     let offset = (t * 1024 * 8) + (tenant_id * 8);
@@ -168,7 +171,7 @@ pub fn spiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64
 pub fn spiral_read_main_compact(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "_compact");
     let mut file = File::open(path).ok()?;
-    if t < 0 || tenant_id < 0 || tenant_id >= 1024 {
+    if t < 0 || !(0..1024).contains(&tenant_id) {
         return None;
     }
     let offset = (t * 1024 * 16) + (tenant_id * 16);
@@ -182,7 +185,7 @@ pub fn spiral_read_main_compact(main_rel_oid: i32, t: i64, tenant_id: i64) -> Op
 pub fn spiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "_blocks");
     let mut file = File::open(path).ok()?;
-    if t < 0 || tenant_id < 0 || tenant_id >= 1024 {
+    if t < 0 || !(0..1024).contains(&tenant_id) {
         return None;
     }
     let block_id = t / POINTS_PER_BLOCK;
@@ -219,7 +222,7 @@ pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id:
         Err(_) => return vec![],
     };
 
-    if block_id < 0 || tenant_id < 0 || tenant_id >= 1024 {
+    if block_id < 0 || !(0..1024).contains(&tenant_id) {
         return vec![];
     }
     let offset = (block_id * BLOCK_BUNDLE_SIZE as i64) + (tenant_id * BLOCK_SIZE as i64);
@@ -253,7 +256,7 @@ pub fn spiral_scan_zero(
     let path = get_storage_path(main_rel_oid, "");
     let mut file = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return TableIterator::new(Vec::new().into_iter()),
+        Err(_) => return TableIterator::new(Vec::new()),
     };
     let metadata = file.metadata().unwrap();
     let total_size = metadata.len();
@@ -273,5 +276,5 @@ pub fn spiral_scan_zero(
         }
     }
 
-    TableIterator::new(results.into_iter())
+    TableIterator::new(results)
 }
