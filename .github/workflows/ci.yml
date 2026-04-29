@@ -21,14 +21,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features pg16 -- -D warnings
 
   test:
     name: Test (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        pg_version: [17, 18]
+        pg_version: [16, 17, 18]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +69,7 @@ jobs:
         run: cargo install cargo-pgrx --version 0.17.0 --locked
 
       - name: Initialize pgrx
-        run: cargo pgrx init pg${{ matrix.pg_version }}
+        run: cargo pgrx init
 
       - name: Run tests
-        run: cargo pgrx test pg${{ matrix.pg_version }}
+        run: cargo pgrx test pg${{ matrix.pg_version }} --no-default-features --features pg${{ matrix.pg_version }}
