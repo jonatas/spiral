@@ -1,13 +1,13 @@
 use pgrx::prelude::*;
 use std::cell::Cell;
 
+pub mod bgworker;
 pub mod catalog;
 pub mod hooks;
 pub mod rollup;
-pub mod bgworker;
 pub mod stats;
-pub mod tam;
 pub mod storage;
+pub mod tam;
 
 pgrx::pg_module_magic!();
 
@@ -35,7 +35,7 @@ fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
             y ^= hash << (i % 8);
         }
     }
-    
+
     x = (x | (x << 16)) & 0x0000FFFF;
     x = (x | (x << 8)) & 0x00FF00FF;
     x = (x | (x << 4)) & 0x0F0F0F0F;
@@ -58,7 +58,7 @@ fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> i64 {
     for (i, dim) in dimensions.iter().enumerate() {
         y ^= (*dim as u32) << (i % 8);
     }
-    
+
     x = (x | (x << 16)) & 0x0000FFFF;
     x = (x | (x << 8)) & 0x00FF00FF;
     x = (x | (x << 4)) & 0x0F0F0F0F;
@@ -117,7 +117,11 @@ fn cluster_table(table_name: &str, time_col: &str, dimensions: Vec<String>) {
 }
 
 pub fn cluster_table_internal(table_name: &str, time_col: &str, dimensions: Vec<String>) {
-    let dims = dimensions.iter().map(|d| format!("\"{}\"", d)).collect::<Vec<_>>().join(", ");
+    let dims = dimensions
+        .iter()
+        .map(|d| format!("\"{}\"", d))
+        .collect::<Vec<_>>()
+        .join(", ");
     let index_name = format!("idx_z_{}", table_name);
     let sql = format!(
         "CREATE INDEX IF NOT EXISTS \"{index_name}\" ON \"{table_name}\" (spiral_zorder(spiral(\"{time_col}\"), ARRAY[{dims}]::text[]));
@@ -128,30 +132,42 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimensions: Vec<
 }
 
 #[pg_extern]
-fn refresh_incremental(view_name: &str, extra_where: default!(Option<String>, "NULL"), depth: default!(i32, 0)) -> bool {
+fn refresh_incremental(
+    view_name: &str,
+    extra_where: default!(Option<String>, "NULL"),
+    depth: default!(i32, 0),
+) -> bool {
     if depth > 5 {
-        notice!("Spiral: refresh_incremental reached max depth for '{}'", view_name);
+        notice!(
+            "Spiral: refresh_incremental reached max depth for '{}'",
+            view_name
+        );
         return false;
     }
-    
+
     let metadata = catalog::get_metadata(view_name);
-    if metadata.is_none() { 
-        return false; 
+    if metadata.is_none() {
+        return false;
     }
     let metadata = metadata.unwrap();
     let frame_seconds = metadata.frame_seconds;
     let parent_view = metadata.parent_view;
     let scope_cols_raw = metadata.scope_columns;
-    let scope_cols: Vec<String> = scope_cols_raw.iter().map(|c| format!("\"{}\"", c)).collect();
-    
+    let scope_cols: Vec<String> = scope_cols_raw
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect();
+
     let changelog_key = metadata.base_view.clone();
 
     let source_table = if parent_view == "BASE" {
         let res = Spi::get_one_with_args::<String>(
             "SELECT base_view FROM spiral.metadata WHERE view_name = $1",
-            &[unsafe { pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID) }]
+            &[unsafe {
+                pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)
+            }],
         );
-        
+
         match res {
             Ok(Some(v)) => v,
             Ok(None) => panic!("No base_view found for {}", view_name),
@@ -163,39 +179,67 @@ fn refresh_incremental(view_name: &str, extra_where: default!(Option<String>, "N
 
     let cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\""));
     let all_cols: Vec<String> = Spi::connect(|client| {
-        Ok::<Vec<String>, spi::Error>(client.select(&cols_query, None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap()).collect())
-    }).unwrap_or_default();
+        Ok::<Vec<String>, spi::Error>(
+            client
+                .select(&cols_query, None, &[])?
+                .map(|r| r.get::<String>(1).unwrap().unwrap())
+                .collect(),
+        )
+    })
+    .unwrap_or_default();
 
     if all_cols.is_empty() {
         return false;
     }
 
-    let update_cols: Vec<String> = all_cols.iter()
+    let update_cols: Vec<String> = all_cols
+        .iter()
         .filter(|&c| c != "t" && !scope_cols_raw.contains(c))
-        .map(|c| format!("\"{}\"", c)).collect();
+        .map(|c| format!("\"{}\"", c))
+        .collect();
 
-    let (sql_child, _) = rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
-    if sql_child.is_empty() { return false; }
-    let select_part = sql_child.split("SELECT").nth(1).unwrap().split("FROM").next().unwrap().trim();
+    let (sql_child, _) =
+        rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
+    if sql_child.is_empty() {
+        return false;
+    }
+    let select_part = sql_child
+        .split("SELECT")
+        .nth(1)
+        .unwrap()
+        .split("FROM")
+        .next()
+        .unwrap()
+        .trim();
 
     let mut on_clause = vec!["target.t::timestamptz = source.t::timestamptz".to_string()];
-    for col in &scope_cols { on_clause.push(format!("target.{} = source.{}", col, col)); }
-    let update_set = update_cols.iter().map(|c| format!("{} = source.{}", c, c)).collect::<Vec<_>>().join(", ");
+    for col in &scope_cols {
+        on_clause.push(format!("target.{} = source.{}", col, col));
+    }
+    let update_set = update_cols
+        .iter()
+        .map(|c| format!("{} = source.{}", c, c))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut source_where = if scope_cols_raw.is_empty() {
         format!(
-            "JOIN spiral.changelog c ON c.base_view = '{changelog_key}' 
-                AND spiral(t) >= (c.t_start/{0})*{0} 
+            "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
+                AND spiral(t) >= (c.t_start/{0})*{0}
                 AND spiral(t) < ((c.t_end/{0})+1)*{0}
                 AND c.scope_values = '{{}}'::jsonb",
             frame_seconds,
             changelog_key = changelog_key.replace("'", "''")
         )
     } else {
-        let scope_cols_json = scope_cols_raw.iter().map(|s| format!("'{}', \"{}\"::text", s, s)).collect::<Vec<_>>().join(", ");
+        let scope_cols_json = scope_cols_raw
+            .iter()
+            .map(|s| format!("'{}', \"{}\"::text", s, s))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "JOIN spiral.changelog c ON c.base_view = '{changelog_key}' 
-                AND spiral(t) >= (c.t_start/{0})*{0} 
+            "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
+                AND spiral(t) >= (c.t_start/{0})*{0}
                 AND spiral(t) < ((c.t_end/{0})+1)*{0}
                 AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
             frame_seconds,
@@ -203,24 +247,47 @@ fn refresh_incremental(view_name: &str, extra_where: default!(Option<String>, "N
             changelog_key = changelog_key.replace("'", "''")
         )
     };
-    if let Some(ref extra) = extra_where { source_where.push_str(&format!(" WHERE ({})", extra)); }
+    if let Some(ref extra) = extra_where {
+        source_where.push_str(&format!(" WHERE ({})", extra));
+    }
 
-    let group_by_clause = if scope_cols.is_empty() { "1".to_string() } else { format!("1, {}", scope_cols.join(", ")) };
+    let group_by_clause = if scope_cols.is_empty() {
+        "1".to_string()
+    } else {
+        format!("1, {}", scope_cols.join(", "))
+    };
 
     let merge_sql = format!(
         "MERGE INTO \"{view_name}\" AS target
             USING (
-                SELECT {select_part} FROM \"{source_table}\" 
+                SELECT {select_part} FROM \"{source_table}\"
                 {source_where}
                 GROUP BY {group_by_clause}
             ) AS source
             ON ({on_clause})
             WHEN MATCHED THEN UPDATE SET {update_set}
             WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
-        view_name = view_name, select_part = select_part, source_table = source_table, source_where = source_where, group_by_clause = group_by_clause, on_clause = on_clause.join(" AND "),
-        update_set = if update_set.is_empty() { "t = source.t" } else { &update_set },
-        all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
-        source_cols_joined = all_cols.iter().map(|c| format!("source.\"{}\"", c)).collect::<Vec<_>>().join(", ")
+        view_name = view_name,
+        select_part = select_part,
+        source_table = source_table,
+        source_where = source_where,
+        group_by_clause = group_by_clause,
+        on_clause = on_clause.join(" AND "),
+        update_set = if update_set.is_empty() {
+            "t = source.t"
+        } else {
+            &update_set
+        },
+        all_cols_joined = all_cols
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", "),
+        source_cols_joined = all_cols
+            .iter()
+            .map(|c| format!("source.\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     SKIP_ACCELERATION.with(|s| s.set(true));
@@ -242,12 +309,17 @@ fn spiral_to_epoch(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
 #[pg_extern]
 fn spiral_from_epoch(epoch: i64) -> pgrx::datum::TimestampWithTimeZone {
     let micros = (epoch - 946684800) * 1000000;
-    unsafe { pgrx::datum::TimestampWithTimeZone::from_datum(micros.into_datum().unwrap(), false).unwrap() }
+    unsafe {
+        pgrx::datum::TimestampWithTimeZone::from_datum(micros.into_datum().unwrap(), false).unwrap()
+    }
 }
 
 #[pg_extern]
 fn spiral_purge(base_table: &str) {
-    let _ = Spi::run(&format!("DELETE FROM spiral.changelog WHERE base_view = '{}'", base_table.replace("'", "''")));
+    let _ = Spi::run(&format!(
+        "DELETE FROM spiral.changelog WHERE base_view = '{}'",
+        base_table.replace("'", "''")
+    ));
     notice!("Spiral: Changelog purged for '{}'", base_table);
 }
 
@@ -255,20 +327,20 @@ fn spiral_purge(base_table: &str) {
 fn spiral_status(base_table: &str) -> pgrx::JsonB {
     Spi::connect(|client| {
         let mut status = serde_json::Map::new();
-        
+
         let mut views = Vec::new();
         let table = client.select("SELECT view_name, frame_seconds, parent_view FROM spiral.metadata WHERE base_view = $1 ORDER BY frame_seconds ASC", None,
             unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] })?;
-        
+
         for row in table {
             let mut v_info = serde_json::Map::new();
             let v_name = row.get::<String>(1)?.unwrap();
             v_info.insert("frame_seconds".to_string(), serde_json::Value::from(row.get::<i32>(2)?.unwrap()));
             v_info.insert("parent".to_string(), serde_json::Value::from(row.get::<String>(3)?.unwrap()));
-            
+
             let count = client.select(&format!("SELECT count(*) FROM \"{}\"", v_name.replace("\"", "\"\"")), Some(1), &[])?.get_one::<i64>()?.unwrap_or(0);
             v_info.insert("row_count".to_string(), serde_json::Value::from(count));
-            
+
             views.push(serde_json::Value::Object(v_info));
         }
         status.insert("hierarchy".to_string(), serde_json::Value::Array(views));
@@ -287,25 +359,66 @@ fn spiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL"))
 }
 
 #[pg_extern(name = "spiral_register_view_rust")]
-fn spiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>) {
-    notice!("Spiral: registering view '{}', parent='{}', base='{}'", view_name, parent_view, base_view);
-    
+fn spiral_register_view(
+    view_name: &str,
+    parent_view: &str,
+    frame_seconds: i32,
+    base_view: &str,
+    scope_columns: Vec<String>,
+) {
+    notice!(
+        "Spiral: registering view '{}', parent='{}', base='{}'",
+        view_name,
+        parent_view,
+        base_view
+    );
+
     let table_exists = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1)",
-        &[unsafe { pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID) }]
-    ).unwrap().unwrap_or(false);
+        &[unsafe {
+            pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)
+        }],
+    )
+    .unwrap()
+    .unwrap_or(false);
 
-    let source_table = if parent_view == "BASE" { base_view } else { parent_view };
-    let (sql, sources) = rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
+    let source_table = if parent_view == "BASE" {
+        base_view
+    } else {
+        parent_view
+    };
+    let (sql, sources) =
+        rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
 
     if !table_exists && !sql.is_empty() {
-        let create_sql = format!("CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0", view_name, sql.split(" AS ").nth(1).unwrap().split(';').next().unwrap());
+        let create_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0",
+            view_name,
+            sql.split(" AS ").nth(1).unwrap().split(';').next().unwrap()
+        );
         let _ = Spi::run(&create_sql);
     }
 
-    catalog::insert_metadata(view_name, parent_view, frame_seconds, base_view, scope_columns.clone(), pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())));
+    catalog::insert_metadata(
+        view_name,
+        parent_view,
+        frame_seconds,
+        base_view,
+        scope_columns.clone(),
+        pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
+    );
     notice!("Spiral: view '{}' metadata inserted", view_name);
-    for src in sources { catalog::insert_source(view_name, base_view, frame_seconds, &src.base_column, &src.formula, &src.mat_column, pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))); }
+    for src in sources {
+        catalog::insert_source(
+            view_name,
+            base_view,
+            frame_seconds,
+            &src.base_column,
+            &src.formula,
+            &src.mat_column,
+            pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
+        );
+    }
     if parent_view == "BASE" {
         for event in &["INSERT", "UPDATE", "DELETE"] {
             let mut transition = String::new();
@@ -318,11 +431,13 @@ fn spiral_register_view(view_name: &str, parent_view: &str, frame_seconds: i32, 
             }
 
             let trigger_sql = format!(
-                "CREATE TRIGGER spiral_track_{base_view}_{event_lower} 
-                 AFTER {event} ON \"{base_view}\" 
+                "CREATE TRIGGER spiral_track_{base_view}_{event_lower}
+                 AFTER {event} ON \"{base_view}\"
                  {transition}
                  FOR EACH STATEMENT EXECUTE FUNCTION spiral.track_changes_stmt('{base_view}')",
-                base_view = base_view, event = event, event_lower = event.to_lowercase(),
+                base_view = base_view,
+                event = event,
+                event_lower = event.to_lowercase(),
                 transition = transition
             );
             let _ = Spi::run(&trigger_sql);
@@ -336,13 +451,16 @@ pub fn get_kickoff_epoch() -> i64 {
 }
 
 pub fn get_minimal_pace() -> f64 {
-    Spi::get_one::<f64>("SELECT COALESCE(current_setting('spiral.minimal_pace', true), '60')::numeric::float8").unwrap_or(Some(60.0)).unwrap()
+    Spi::get_one::<f64>(
+        "SELECT COALESCE(current_setting('spiral.minimal_pace', true), '60')::numeric::float8",
+    )
+    .unwrap_or(Some(60.0))
+    .unwrap()
 }
 
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-    }
+    pub fn setup(_options: Vec<&str>) {}
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         vec!["shared_preload_libraries = 'spiral'"]

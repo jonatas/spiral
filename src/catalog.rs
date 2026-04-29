@@ -1,5 +1,5 @@
-use pgrx::prelude::*;
 use pgrx::datum::DatumWithOid;
+use pgrx::prelude::*;
 
 pub struct Metadata {
     pub parent_view: String,
@@ -18,8 +18,8 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
                 &[DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value())]
             ).unwrap().first()
         };
-        if row.is_empty() { 
-            return Ok::<Option<Metadata>, spi::Error>(None); 
+        if row.is_empty() {
+            return Ok::<Option<Metadata>, spi::Error>(None);
         }
         Ok(Some(Metadata {
             parent_view: row.get::<String>(1).unwrap().unwrap(),
@@ -58,20 +58,34 @@ pub fn get_children(view_name: &str) -> Vec<String> {
 pub fn is_spiral_relation(name: &str) -> bool {
     Spi::connect(|client| {
         let row = unsafe {
-            client.select(
-                "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
-                None,
-                &[DatumWithOid::new(name.into_datum(), PgBuiltInOids::TEXTOID.value())]
-            ).unwrap().first()
+            client
+                .select(
+                    "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
+                    None,
+                    &[DatumWithOid::new(
+                        name.into_datum(),
+                        PgBuiltInOids::TEXTOID.value(),
+                    )],
+                )
+                .unwrap()
+                .first()
         };
         Ok::<bool, spi::Error>(!row.is_empty())
-    }).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
-pub fn insert_metadata(view_name: &str, parent_view: &str, frame_seconds: i32, base_view: &str, scope_columns: Vec<String>, columns_metadata: pgrx::JsonB) {
+pub fn insert_metadata(
+    view_name: &str,
+    parent_view: &str,
+    frame_seconds: i32,
+    base_view: &str,
+    scope_columns: Vec<String>,
+    columns_metadata: pgrx::JsonB,
+) {
     unsafe {
         Spi::run_with_args(
-            "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata) 
+            "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
             &[
@@ -86,10 +100,18 @@ pub fn insert_metadata(view_name: &str, parent_view: &str, frame_seconds: i32, b
     }
 }
 
-pub fn insert_source(view_name: &str, base_view: &str, frame_seconds: i32, base_column: &str, formula: &str, mat_column: &str, metadata: pgrx::JsonB) {
+pub fn insert_source(
+    view_name: &str,
+    base_view: &str,
+    frame_seconds: i32,
+    base_column: &str,
+    formula: &str,
+    mat_column: &str,
+    metadata: pgrx::JsonB,
+) {
     unsafe {
         Spi::run_with_args(
-            "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, metadata) 
+            "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, metadata)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (view_name, base_column, formula) DO UPDATE SET base_view = EXCLUDED.base_view, frame_seconds = EXCLUDED.frame_seconds, mat_column = EXCLUDED.mat_column, metadata = EXCLUDED.metadata",
             &[
@@ -107,7 +129,7 @@ pub fn insert_source(view_name: &str, base_view: &str, frame_seconds: i32, base_
 
 pub fn unify_changelog(base_view: &str) {
     let _ = Spi::connect(|_client| {
-         let _ = Spi::run(&format!("CREATE TEMP TABLE temp_unified AS
+        let _ = Spi::run(&format!("CREATE TEMP TABLE temp_unified AS
              SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
              FROM (
                 SELECT *,
@@ -121,36 +143,60 @@ pub fn unify_changelog(base_view: &str) {
              ) s2
              GROUP BY base_view, scope_values, grp", base_view.replace("'", "''")));
 
-         let _ = Spi::run(&format!("DELETE FROM spiral.changelog WHERE base_view = '{}'", base_view.replace("'", "''")));
-         let _ = Spi::run(&format!("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified"));
-         let _ = Spi::run("DROP TABLE temp_unified");
-         Ok::<(), spi::Error>(())
+        let _ = Spi::run(&format!(
+            "DELETE FROM spiral.changelog WHERE base_view = '{}'",
+            base_view.replace("'", "''")
+        ));
+        let _ = Spi::run(&format!("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified"));
+        let _ = Spi::run("DROP TABLE temp_unified");
+        Ok::<(), spi::Error>(())
     });
 }
 
-pub fn get_dirty_ranges(base_view: &str, ts: i64, te: i64, scope_values: Option<pgrx::JsonB>) -> Vec<(i64, i64)> {
+pub fn get_dirty_ranges(
+    base_view: &str,
+    ts: i64,
+    te: i64,
+    scope_values: Option<pgrx::JsonB>,
+) -> Vec<(i64, i64)> {
     Spi::connect(|client| {
         let mut ranges = Vec::new();
         let sql = if scope_values.is_some() {
-            format!("SELECT t_start, t_end FROM spiral.changelog 
-                     WHERE base_view = $1 
+            format!(
+                "SELECT t_start, t_end FROM spiral.changelog
+                     WHERE base_view = $1
                        AND NOT (t_end < $2 OR t_start > $3)
                        AND (scope_values = '{{}}'::jsonb OR scope_values = $4)
-                     ORDER BY t_start")
+                     ORDER BY t_start"
+            )
         } else {
-            format!("SELECT t_start, t_end FROM spiral.changelog 
-                     WHERE base_view = $1 
+            format!(
+                "SELECT t_start, t_end FROM spiral.changelog
+                     WHERE base_view = $1
                        AND NOT (t_end < $2 OR t_start > $3)
-                     ORDER BY t_start")
+                     ORDER BY t_start"
+            )
         };
 
         let mut args = Vec::new();
         unsafe {
-            args.push(DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()));
-            args.push(DatumWithOid::new(ts.into_datum().unwrap(), PgBuiltInOids::INT8OID.value()));
-            args.push(DatumWithOid::new(te.into_datum().unwrap(), PgBuiltInOids::INT8OID.value()));
+            args.push(DatumWithOid::new(
+                base_view.into_datum().unwrap(),
+                PgBuiltInOids::TEXTOID.value(),
+            ));
+            args.push(DatumWithOid::new(
+                ts.into_datum().unwrap(),
+                PgBuiltInOids::INT8OID.value(),
+            ));
+            args.push(DatumWithOid::new(
+                te.into_datum().unwrap(),
+                PgBuiltInOids::INT8OID.value(),
+            ));
             if let Some(sv) = scope_values {
-                args.push(DatumWithOid::new(sv.into_datum(), PgBuiltInOids::JSONBOID.value()));
+                args.push(DatumWithOid::new(
+                    sv.into_datum(),
+                    PgBuiltInOids::JSONBOID.value(),
+                ));
             }
         }
 
@@ -161,5 +207,6 @@ pub fn get_dirty_ranges(base_view: &str, ts: i64, te: i64, scope_values: Option<
             ranges.push((s, e));
         }
         Ok::<Vec<(i64, i64)>, spi::Error>(ranges)
-    }).unwrap_or_default()
+    })
+    .unwrap_or_default()
 }

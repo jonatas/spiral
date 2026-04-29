@@ -9,26 +9,27 @@ pub struct Frame {
 pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 
 pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
-    frames_str.split(',')
+    frames_str
+        .split(',')
         .map(|s| {
             let s = s.trim();
             let seconds = if s.ends_with('s') {
-                s[..s.len()-1].parse::<i32>().unwrap_or(0)
+                s[..s.len() - 1].parse::<i32>().unwrap_or(0)
             } else if s.ends_with('m') {
-                s[..s.len()-1].parse::<i32>().unwrap_or(0) * 60
+                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 60
             } else if s.ends_with('h') {
-                s[..s.len()-1].parse::<i32>().unwrap_or(0) * 3600
+                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 3600
             } else if s.ends_with('d') {
-                s[..s.len()-1].parse::<i32>().unwrap_or(0) * 86400
+                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 86400
             } else if s.ends_with('w') {
-                s[..s.len()-1].parse::<i32>().unwrap_or(0) * 604800
+                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 604800
             } else if s.ends_with('M') {
-                s[..s.len()-1].parse::<i32>().unwrap_or(0) * 2592000 // 30 days
+                s[..s.len() - 1].parse::<i32>().unwrap_or(0) * 2592000 // 30 days
             } else {
                 s.parse::<i32>().unwrap_or(0)
             };
             let name = if s.ends_with('M') {
-                format!("{}mon", &s[..s.len()-1])
+                format!("{}mon", &s[..s.len() - 1])
             } else {
                 s.to_string()
             };
@@ -45,7 +46,12 @@ pub struct SourceDef {
     pub mat_column: String,
 }
 
-pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32, scope_columns: &[String]) -> (String, Vec<SourceDef>) {
+pub fn derive_child_sql(
+    child_name: &str,
+    parent_name: &str,
+    frame_seconds: i32,
+    scope_columns: &[String],
+) -> (String, Vec<SourceDef>) {
     Spi::connect(|client| {
         let exists = client.select(
             "SELECT 1 FROM pg_class WHERE relname = $1",
@@ -56,18 +62,18 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
         let source_for_cols = if exists { child_name } else { parent_name };
 
         let query = format!(
-            "SELECT a.attname::text 
-             FROM pg_attribute a 
-             JOIN pg_class c ON a.attrelid = c.oid 
+            "SELECT a.attname::text
+             FROM pg_attribute a
+             JOIN pg_class c ON a.attrelid = c.oid
              WHERE c.relname = '{}' AND a.attnum > 0 AND NOT attisdropped",
             source_for_cols.replace("'", "''")
         );
         let columns = client.select(&query, None, &[])?;
-        
+
         let mut select_cols = vec![format!("to_timestamp(((spiral(t) / {0}) * {0})::double precision) as t", frame_seconds)];
         let mut group_by = vec!["(spiral(t) / {0}) * {0}".replace("{0}", &frame_seconds.to_string())];
         let mut sources = Vec::new();
-        
+
         let parent_is_view = client.select(
             "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
             Some(1),
@@ -77,7 +83,7 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
         for row in columns {
             let col = row.get::<String>(1)?.unwrap();
             if col == "t" { continue; }
-            
+
             if scope_columns.contains(&col) {
                 if !select_cols.iter().any(|s| s.contains(&format!("\"{}\"", col))) {
                     select_cols.push(format!("\"{}\"", col));
@@ -85,7 +91,7 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
                 }
                 continue;
             }
-            
+
             // Heuristic for mapping view columns back to base table columns
             let base_col: String;
             if col.ends_with("_stats") {
@@ -125,7 +131,7 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
                 sources.push(SourceDef { base_column: base_col, formula: "sum".to_string(), mat_column: col.clone() });
             }
         }
-        
+
         let scope_cols_str = scope_columns.iter().map(|s| format!("\"{}\"", s.trim())).collect::<Vec<_>>().join(", ");
 
         let index_sql = if scope_columns.is_empty() {
@@ -140,13 +146,13 @@ pub fn derive_child_sql(child_name: &str, parent_name: &str, frame_seconds: i32,
         };
 
         let sql = format!(
-            "CREATE TABLE {child_name} AS 
-             SELECT {select_cols} 
+            "CREATE TABLE {child_name} AS
+             SELECT {select_cols}
              FROM {parent_name}
              GROUP BY {group_by};
              {index_sql};",
             child_name = child_name,
-            select_cols = select_cols.join(", "), 
+            select_cols = select_cols.join(", "),
             parent_name = parent_name,
             group_by = group_by.join(", "),
             index_sql = index_sql
