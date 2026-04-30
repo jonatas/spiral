@@ -53,11 +53,15 @@ pub fn derive_child_sql(
     scope_columns: &[String],
 ) -> (String, Vec<SourceDef>) {
     Spi::connect(|client| {
-        let exists = !client.select(
+        let exists_res = client.select(
             "SELECT 1 FROM pg_class WHERE relname = $1",
             Some(1),
             unsafe { &[pgrx::datum::DatumWithOid::new(child_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
-        )?.first().is_empty();
+        );
+        let exists = match exists_res {
+            Ok(t) => !t.is_empty(),
+            Err(_) => false,
+        };
 
         let source_for_cols = if exists { child_name } else { parent_name };
 
@@ -74,11 +78,15 @@ pub fn derive_child_sql(
         let mut group_by = vec!["(spiral(t) / {0}) * {0}".replace("{0}", &frame_seconds.to_string())];
         let mut sources = Vec::new();
 
-        let parent_is_view = !client.select(
+        let parent_is_view_res = client.select(
             "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
             Some(1),
             unsafe { &[pgrx::datum::DatumWithOid::new(parent_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
-        )?.first().is_empty();
+        );
+        let parent_is_view = match parent_is_view_res {
+            Ok(t) => !t.is_empty(),
+            Err(_) => false,
+        };
 
         for row in columns {
             let col = row.get::<String>(1)?.unwrap();

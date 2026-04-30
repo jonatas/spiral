@@ -103,7 +103,7 @@ fn spiral_is_loaded() -> bool {
 #[pg_extern(immutable, parallel_safe)]
 fn spiral(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
     let micros = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
-    (micros / 1000000) + 946684800
+    micros / 1000000
 }
 
 #[pg_extern(immutable, parallel_safe, name = "spiral")]
@@ -308,7 +308,7 @@ fn spiral_to_epoch(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
 
 #[pg_extern]
 fn spiral_from_epoch(epoch: i64) -> pgrx::datum::TimestampWithTimeZone {
-    let micros = (epoch - 946684800) * 1000000;
+    let micros = epoch * 1000000;
     unsafe {
         pgrx::datum::TimestampWithTimeZone::from_datum(micros.into_datum().unwrap(), false).unwrap()
     }
@@ -334,23 +334,35 @@ fn spiral_status(base_table: &str) -> pgrx::JsonB {
 
         for row in table {
             let mut v_info = serde_json::Map::new();
-            let v_name = row.get::<String>(1)?.unwrap();
-            v_info.insert("frame_seconds".to_string(), serde_json::Value::from(row.get::<i32>(2)?.unwrap()));
-            v_info.insert("parent".to_string(), serde_json::Value::from(row.get::<String>(3)?.unwrap()));
+            let v_name = row.get::<String>(1)?.unwrap_or_default();
+            v_info.insert("frame_seconds".to_string(), serde_json::Value::from(row.get::<i32>(2)?.unwrap_or(0)));
+            v_info.insert("parent".to_string(), serde_json::Value::from(row.get::<String>(3)?.unwrap_or_default()));
 
-            let count = client.select(&format!("SELECT count(*) FROM \"{}\"", v_name.replace("\"", "\"\"")), Some(1), &[])?.get_one::<i64>()?.unwrap_or(0);
-            v_info.insert("row_count".to_string(), serde_json::Value::from(count));
+            if !v_name.is_empty() {
+                let count_query = format!("SELECT count(*) FROM \"{}\"", v_name.replace("\"", "\"\""));
+                let count = client.select(&count_query, Some(1), &[])?.get_one::<i64>()?.unwrap_or(0);
+                v_info.insert("row_count".to_string(), serde_json::Value::from(count));
+            }
 
             views.push(serde_json::Value::Object(v_info));
         }
         status.insert("hierarchy".to_string(), serde_json::Value::Array(views));
 
-        let dirty_count = client.select("SELECT count(*) FROM spiral.changelog WHERE base_view = $1", Some(1),
-            unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] })?.get_one::<i64>()?.unwrap_or(0);
+        let dirty_count_res = client.select("SELECT count(*) FROM spiral.changelog WHERE base_view = $1", Some(1),
+            unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] });
+        
+        let dirty_count = match dirty_count_res {
+            Ok(t) => t.get_one::<i64>().unwrap_or(Some(0)).unwrap_or(0),
+            Err(_) => 0,
+        };
         status.insert("dirty_segments_count".to_string(), serde_json::Value::from(dirty_count));
 
         Ok::<pgrx::JsonB, spi::Error>(pgrx::JsonB(serde_json::Value::Object(status)))
-    }).unwrap()
+    }).unwrap_or_else(|e| {
+        let mut err_map = serde_json::Map::new();
+        err_map.insert("error".to_string(), serde_json::Value::String(format!("{:?}", e)));
+        pgrx::JsonB(serde_json::Value::Object(err_map))
+    })
 }
 
 #[pg_extern(name = "spiral_refresh")]
@@ -379,7 +391,7 @@ fn spiral_register_view(
             pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)
         }],
     )
-    .unwrap()
+    .unwrap_or(Some(false))
     .unwrap_or(false);
 
     let source_table = if parent_view == "BASE" {
@@ -391,12 +403,20 @@ fn spiral_register_view(
         rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
 
     if !table_exists && !sql.is_empty() {
-        let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0",
-            view_name,
-            sql.split(" AS ").nth(1).unwrap().split(';').next().unwrap()
-        );
-        let _ = Spi::run(&create_sql);
+        let select_part = if let Some(part) = sql.splitn(2, " AS ").nth(1) {
+            part.split(';').next().unwrap_or("")
+        } else {
+            ""
+        };
+
+        if !select_part.is_empty() {
+            let create_sql = format!(
+                "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0",
+                view_name,
+                select_part
+            );
+            let _ = Spi::run(&create_sql);
+        }
     }
 
     catalog::insert_metadata(
@@ -447,7 +467,7 @@ fn spiral_register_view(
 }
 
 pub fn get_kickoff_epoch() -> i64 {
-    Spi::get_one::<i64>("SELECT spiral(COALESCE(current_setting('spiral.kickoff_date', true), '1970-01-01')::timestamptz)").unwrap_or(Some(0)).unwrap()
+    Spi::get_one::<i64>("SELECT spiral(COALESCE(NULLIF(current_setting('spiral.kickoff_date', true), ''), '2000-01-01')::timestamptz)").unwrap_or(Some(0)).unwrap_or(0)
 }
 
 pub fn get_minimal_pace() -> f64 {

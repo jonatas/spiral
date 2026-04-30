@@ -100,3 +100,37 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql
 SET search_path = public, spiral, "$user";
+
+-- Missing functions from demo.sql
+CREATE OR REPLACE FUNCTION to_spiraling_number(t BIGINT, cycle INTEGER, lane INTEGER) RETURNS BIGINT AS $$
+    SELECT spiral_zorder($1, ARRAY[$2::text, $3::text]);
+$$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION to_spiral(t BIGINT, cycle INTEGER) RETURNS BOX AS $$
+    SELECT box(point(($1 % $2)::double precision, ($1 / $2)::double precision), 
+               point(($1 % $2 + 10)::double precision, ($1 / $2 + 10)::double precision));
+$$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION spiral_create_partition(table_name TEXT, range_size BIGINT, partition_id INTEGER) RETURNS VOID AS $$
+DECLARE
+    v_start BIGINT := range_size * partition_id;
+    v_end BIGINT := range_size * (partition_id + 1);
+    v_part_name TEXT := table_name || '_' || partition_id;
+BEGIN
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)', 
+                   v_part_name, table_name, v_start, v_end);
+END;
+$$ LANGUAGE plpgsql;
+
+-- DOCS SUPPORT
+CREATE OR REPLACE VIEW spiral.available_sources AS
+SELECT 
+    m.base_view,
+    m.view_name,
+    m.frame_seconds,
+    s.base_column,
+    s.formula,
+    s.mat_column
+FROM spiral.metadata m
+JOIN spiral.sources s ON m.view_name = s.view_name
+ORDER BY m.base_view, m.frame_seconds;

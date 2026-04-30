@@ -30,20 +30,23 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)
+        .open(&path)
         .expect("Failed to open Main Store file");
 
     let kickoff = crate::get_kickoff_epoch();
+    notice!("Spiral: packing delta from '{}' to '{}' (kickoff={})", delta_table_name, path.display(), kickoff);
+    
     let _ = Spi::connect(|client| {
         let query = format!(
-            "SELECT (spiral(t) - {}) as t_rel, tenant_id, price FROM {} ORDER BY t ASC",
-            kickoff, delta_table_name
+            "SELECT (spiral(t) - {kickoff}) as t_rel, tenant_id, price FROM {delta_table_name} ORDER BY t ASC",
+            kickoff = kickoff, delta_table_name = delta_table_name
         );
         let tuple_table = client.select(&query, None, &[])?;
+        let mut count = 0;
 
         for row in tuple_table {
-            let t = row.get::<i64>(1)?.unwrap_or(0);
-            let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
+            let t = row.get::<i64>(1)?.unwrap_or(-1);
+            let tenant_id = row.get::<i64>(2)?.unwrap_or(-1);
             let price = row.get::<f64>(3)?.unwrap_or(0.0);
 
             if t < 0 || !(0..1024).contains(&tenant_id) {
@@ -52,9 +55,12 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
 
             let offset = (t * 1024 * 8) + (tenant_id * 8);
             if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
-                let _ = file.write_all(&price.to_le_bytes());
+                if file.write_all(&price.to_le_bytes()).is_ok() {
+                    count += 1;
+                }
             }
         }
+        notice!("Spiral: packed {} rows into O(1) store", count);
         Ok::<(), spi::Error>(())
     });
 }
@@ -157,10 +163,13 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
 pub fn spiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "");
     let mut file = File::open(path).ok()?;
-    if t < 0 || !(0..1024).contains(&tenant_id) {
+    let kickoff = crate::get_kickoff_epoch();
+    let t_rel = t - kickoff;
+
+    if t_rel < 0 || !(0..1024).contains(&tenant_id) {
         return None;
     }
-    let offset = (t * 1024 * 8) + (tenant_id * 8);
+    let offset = (t_rel * 1024 * 8) + (tenant_id * 8);
     file.seek(SeekFrom::Start(offset as u64)).ok()?;
     let mut buf = [0u8; 8];
     file.read_exact(&mut buf).ok()?;

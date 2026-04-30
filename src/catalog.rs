@@ -11,22 +11,23 @@ pub struct Metadata {
 
 pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     Spi::connect(|client| {
-        let row = unsafe {
+        let table = unsafe {
             client.select(
                 "SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata WHERE view_name = $1",
                 None,
                 &[DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value())]
-            ).unwrap().first()
+            )?
         };
-        if row.is_empty() {
+        if table.is_empty() {
             return Ok::<Option<Metadata>, spi::Error>(None);
         }
+        let row = table.first();
         Ok(Some(Metadata {
-            parent_view: row.get::<String>(1).unwrap().unwrap(),
-            frame_seconds: row.get::<i32>(2).unwrap().unwrap(),
-            base_view: row.get::<String>(3).unwrap().unwrap(),
-            scope_columns: row.get::<Vec<String>>(4).unwrap().unwrap(),
-            columns_metadata: row.get::<pgrx::JsonB>(5).unwrap().unwrap(),
+            parent_view: row.get::<String>(1)?.unwrap_or_default(),
+            frame_seconds: row.get::<i32>(2)?.unwrap_or(0),
+            base_view: row.get::<String>(3)?.unwrap_or_default(),
+            scope_columns: row.get::<Vec<String>>(4)?.unwrap_or_default(),
+            columns_metadata: row.get::<pgrx::JsonB>(5)?.unwrap_or_else(|| pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))),
         }))
     }).unwrap_or_else(|e| {
         notice!("Spiral: get_metadata error for '{}': {:?}", view_name, e);
@@ -42,11 +43,12 @@ pub fn get_children(view_name: &str) -> Vec<String> {
                 "SELECT view_name FROM spiral.metadata WHERE parent_view = $1 ORDER BY frame_seconds ASC",
                 None,
                 &[DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value())]
-            ).unwrap()
+            )?
         };
         for row in tuple_table {
-            let child = row.get::<String>(1).unwrap().unwrap();
-            children.push(child);
+            if let Ok(Some(child)) = row.get::<String>(1) {
+                children.push(child);
+            }
         }
         Ok::<Vec<String>, spi::Error>(children)
     }).unwrap_or_else(|e| {
@@ -57,7 +59,7 @@ pub fn get_children(view_name: &str) -> Vec<String> {
 
 pub fn is_spiral_relation(name: &str) -> bool {
     Spi::connect(|client| {
-        let row = unsafe {
+        let table = unsafe {
             client
                 .select(
                     "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
@@ -66,11 +68,9 @@ pub fn is_spiral_relation(name: &str) -> bool {
                         name.into_datum(),
                         PgBuiltInOids::TEXTOID.value(),
                     )],
-                )
-                .unwrap()
-                .first()
+                )?
         };
-        Ok::<bool, spi::Error>(!row.is_empty())
+        Ok::<bool, spi::Error>(!table.is_empty())
     })
     .unwrap_or(false)
 }
@@ -83,21 +83,23 @@ pub fn insert_metadata(
     scope_columns: Vec<String>,
     columns_metadata: pgrx::JsonB,
 ) {
-    unsafe {
-        Spi::run_with_args(
-            "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
-            &[
-                DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(parent_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(frame_seconds.into_datum(), PgBuiltInOids::INT4OID.value()),
-                DatumWithOid::new(base_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(scope_columns.into_datum(), PgBuiltInOids::TEXTARRAYOID.value()),
-                DatumWithOid::new(columns_metadata.into_datum(), PgBuiltInOids::JSONBOID.value()),
-            ],
-        ).unwrap();
-    }
+    let _ = Spi::connect(|_client| {
+        unsafe {
+            Spi::run_with_args(
+                "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
+                &[
+                    DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(parent_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(frame_seconds.into_datum().unwrap(), PgBuiltInOids::INT4OID.value()),
+                    DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(scope_columns.into_datum().unwrap(), PgBuiltInOids::TEXTARRAYOID.value()),
+                    DatumWithOid::new(columns_metadata.into_datum().unwrap(), PgBuiltInOids::JSONBOID.value()),
+                ],
+            )
+        }
+    });
 }
 
 pub fn insert_source(
@@ -109,22 +111,24 @@ pub fn insert_source(
     mat_column: &str,
     metadata: pgrx::JsonB,
 ) {
-    unsafe {
-        Spi::run_with_args(
-            "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (view_name, base_column, formula) DO UPDATE SET base_view = EXCLUDED.base_view, frame_seconds = EXCLUDED.frame_seconds, mat_column = EXCLUDED.mat_column, metadata = EXCLUDED.metadata",
-            &[
-                DatumWithOid::new(view_name.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(base_view.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(frame_seconds.into_datum(), PgBuiltInOids::INT4OID.value()),
-                DatumWithOid::new(base_column.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(formula.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(mat_column.into_datum(), PgBuiltInOids::TEXTOID.value()),
-                DatumWithOid::new(metadata.into_datum(), PgBuiltInOids::JSONBOID.value()),
-            ],
-        ).unwrap();
-    }
+    let _ = Spi::connect(|_client| {
+        unsafe {
+            Spi::run_with_args(
+                "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (view_name, base_column, formula) DO UPDATE SET base_view = EXCLUDED.base_view, frame_seconds = EXCLUDED.frame_seconds, mat_column = EXCLUDED.mat_column, metadata = EXCLUDED.metadata",
+                &[
+                    DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(frame_seconds.into_datum().unwrap(), PgBuiltInOids::INT4OID.value()),
+                    DatumWithOid::new(base_column.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(formula.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(mat_column.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(metadata.into_datum().unwrap(), PgBuiltInOids::JSONBOID.value()),
+                ],
+            )
+        }
+    });
 }
 
 pub fn unify_changelog(base_view: &str) {
