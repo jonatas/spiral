@@ -22,8 +22,19 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     hooks::init_hooks();
 }
 
+/// Computes the Z-order curve for a timestamp and a set of string dimensions.
+///
+/// Hashes string dimensions and interleaves their bits with the time bit representation.
+///
+/// # Examples
+/// ```rust
+/// use spiral::spiral_zorder;
+///
+/// let res = spiral_zorder(0, vec![]);
+/// assert_eq!(res, 0);
+/// ```
 #[pg_extern(immutable, parallel_safe)]
-fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
+pub fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
     let mut x = t as u32;
     let mut y = 0u32;
     for (i, dim) in dimensions.iter().enumerate() {
@@ -51,8 +62,19 @@ fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
     (x as i64) | ((y as i64) << 1)
 }
 
+/// Computes the Z-order curve for a timestamp and a set of integer dimensions.
+///
+/// Interleaves the lower bits of the dimensions with the time bit representation.
+///
+/// # Examples
+/// ```rust
+/// use spiral::spiral_zorder_int_array;
+///
+/// let res = spiral_zorder_int_array(1, vec![1]);
+/// assert_eq!(res, 3);
+/// ```
 #[pg_extern(immutable, parallel_safe, name = "spiral_zorder")]
-fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> i64 {
+pub fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> i64 {
     let mut x = t as u32;
     let mut y = 0u32;
     for (i, dim) in dimensions.iter().enumerate() {
@@ -74,8 +96,20 @@ fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> i64 {
     (x as i64) | ((y as i64) << 1)
 }
 
+/// Computes the 3D Z-order curve for a timestamp (`x`) and two integer dimensions (`y` and `z`).
+///
+/// # Examples
+/// ```rust
+/// use spiral::spiral_zorder_3d;
+///
+/// let res = spiral_zorder_3d(1, 1, 1);
+/// assert_eq!(res, 7);
+///
+/// let res2 = spiral_zorder_3d(2, 0, 0);
+/// assert_eq!(res2, 8);
+/// ```
 #[pg_extern(immutable, parallel_safe)]
-fn spiral_zorder_3d(x: i64, y: i32, z: i32) -> i64 {
+pub fn spiral_zorder_3d(x: i64, y: i32, z: i32) -> i64 {
     let mut res = 0i64;
     for i in 0..20 {
         res |= ((x >> i) & 1) << (3 * i);
@@ -85,8 +119,17 @@ fn spiral_zorder_3d(x: i64, y: i32, z: i32) -> i64 {
     res
 }
 
+/// Computes the 2D bit interleaving (similar to Hilbert curve pre-processing) for two integer dimensions.
+///
+/// # Examples
+/// ```rust
+/// use spiral::spiral_hilbert_2d;
+///
+/// let res = spiral_hilbert_2d(1, 1);
+/// assert_eq!(res, 3);
+/// ```
 #[pg_extern(immutable, parallel_safe)]
-fn spiral_hilbert_2d(x: i32, y: i32) -> i32 {
+pub fn spiral_hilbert_2d(x: i32, y: i32) -> i32 {
     let mut res = 0i32;
     for i in 0..15 {
         res |= ((x >> i) & 1) << (2 * i);

@@ -11,6 +11,21 @@ pub struct StatsState {
 }
 
 impl StatsState {
+    /// Adds a new value to the statistics state using Welford's online algorithm.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use spiral::stats::StatsState;
+    ///
+    /// let mut state = StatsState::default();
+    /// state.add(10.0);
+    /// state.add(20.0);
+    /// state.add(30.0);
+    ///
+    /// assert_eq!(state.mean(), 20.0);
+    /// assert_eq!(state.variance(), 100.0);
+    /// assert_eq!(state.stddev(), 10.0);
+    /// ```
     pub fn add(&mut self, x: f64) {
         let n1 = self.n;
         self.n += 1.0;
@@ -27,6 +42,26 @@ impl StatsState {
         self.m2 += term1;
     }
 
+    /// Merges another `StatsState` into this one, combining their statistics 
+    /// (Chan et al. parallel variance algorithm).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use spiral::stats::StatsState;
+    ///
+    /// let mut s1 = StatsState::default();
+    /// s1.add(10.0);
+    /// s1.add(20.0);
+    ///
+    /// let mut s2 = StatsState::default();
+    /// s2.add(30.0);
+    /// s2.add(40.0);
+    ///
+    /// s1.merge(&s2);
+    ///
+    /// assert_eq!(s1.mean(), 25.0);
+    /// assert!((s1.variance() - 166.66666666666666).abs() < 1e-9);
+    /// ```
     pub fn merge(&mut self, other: &Self) {
         if other.n == 0.0 {
             return;

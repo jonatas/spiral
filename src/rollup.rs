@@ -8,6 +8,23 @@ pub struct Frame {
 
 pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 
+/// Parses a comma-separated string of time frames into a vector of `Frame` structs.
+///
+/// This function understands suffixes like `s` (seconds), `m` (minutes), `h` (hours), 
+/// `d` (days), `w` (weeks), and `M` (months of 30 days).
+///
+/// # Examples
+///
+/// ```rust
+/// use spiral::rollup::parse_frames;
+///
+/// let frames = parse_frames("1m, 1h, 1M");
+/// 
+/// assert_eq!(frames.len(), 3);
+/// assert_eq!(frames[0].seconds, 60); // 1 minute
+/// assert_eq!(frames[1].seconds, 3600); // 1 hour
+/// assert_eq!(frames[2].seconds, 2592000); // 30 days
+/// ```
 pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
     frames_str
         .split(',')

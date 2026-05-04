@@ -943,7 +943,20 @@ unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
     pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query
 }
 
-fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool) -> String {
+/// Maps an aggregate function name to its corresponding column projection, 
+/// adjusting for whether it's querying a rollup view or the base table.
+///
+/// # Examples
+/// ```rust
+/// use spiral::hooks::map_agg_inner;
+///
+/// // When not querying a rollup, it preserves the aggregate function call.
+/// assert_eq!(map_agg_inner("SUM", "col_a", false), "SUM(\"col_a\")");
+///
+/// // When querying a rollup, it maps directly to the pre-aggregated column.
+/// assert_eq!(map_agg_inner("SUM", "col_a", true), "\"col_a\"");
+/// ```
+pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool) -> String {
     let lower = agg_fn.to_lowercase();
     if !is_rollup {
         return format!("{}(\"{}\")", agg_fn, mapped_col);
