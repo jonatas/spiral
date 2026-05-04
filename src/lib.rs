@@ -488,4 +488,102 @@ pub mod pg_test {
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         vec!["shared_preload_libraries = 'spiral'"]
     }
+
+    #[test]
+    fn test_spiral_zorder_3d() {
+        let res = crate::spiral_zorder_3d(1, 1, 1);
+        // x = 1, y = 1, z = 1
+        // x bit 0 => bit 0 = 1
+        // y bit 0 => bit 1 = 1
+        // z bit 0 => bit 2 = 1
+        // 0b111 = 7
+        assert_eq!(res, 7);
+
+        let res2 = crate::spiral_zorder_3d(2, 0, 0);
+        // x = 2 (0b10)
+        // bit 0 of x is 0 => bit 0 = 0
+        // bit 1 of x is 1 => bit 3 = 1 (8)
+        assert_eq!(res2, 8);
+    }
+
+    #[test]
+    fn test_spiral_hilbert_2d() {
+        let res = crate::spiral_hilbert_2d(1, 1);
+        // x = 1, y = 1
+        // x bit 0 => bit 0 = 1
+        // y bit 0 => bit 1 = 1
+        // 0b11 = 3
+        assert_eq!(res, 3);
+    }
+
+    #[test]
+    fn test_spiral_zorder_int_array() {
+        let res1 = crate::spiral_zorder_int_array(0, vec![0]);
+        assert_eq!(res1, 0);
+
+        let res2 = crate::spiral_zorder_int_array(1, vec![1]);
+        // x = 1, y = 1
+        // zorder interleaving: x=1 (0b01), y=1 (0b01) -> 0b11 = 3
+        assert_eq!(res2, 3);
+    }
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+    use crate::catalog;
+
+    #[pg_test]
+    fn test_pg_framework() {
+        // verify that pgrx spi connects and evaluates simple query
+        let result = pgrx::Spi::get_one::<i32>("SELECT 1 + 1");
+        assert_eq!(result, Ok(Some(2)));
+    }
+
+    #[pg_test]
+    fn test_catalog_is_spiral_relation() {
+        // Initially should be false for a random table
+        assert!(!catalog::is_spiral_relation("non_existent_table"));
+
+        // Let's insert some dummy metadata
+        catalog::insert_metadata(
+            "test_view",
+            "parent_view",
+            60,
+            "base_view",
+            vec!["col1".to_string()],
+            pgrx::JsonB(serde_json::json!({})),
+        );
+
+        assert!(catalog::is_spiral_relation("test_view"));
+    }
+
+    #[pg_test]
+    fn test_catalog_get_children() {
+        catalog::insert_metadata(
+            "child1",
+            "parent_view",
+            60,
+            "base_view",
+            vec![],
+            pgrx::JsonB(serde_json::json!({})),
+        );
+        catalog::insert_metadata(
+            "child2",
+            "parent_view",
+            300,
+            "base_view",
+            vec![],
+            pgrx::JsonB(serde_json::json!({})),
+        );
+
+        let children = catalog::get_children("parent_view");
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0], "child1");
+        assert_eq!(children[1], "child2");
+    }
+}
+
+
+

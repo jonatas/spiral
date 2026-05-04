@@ -206,3 +206,43 @@ pub fn derive_child_sql(
         error!("Spiral failed to derive child SQL for {}: {:?}", parent_name, e);
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_frames() {
+        let frames = parse_frames("1s,5m,1h,2d,1w,1M,123");
+        
+        assert_eq!(frames.len(), 7);
+        
+        assert_eq!(frames[0].name, "1s");
+        assert_eq!(frames[0].seconds, 1);
+
+        assert_eq!(frames[1].name, "5m");
+        assert_eq!(frames[1].seconds, 300);
+
+        assert_eq!(frames[2].name, "1h");
+        assert_eq!(frames[2].seconds, 3600);
+
+        assert_eq!(frames[3].name, "2d");
+        assert_eq!(frames[3].seconds, 172800);
+
+        assert_eq!(frames[4].name, "1w");
+        assert_eq!(frames[4].seconds, 604800);
+
+        assert_eq!(frames[5].name, "1mon");
+        assert_eq!(frames[5].seconds, 2592000);
+
+        assert_eq!(frames[6].name, "123");
+        assert_eq!(frames[6].seconds, 123);
+    }
+
+    #[test]
+    fn test_parse_frames_invalid() {
+        let frames = parse_frames("0s,-1m,abc");
+        assert_eq!(frames.len(), 0); // They should filter out or parse to 0
+    }
+}
+

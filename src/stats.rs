@@ -331,3 +331,41 @@ extension_sql!(
         spiral_sketch_combine
     ]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stats_state_add_and_mean() {
+        let mut state = StatsState::default();
+        state.add(10.0);
+        state.add(20.0);
+        state.add(30.0);
+        
+        assert_eq!(state.n, 3.0);
+        assert_eq!(state.mean(), 20.0);
+        assert_eq!(state.variance(), 100.0);
+        assert_eq!(state.stddev(), 10.0);
+        assert_eq!(state.skewness(), 0.0); // symmetrical
+        assert_eq!(state.kurtosis(), -1.5); // flat distribution
+    }
+
+    #[test]
+    fn test_stats_state_merge() {
+        let mut s1 = StatsState::default();
+        s1.add(10.0);
+        s1.add(20.0);
+        
+        let mut s2 = StatsState::default();
+        s2.add(30.0);
+        s2.add(40.0);
+        
+        s1.merge(&s2);
+        
+        assert_eq!(s1.n, 4.0);
+        assert_eq!(s1.mean(), 25.0);
+        assert!((s1.variance() - 166.66666666666666).abs() < 1e-9);
+    }
+}
+
