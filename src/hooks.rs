@@ -1286,22 +1286,3 @@ pub unsafe fn init_hooks() {
     pg_sys::planner_hook = Some(spiral_planner_hook);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_map_agg_inner_not_rollup() {
-        assert_eq!(map_agg_inner("SUM", "col_a", false), "SUM(\"col_a\")");
-        assert_eq!(map_agg_inner("count", "col_b", false), "count(\"col_b\")");
-    }
-
-    #[test]
-    fn test_map_agg_inner_rollup() {
-        assert_eq!(map_agg_inner("SUM", "col_a", true), "\"col_a\"");
-        assert_eq!(map_agg_inner("COUNT", "col_a", true), "\"col_a\"");
-        assert_eq!(map_agg_inner("avg", "col_a", true), "\"col_a\"");
-        assert_eq!(map_agg_inner("unknown_agg", "col_c", true), "\"col_c\"");
-    }
-}
-

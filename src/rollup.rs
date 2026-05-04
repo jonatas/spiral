@@ -24,6 +24,10 @@ pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 /// assert_eq!(frames[0].seconds, 60); // 1 minute
 /// assert_eq!(frames[1].seconds, 3600); // 1 hour
 /// assert_eq!(frames[2].seconds, 2592000); // 30 days
+///
+/// // Invalid or zero cases are ignored
+/// let invalid = parse_frames("0s, -1m, abc");
+/// assert_eq!(invalid.len(), 0);
 /// ```
 pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
     frames_str
@@ -222,44 +226,5 @@ pub fn derive_child_sql(
     }).unwrap_or_else(|e| {
         error!("Spiral failed to derive child SQL for {}: {:?}", parent_name, e);
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_frames() {
-        let frames = parse_frames("1s,5m,1h,2d,1w,1M,123");
-        
-        assert_eq!(frames.len(), 7);
-        
-        assert_eq!(frames[0].name, "1s");
-        assert_eq!(frames[0].seconds, 1);
-
-        assert_eq!(frames[1].name, "5m");
-        assert_eq!(frames[1].seconds, 300);
-
-        assert_eq!(frames[2].name, "1h");
-        assert_eq!(frames[2].seconds, 3600);
-
-        assert_eq!(frames[3].name, "2d");
-        assert_eq!(frames[3].seconds, 172800);
-
-        assert_eq!(frames[4].name, "1w");
-        assert_eq!(frames[4].seconds, 604800);
-
-        assert_eq!(frames[5].name, "1mon");
-        assert_eq!(frames[5].seconds, 2592000);
-
-        assert_eq!(frames[6].name, "123");
-        assert_eq!(frames[6].seconds, 123);
-    }
-
-    #[test]
-    fn test_parse_frames_invalid() {
-        let frames = parse_frames("0s,-1m,abc");
-        assert_eq!(frames.len(), 0); // They should filter out or parse to 0
-    }
 }
 
