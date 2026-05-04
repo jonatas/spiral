@@ -1,3 +1,4 @@
+LOAD 'spiral';
 SET spiral.kickoff_date = '2026-04-15';
 
 -- Test table with various magic comments
@@ -25,14 +26,14 @@ INSERT INTO sensors (t, sensor_id, voltage, current, status_code) VALUES
 ('2026-04-15 00:00:15Z', 2, 220.1, 0.5, 200);
 
 -- Refresh the views
-SELECT spiral_refresh('sensors_ohlcv_1m');
+SELECT spiral_refresh('sensors');
 
 -- Check 1m view
-SELECT t, sensor_id, v_o, v_h, v_l, v_c, total_readings, status_code_count
-FROM sensors_ohlcv_1m
+SELECT t, sensor_id, voltage_ohlcv_o, voltage_ohlcv_h, voltage_ohlcv_l, voltage_ohlcv_c, current, status_code
+FROM sensors_1m
 ORDER BY t, sensor_id;
 
 -- Check 1h view (should be automatically updated by cascading refresh)
-SELECT t, sensor_id, v_o, v_h, v_l, v_c, total_readings, status_code_count
-FROM sensors_ohlcv_1h
+SELECT t, sensor_id, voltage_ohlcv_o, voltage_ohlcv_h, voltage_ohlcv_l, voltage_ohlcv_c, current, status_code
+FROM sensors_1h
 ORDER BY t, sensor_id;

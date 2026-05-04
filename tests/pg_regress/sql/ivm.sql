@@ -1,3 +1,4 @@
+LOAD 'spiral';
 SET spiral.kickoff_date = '2026-04-15';
 
 CREATE TABLE metrics (
@@ -15,11 +16,11 @@ INSERT INTO metrics (t, device_id, val) VALUES
 ('2026-04-15 10:00:55Z', 'A', 20.0);
 
 -- Refresh
-SELECT spiral_refresh('metrics_ohlcv_1m');
+SELECT spiral_refresh('metrics');
 
 -- Check initial state
-SELECT t, device_id, val_o, val_h, val_l, val_c, val_sum 
-FROM metrics_ohlcv_1m;
+SELECT t, device_id, val_ohlcv_o, val_ohlcv_h, val_ohlcv_l, val_ohlcv_c, val_ohlcv_v 
+FROM metrics_1m;
 
 -- Update data (Backfill)
 UPDATE metrics SET val = 15.0 WHERE t = '2026-04-15 10:00:05Z' AND device_id = 'A';
@@ -29,11 +30,11 @@ SELECT base_view, to_timestamptz(t_start), to_timestamptz(t_end), scope_values
 FROM spiral.changelog;
 
 -- Refresh again
-SELECT spiral_refresh('metrics_ohlcv_1m');
+SELECT spiral_refresh('metrics');
 
 -- Check updated state
-SELECT t, device_id, val_o, val_h, val_l, val_c, val_sum 
-FROM metrics_ohlcv_1m;
+SELECT t, device_id, val_ohlcv_o, val_ohlcv_h, val_ohlcv_l, val_ohlcv_c, val_ohlcv_v 
+FROM metrics_1m;
 
 -- Delete data
 DELETE FROM metrics WHERE t = '2026-04-15 10:00:55Z' AND device_id = 'A';
@@ -45,8 +46,8 @@ FROM spiral.changelog;
 -- Refresh again (incremental MERGE should handle deletion by re-aggregating from parent)
 -- Note: MERGE in refresh_incremental doesn't handle deletions from the source table unless the source is empty for that bucket.
 -- In Spiral, it re-aggregates from the parent (or base table).
-SELECT spiral_refresh('metrics_ohlcv_1m');
+SELECT spiral_refresh('metrics');
 
 -- Check final state
-SELECT t, device_id, val_o, val_h, val_l, val_c, val_sum 
-FROM metrics_ohlcv_1m;
+SELECT t, device_id, val_ohlcv_o, val_ohlcv_h, val_ohlcv_l, val_ohlcv_c, val_ohlcv_v 
+FROM metrics_1m;

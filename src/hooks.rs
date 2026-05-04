@@ -112,14 +112,59 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
             }
 
             let query_str = CStr::from_ptr(query_string).to_string_lossy();
+            let mut extracted_frames = String::new();
+            let mut extracted_tenant = String::new();
+
+            let mut process_options = |list: *mut pg_sys::List| -> *mut pg_sys::List {
+                let mut new_options: *mut pg_sys::List = std::ptr::null_mut();
+                if list.is_null() { return new_options; }
+                for i in 0..(*list).length {
+                    let cell = pg_sys::list_nth(list, i) as *mut pg_sys::DefElem;
+                    let mut is_spiral = false;
+                    if !(*cell).defnamespace.is_null() {
+                        let ns = CStr::from_ptr((*cell).defnamespace).to_string_lossy();
+                        if ns == "spiral" {
+                            is_spiral = true;
+                            let defname = CStr::from_ptr((*cell).defname).to_string_lossy();
+                            if defname == "frames" {
+                                let arg = (*cell).arg;
+                                if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
+                                    let s = arg as *mut pg_sys::String;
+                                    extracted_frames = CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
+                                }
+                            } else if defname == "tenant" {
+                                let arg = (*cell).arg;
+                                if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
+                                    let s = arg as *mut pg_sys::String;
+                                    extracted_tenant = CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
+                                }
+                            }
+                        }
+                    }
+                    if !is_spiral {
+                        new_options = pg_sys::lappend(new_options, cell as *mut _);
+                    }
+                }
+                new_options
+            };
+
+            if tag == pg_sys::NodeTag::T_CreateStmt {
+                let stmt = utility_stmt as *mut pg_sys::CreateStmt;
+                (*stmt).options = process_options((*stmt).options);
+            } else if tag == pg_sys::NodeTag::T_CreateTableAsStmt {
+                let stmt = utility_stmt as *mut pg_sys::CreateTableAsStmt;
+                let into = (*stmt).into;
+                (*into).options = process_options((*into).options);
+            }
+
             notice!(
                 "Spiral: Utility hook caught CREATE relation '{}', query_str length={}",
                 name,
                 query_str.len()
             );
 
-            if query_str.contains("Spiral:") || query_str.contains("spiral_hierarchy") {
-                notice!("Spiral: Magic comments found, calling standard_ProcessUtility...");
+            if !extracted_frames.is_empty() {
+                notice!("Spiral: WITH parameters found, calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
                         pstmt,
@@ -145,31 +190,31 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 }
                 notice!("Spiral: standard_ProcessUtility returned, processing hierarchy...");
 
-                // 2. Parse frames or use defaults
-                let re_frames = regex::Regex::new(r"spiral_hierarchy\s*=\s*'([^']+)'").unwrap();
-                let frames_str = re_frames
-                    .captures(&query_str)
-                    .map(|m| m.get(1).unwrap().as_str().to_string())
-                    .unwrap_or_else(|| "1m, 1h, 1d".to_string());
+                // 2. Parse frames
+                let frames_str = extracted_frames.clone();
 
-                // 3. Detect Scope (Tenant) columns via Foreign Keys
-                let scope_columns = Spi::connect(|client| {
-                    let q = format!(
-                        "
-                        SELECT a.attname::text 
-                        FROM pg_constraint c 
-                        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
-                        WHERE c.contype = 'f' AND c.conrelid = '\"{}\"'::regclass",
-                        name.replace("\"", "\"\"")
-                    );
-                    Ok::<Vec<String>, spi::Error>(
-                        client
-                            .select(&q, None, &[])?
-                            .map(|r| r.get::<String>(1).unwrap().unwrap())
-                            .collect(),
-                    )
-                })
-                .unwrap_or_default();
+                // 3. Detect Scope (Tenant) columns via Foreign Keys or extracted tenant
+                let scope_columns = if !extracted_tenant.is_empty() {
+                    extracted_tenant.split(',').map(|s| s.trim().to_string()).collect()
+                } else {
+                    Spi::connect(|client| {
+                        let q = format!(
+                            "
+                            SELECT a.attname::text 
+                            FROM pg_constraint c 
+                            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+                            WHERE c.contype = 'f' AND c.conrelid = '\"{}\"'::regclass",
+                            name.replace("\"", "\"\"")
+                        );
+                        Ok::<Vec<String>, spi::Error>(
+                            client
+                                .select(&q, None, &[])?
+                                .map(|r| r.get::<String>(1).unwrap().unwrap())
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or_default()
+                };
 
                 let re_col =
                     regex::Regex::new(r"(\w+)\s+[\w\(\) ]+,?\s*--\s*Spiral:\s*([^\n\r]+)").unwrap();
@@ -187,6 +232,31 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     scope_columns.clone(),
                     pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
                 );
+
+                for event in &["INSERT", "UPDATE", "DELETE"] {
+                    let mut transition = String::new();
+                    if *event == "UPDATE" {
+                        transition.push_str("REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table ");
+                    } else if *event == "INSERT" {
+                        transition.push_str("REFERENCING NEW TABLE AS new_table ");
+                    } else if *event == "DELETE" {
+                        transition.push_str("REFERENCING OLD TABLE AS old_table ");
+                    }
+
+                    let trigger_sql = format!(
+                        "CREATE TRIGGER spiral_track_{base_view}_{event_lower}
+                         AFTER {event} ON \"{base_view}\"
+                         {transition}
+                         FOR EACH STATEMENT EXECUTE FUNCTION spiral.track_changes_stmt('{base_view}')",
+                        base_view = name,
+                        event = event,
+                        event_lower = event.to_lowercase(),
+                        transition = transition
+                    );
+                    if let Err(e) = Spi::run(&trigger_sql) {
+                        warning!("Spiral failed to create trigger: {:?}", e);
+                    }
+                }
 
                 // 5. Generate the entire hierarchy automatically
                 notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
@@ -330,7 +400,7 @@ unsafe fn build_time_constraints(
                                 pg_sys::TIMESTAMPTZOID => {
                                     let ts = i64::from_datum((*con).constvalue, (*con).constisnull)
                                         .unwrap();
-                                    Some(ts / 1000000 + 946684800)
+                                    Some(ts / 1000000)
                                 }
                                 _ => None,
                             };
@@ -693,7 +763,7 @@ pub fn generate_hierarchy_internal(
 
         let mut sources = Vec::new();
         let mut select_parts = vec![format!(
-            "to_timestamp(((spiral(t) / {0}) * {0})::double precision) as t",
+            "to_timestamp(((spiral(t) / {0}) * {0} + 946684800)::double precision) as t",
             frame.seconds
         )];
         let mut group_parts = vec![format!("(spiral(t) / {0}) * {0}", frame.seconds)];
@@ -719,6 +789,7 @@ pub fn generate_hierarchy_internal(
                             base_column: col.clone(),
                             formula: "stats".to_string(),
                             mat_column: mat,
+                            rollup_gsub_strategy: None,
                         });
                     }
                 }
@@ -730,6 +801,7 @@ pub fn generate_hierarchy_internal(
                             base_column: col.clone(),
                             formula: "ohlcv".to_string(),
                             mat_column: mat,
+                            rollup_gsub_strategy: None,
                         });
                     }
                 }
@@ -741,6 +813,7 @@ pub fn generate_hierarchy_internal(
                             base_column: col.clone(),
                             formula: "sketch".to_string(),
                             mat_column: mat,
+                            rollup_gsub_strategy: None,
                         });
                     }
                 }
@@ -757,7 +830,8 @@ pub fn generate_hierarchy_internal(
                             sources.push(rollup::SourceDef {
                                 base_column: col.clone(),
                                 formula: "sum".to_string(),
-                                mat_column: col,
+                                mat_column: col.clone(),
+                                rollup_gsub_strategy: None,
                             });
                         }
                 }
@@ -774,7 +848,11 @@ pub fn generate_hierarchy_internal(
                 if !seen_cols.insert(src.mat_column.clone()) {
                     continue;
                 }
-                if src.formula == "stats" {
+                if let Some(strategy) = &src.rollup_gsub_strategy {
+                    let sql = strategy.replace("rollup(\"\\1\")", &format!("\"{}\"", src.mat_column))
+                                      .replace("\\1", &src.mat_column);
+                    select_parts.push(sql);
+                } else if src.formula == "stats" {
                     select_parts.push(format!(
                         "spiral_stats_merge(\"{}\") as \"{}\"",
                         src.mat_column, src.mat_column
@@ -796,6 +874,7 @@ pub fn generate_hierarchy_internal(
                 sources.push(src);
             }
         }
+
 
         let scope_cols_str = scope_columns
             .iter()
@@ -830,6 +909,7 @@ pub fn generate_hierarchy_internal(
                         &src.base_column,
                         &src.formula,
                         &src.mat_column,
+                        src.rollup_gsub_strategy.as_deref(),
                         pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
                     );
                 }
@@ -950,7 +1030,7 @@ fn construct_union_sql_hierarchical(
         let mut inner_select = Vec::new();
         inner_select.push(format!(
             "to_timestamp({}::double precision) as t",
-            seg._t_start
+            seg._t_start + 946684800
         ));
         for (col, agg) in cols {
             if let Some(agg_fn) = agg {
@@ -1029,7 +1109,7 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     let metadata = catalog::get_metadata(base_name);
     let is_root = metadata
         .as_ref()
-        .map(|m| m.parent_view == "BASE")
+        .map(|m| m.parent_view == m.base_view)
         .unwrap_or(false);
     let real_base = metadata
         .as_ref()

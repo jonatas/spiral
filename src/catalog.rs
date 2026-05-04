@@ -109,14 +109,26 @@ pub fn insert_source(
     base_column: &str,
     formula: &str,
     mat_column: &str,
+    rollup_gsub_strategy: Option<&str>,
     metadata: pgrx::JsonB,
 ) {
+    let rgs_val = if let Some(s) = rollup_gsub_strategy {
+        format!("'{}'", s.replace("'", "''"))
+    } else {
+        "NULL".to_string()
+    };
+
+    let sql = format!(
+        "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, rollup_gsub_strategy, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, {}, $7)
+         ON CONFLICT (view_name, base_column, formula) DO UPDATE SET base_view = EXCLUDED.base_view, frame_seconds = EXCLUDED.frame_seconds, mat_column = EXCLUDED.mat_column, rollup_gsub_strategy = EXCLUDED.rollup_gsub_strategy, metadata = EXCLUDED.metadata",
+        rgs_val
+    );
+
     let _ = Spi::connect(|_client| {
         unsafe {
             Spi::run_with_args(
-                "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, metadata)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (view_name, base_column, formula) DO UPDATE SET base_view = EXCLUDED.base_view, frame_seconds = EXCLUDED.frame_seconds, mat_column = EXCLUDED.mat_column, metadata = EXCLUDED.metadata",
+                &sql,
                 &[
                     DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
                     DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),

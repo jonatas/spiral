@@ -30,11 +30,11 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 CREATE AGGREGATE first_pg(double precision, timestamptz) (sfunc = first_pg_sfunc, stype = time_value_pg);
 CREATE AGGREGATE last_pg(double precision, timestamptz) (sfunc = last_pg_sfunc, stype = time_value_pg);
 
-CREATE MATERIALIZED VIEW baseline_ohlcv_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
-CREATE MATERIALIZED VIEW baseline_ohlcv_5m AS SELECT date_trunc('minute', (t - ((extract(minute from t)::int % 5) || ' minutes')::interval)) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_ohlcv_1m GROUP BY 1, 2;
-CREATE MATERIALIZED VIEW baseline_ohlcv_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_ohlcv_5m GROUP BY 1, 2;
+CREATE MATERIALIZED VIEW baseline_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
+CREATE MATERIALIZED VIEW baseline_5m AS SELECT date_trunc('minute', (t - ((extract(minute from t)::int % 5) || ' minutes')::interval)) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_1m GROUP BY 1, 2;
+CREATE MATERIALIZED VIEW baseline_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_5m GROUP BY 1, 2;
 
-CREATE INDEX idx_baseline_ohlcv_1h_t_symbol ON baseline_ohlcv_1h (t, symbol_id);
+CREATE INDEX idx_baseline_1h_t_symbol ON baseline_1h (t, symbol_id);
 
 -- 4. SPIRAL SETUP
 CREATE TABLE spiral_ticks (
@@ -42,12 +42,12 @@ CREATE TABLE spiral_ticks (
     symbol_id int NOT NULL,
     price double precision, -- Spiral: ohlcv, sketch
     vol int                 -- Spiral: sum
-); -- spiral_hierarchy = '1m, 5m, 1h'
+) WITH (spiral.frames = '1m, 5m, 1h');
 
 CREATE INDEX idx_spiral_ticks_t_symbol ON spiral_ticks (t, symbol_id);
 
 -- Wait for refresh
-SELECT spiral_refresh('spiral_ticks_ohlcv_1m');
+SELECT spiral_refresh('spiral_ticks_1m');
 
 -- 5. BENCHMARK EXECUTION
 DO $$
@@ -78,13 +78,13 @@ BEGIN
     RAISE NOTICE '--- Starting Refresh ---';
     
     start_time := clock_timestamp();
-    REFRESH MATERIALIZED VIEW baseline_ohlcv_1m;
-    REFRESH MATERIALIZED VIEW baseline_ohlcv_5m;
-    REFRESH MATERIALIZED VIEW baseline_ohlcv_1h;
+    REFRESH MATERIALIZED VIEW baseline_1m;
+    REFRESH MATERIALIZED VIEW baseline_5m;
+    REFRESH MATERIALIZED VIEW baseline_1h;
     dur_refresh_base := clock_timestamp() - start_time;
 
     start_time := clock_timestamp();
-    PERFORM spiral_refresh('spiral_ticks_ohlcv_1m');
+    PERFORM spiral_refresh('spiral_ticks');
     dur_refresh_aspi := clock_timestamp() - start_time;
 
     RAISE NOTICE '--- Testing Binary Pack (Main Store) ---';
@@ -114,17 +114,17 @@ SELECT
 FROM pg_class 
 WHERE relname IN (
     'baseline_ticks', 'spiral_ticks',
-    'baseline_ohlcv_1m', 'baseline_ohlcv_5m', 'baseline_ohlcv_1h',
-    'spiral_ohlcv_1m', 'spiral_ohlcv_5m', 'spiral_ohlcv_1h'
+    'baseline_1m', 'baseline_5m', 'baseline_1h',
+    'spiral_1m', 'spiral_5m', 'spiral_1h'
 )
 ORDER BY relname;
 
 -- 7. QUERY SAMPLES (Rollup vs. Raw)
 SELECT '--- Query: 1h Rollup for Symbol 5 (Baseline View) ---' as test;
-EXPLAIN ANALYZE SELECT * FROM baseline_ohlcv_1h WHERE symbol_id = 5 ORDER BY t DESC LIMIT 5;
+EXPLAIN ANALYZE SELECT * FROM baseline_1h WHERE symbol_id = 5 ORDER BY t DESC LIMIT 5;
 
 SELECT '--- Query: 1h Rollup for Symbol 5 (Spiral View) ---' as test;
-EXPLAIN ANALYZE SELECT * FROM spiral_ohlcv_1h WHERE symbol_id = 5 ORDER BY t DESC LIMIT 5;
+EXPLAIN ANALYZE SELECT * FROM spiral_1h WHERE symbol_id = 5 ORDER BY t DESC LIMIT 5;
 
 SELECT '--- Query: 1h Rollup for Symbol 5 (RAW DATA - No View) ---' as test;
 EXPLAIN ANALYZE 
@@ -143,7 +143,7 @@ ORDER BY t DESC LIMIT 5;
 
 -- 8. PERCENTILE COMPARISON (Sketch vs. Raw)
 SELECT '--- Query: P95 Price for Symbol 5 (Spiral Sketch - 1h View) ---' as test;
-EXPLAIN ANALYZE SELECT symbol_id, spiral_quantile(price_sketch, 0.95) FROM spiral_ohlcv_1h WHERE symbol_id = 5;
+EXPLAIN ANALYZE SELECT symbol_id, spiral_quantile(price_sketch, 0.95) FROM spiral_1h WHERE symbol_id = 5;
 
 SELECT '--- Query: P95 Price for Symbol 5 (RAW DATA - percentile_cont) ---' as test;
 EXPLAIN ANALYZE 
@@ -154,7 +154,7 @@ GROUP BY 1;
 
 -- 9. AGGREGATION SCALING (Large Window)
 SELECT '--- Query: Total Volume for all Symbols (Spiral 1h View) ---' as test;
-EXPLAIN ANALYZE SELECT symbol_id, sum(volume) FROM spiral_ohlcv_1h GROUP BY 1;
+EXPLAIN ANALYZE SELECT symbol_id, sum(volume) FROM spiral_1h GROUP BY 1;
 
 SELECT '--- Query: Total Volume for all Symbols (RAW DATA) ---' as test;
 EXPLAIN ANALYZE SELECT symbol_id, sum(vol) FROM baseline_ticks GROUP BY 1;

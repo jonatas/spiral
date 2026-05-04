@@ -198,101 +198,103 @@ fn refresh_incremental(
         .map(|c| format!("\"{}\"", c))
         .collect();
 
-    let (sql_child, _) =
-        rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
-    if sql_child.is_empty() {
-        return false;
-    }
-    let select_part = sql_child
-        .split("SELECT")
-        .nth(1)
-        .unwrap()
-        .split("FROM")
-        .next()
-        .unwrap()
-        .trim();
+    if frame_seconds > 0 {
+        let (sql_child, _) =
+            rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
+        if sql_child.is_empty() {
+            return false;
+        }
+        let select_part = sql_child
+            .split("SELECT")
+            .nth(1)
+            .unwrap()
+            .split("FROM")
+            .next()
+            .unwrap()
+            .trim();
 
-    let mut on_clause = vec!["target.t::timestamptz = source.t::timestamptz".to_string()];
-    for col in &scope_cols {
-        on_clause.push(format!("target.{} = source.{}", col, col));
-    }
-    let update_set = update_cols
-        .iter()
-        .map(|c| format!("{} = source.{}", c, c))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut source_where = if scope_cols_raw.is_empty() {
-        format!(
-            "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
-                AND spiral(t) >= (c.t_start/{0})*{0}
-                AND spiral(t) < ((c.t_end/{0})+1)*{0}
-                AND c.scope_values = '{{}}'::jsonb",
-            frame_seconds,
-            changelog_key = changelog_key.replace("'", "''")
-        )
-    } else {
-        let scope_cols_json = scope_cols_raw
+        let mut on_clause = vec!["target.t::timestamptz = source.t::timestamptz".to_string()];
+        for col in &scope_cols {
+            on_clause.push(format!("target.{} = source.{}", col, col));
+        }
+        let update_set = update_cols
             .iter()
-            .map(|s| format!("'{}', \"{}\"::text", s, s))
+            .map(|c| format!("{} = source.{}", c, c))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
-            "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
-                AND spiral(t) >= (c.t_start/{0})*{0}
-                AND spiral(t) < ((c.t_end/{0})+1)*{0}
-                AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
-            frame_seconds,
-            scope_cols_json,
-            changelog_key = changelog_key.replace("'", "''")
-        )
-    };
-    if let Some(ref extra) = extra_where {
-        source_where.push_str(&format!(" WHERE ({})", extra));
-    }
 
-    let group_by_clause = if scope_cols.is_empty() {
-        "1".to_string()
-    } else {
-        format!("1, {}", scope_cols.join(", "))
-    };
-
-    let merge_sql = format!(
-        "MERGE INTO \"{view_name}\" AS target
-            USING (
-                SELECT {select_part} FROM \"{source_table}\"
-                {source_where}
-                GROUP BY {group_by_clause}
-            ) AS source
-            ON ({on_clause})
-            WHEN MATCHED THEN UPDATE SET {update_set}
-            WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
-        view_name = view_name,
-        select_part = select_part,
-        source_table = source_table,
-        source_where = source_where,
-        group_by_clause = group_by_clause,
-        on_clause = on_clause.join(" AND "),
-        update_set = if update_set.is_empty() {
-            "t = source.t"
+        let mut source_where = if scope_cols_raw.is_empty() {
+            format!(
+                "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
+                    AND spiral(t) >= (c.t_start/{0})*{0}
+                    AND spiral(t) < ((c.t_end/{0})+1)*{0}
+                    AND c.scope_values = '{{}}'::jsonb",
+                frame_seconds,
+                changelog_key = changelog_key.replace("'", "''")
+            )
         } else {
-            &update_set
-        },
-        all_cols_joined = all_cols
-            .iter()
-            .map(|c| format!("\"{}\"", c))
-            .collect::<Vec<_>>()
-            .join(", "),
-        source_cols_joined = all_cols
-            .iter()
-            .map(|c| format!("source.\"{}\"", c))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            let scope_cols_json = scope_cols_raw
+                .iter()
+                .map(|s| format!("'{}', \"{}\"::text", s, s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
+                    AND spiral(t) >= (c.t_start/{0})*{0}
+                    AND spiral(t) < ((c.t_end/{0})+1)*{0}
+                    AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
+                frame_seconds,
+                scope_cols_json,
+                changelog_key = changelog_key.replace("'", "''")
+            )
+        };
+        if let Some(ref extra) = extra_where {
+            source_where.push_str(&format!(" WHERE ({})", extra));
+        }
 
-    SKIP_ACCELERATION.with(|s| s.set(true));
-    let _ = Spi::run(&merge_sql);
-    SKIP_ACCELERATION.with(|s| s.set(false));
+        let group_by_clause = if scope_cols.is_empty() {
+            "1".to_string()
+        } else {
+            format!("1, {}", scope_cols.join(", "))
+        };
+
+        let merge_sql = format!(
+            "MERGE INTO \"{view_name}\" AS target
+                USING (
+                    SELECT {select_part} FROM \"{source_table}\"
+                    {source_where}
+                    GROUP BY {group_by_clause}
+                ) AS source
+                ON ({on_clause})
+                WHEN MATCHED THEN UPDATE SET {update_set}
+                WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
+            view_name = view_name,
+            select_part = select_part,
+            source_table = source_table,
+            source_where = source_where,
+            group_by_clause = group_by_clause,
+            on_clause = on_clause.join(" AND "),
+            update_set = if update_set.is_empty() {
+                "t = source.t"
+            } else {
+                &update_set
+            },
+            all_cols_joined = all_cols
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            source_cols_joined = all_cols
+                .iter()
+                .map(|c| format!("source.\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        SKIP_ACCELERATION.with(|s| s.set(true));
+        let _ = Spi::run(&merge_sql);
+        SKIP_ACCELERATION.with(|s| s.set(false));
+    }
 
     let children = catalog::get_children(view_name);
     for child in children {
@@ -436,6 +438,7 @@ fn spiral_register_view(
             &src.base_column,
             &src.formula,
             &src.mat_column,
+            src.rollup_gsub_strategy.as_deref(),
             pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
         );
     }

@@ -5,24 +5,26 @@
 ## 🚀 Key Features (Experimental)
 
 ### 1. Magic Comments (Zero-Config Pipelines)
-Define analytics pipelines directly within your `CREATE TABLE` statement. Spiral parses SQL comments to generate materialized view hierarchies for testing.
+Define analytics pipelines directly within your `CREATE TABLE` statement. Spiral parses SQL comments to generate persistent metadata and rollup strategies.
 
 ```sql
 CREATE TABLE sensor_readings (
     t timestamptz NOT NULL,
-    sensor_id int REFERENCES sensors(id), -- Auto-detected as tenant!
+    sensor_id int REFERENCES sensors(id),
     voltage double precision, -- Spiral: ohlc as v, stats as v_stats
     current double precision, -- Spiral: stats
-    status_code int           -- Spiral: count as total_events
-); -- Hierarchy 1m -> 1d -> 1mon created automatically
+    status_code int           -- Spiral: sum
+) WITH (
+    spiral.frames = '1m, 1d, 1mon',
+    spiral.tenant = 'sensor_id'
+);
 ```
 
 **What happens automatically:**
-- **Smart Defaults**:
+- **Smart Defaults & Parsing**:
     - **Time Detection**: Automatically picks the first `timestamptz`, `timestamp`, `date`, or `bigint` column.
-    - **Tenant Detection**: Automatically identifies columns with **Foreign Key** constraints as tenant dimensions.
-    - **Default Frames**: If no frames are provided, Spiral defaults to `1m, 1d, 1mon`.
-- **Automated Hierarchy**: Views for the detected frames are created and wired together.
+    - **Frames & Tenant**: Strictly parsed from the `WITH (spiral.frames='...', spiral.tenant='...')` clause. Without `spiral.frames`, the table will not be tracked by Spiral.
+- **Metadata-Driven Hierarchy**: Instead of relying on hardcoded naming conventions (like `_stats`), Spiral now generates and persists a **Rollup Strategy** for each column in `spiral.sources`.
 - **Intelligent Naming & Aliasing**: 
     - Single-formula columns keep their original name.
     - Use `as alias` in comments for custom column names.
@@ -30,7 +32,26 @@ CREATE TABLE sensor_readings (
 
 ---
 
-### 2. Advanced Hierarchical Statistics
+### 2. Advanced Rollup Customization (GSub Strategies)
+Spiral's rollup engine is no longer bound by column name suffixes. Every rollup is driven by the `rollup_gsub_strategy` column in `spiral.sources`.
+
+- **Dynamic Substitutions**: Use `rollup("\1")` to refer to the source column (either raw or from a parent tier) and `"\1"` to refer to the target materialized column.
+- **Custom Formulas**: You can manually update `spiral.sources` to implement specialized rollup logic.
+
+**Example Strategy Injection:**
+```sql
+-- Internally generated for 'stats' formula:
+-- rollup_gsub_strategy = 'spiral_stats_merge(rollup("\1")) as "\1"'
+
+-- You can replace it with custom logic:
+UPDATE spiral.sources 
+SET rollup_gsub_strategy = 'my_custom_agg(rollup("\1")) as "\1"' 
+WHERE mat_column = 'my_col';
+```
+
+---
+
+### 3. Advanced Hierarchical Statistics
 Spiral implements **Welford-style parallel merging algorithms** for higher-order moments. This allows complex statistics to be rolled up across timeframes with $O(1)$ efficiency, avoiding full table scans.
 
 | Function | Business Scenario | Dashboard Insight |
@@ -47,7 +68,7 @@ SELECT
     spiral_stats_mean(current) as avg_curr,
     spiral_stats_stddev(current) as volatility,
     spiral_stats_kurtosis(current) as risk_factor
-FROM sensor_readings_ohlcv_1h
+FROM sensor_readings_1h
 WHERE risk_factor > 3.0; -- Instant detection of extreme anomalies
 ```
 
@@ -158,7 +179,7 @@ SELECT spiral_pack_delta_zero('backup_ticks', new_ticks_oid);
 The fastest way to learn Spiral is through the [Short Walkthrough](examples/short_walkthrough.sql).
 
 ```bash
-cargo pgrx run pg16 < examples/short_walkthrough.sql
+cargo pgrx run pg18 < examples/short_walkthrough.sql
 ```
 
 ### Basic Usage
@@ -169,16 +190,19 @@ CREATE EXTENSION spiral;
 -- Set your "Day Zero"
 SET spiral.kickoff_date = '2026-04-15';
 
--- Define your data (Smart Detection will handle the rest)
+-- Define your data and frames
 CREATE TABLE ticks (
     t timestamptz NOT NULL,
     symbol_id int REFERENCES symbols(id),
     price numeric, -- Spiral: ohlc, stats
     vol int        -- Spiral: sum
+) WITH (
+    spiral.frames = '1m',
+    spiral.tenant = 'symbol_id'
 );
 
 -- Background worker handles refreshes, or manual refresh:
-SELECT spiral_refresh('ticks_ohlcv_1m');
+SELECT spiral_refresh('ticks_1m');
 ```
 
 ## 🧪 Benchmarks & Examples
@@ -195,11 +219,7 @@ Spiral is currently being tested on **PostgreSQL 16, 17, and 18**.
 To run the framework locally with your preferred PostgreSQL version:
 
 ```bash
-# For PostgreSQL 16
-cargo pgrx run pg16
-
-# For PostgreSQL 18
-cargo pgrx run pg18 --no-default-features --features pg18
+cargo pgrx run pg18
 ```
 
 For certain hooks to function correctly, you must add `spiral` to your `shared_preload_libraries` in `postgresql.conf`:

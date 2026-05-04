@@ -81,13 +81,13 @@ CREATE INDEX idx_spiral_ticks_spiral_t ON spiral_ticks (symbol_id, spiral(t));
 
 -- 6. VIEW CREATION (Initial Aggregation)
 \echo '--- Creating Baseline Views (Aggregating 10M rows) ---'
-CREATE MATERIALIZED VIEW baseline_ohlcv_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
-CREATE MATERIALIZED VIEW baseline_ohlcv_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_ohlcv_1m GROUP BY 1, 2;
-CREATE INDEX idx_baseline_ohlcv_1h_t_symbol ON baseline_ohlcv_1h (t, symbol_id);
+CREATE MATERIALIZED VIEW baseline_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
+CREATE MATERIALIZED VIEW baseline_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_1m GROUP BY 1, 2;
+CREATE INDEX idx_baseline_1h_t_symbol ON baseline_1h (t, symbol_id);
 
 \echo '--- Creating Spiral Hierarchy (Aggregating 10M rows + Sketches) ---'
--- This will automatically create spiral_ohlcv_5m and spiral_ohlcv_1h due to our fix in hooks.rs
-CREATE MATERIALIZED VIEW spiral_ohlcv_1m WITH (spiral.frames='5m,1h') AS 
+-- This will automatically create spiral_5m and spiral_1h due to our fix in hooks.rs
+CREATE MATERIALIZED VIEW spiral_1m WITH (spiral.frames='5m,1h') AS 
 SELECT 
     to_timestamptz((spiral(t)/60)*60) as t, 
     symbol_id,
@@ -97,21 +97,21 @@ SELECT
 FROM spiral_ticks 
 GROUP BY 1, 2;
 
-CREATE INDEX idx_spiral_ohlcv_1h_t_symbol ON spiral_ohlcv_1h (t, symbol_id);
+CREATE INDEX idx_spiral_1h_t_symbol ON spiral_1h (t, symbol_id);
 
 -- 7. PERFORMANCE QUERIES
 \echo '--- P95 Percentile: Raw Data (10M Rows) ---'
 EXPLAIN ANALYZE SELECT symbol_id, percentile_cont(0.95) WITHIN GROUP (ORDER BY price) FROM baseline_ticks WHERE symbol_id = 5 GROUP BY 1;
 
 \echo '--- P95 Percentile: Spiral Sketch (Pre-aggregated 1h) ---'
-EXPLAIN ANALYZE SELECT symbol_id, spiral_quantile(price_sketch, 0.95) FROM spiral_ohlcv_1h WHERE symbol_id = 5;
+EXPLAIN ANALYZE SELECT symbol_id, spiral_quantile(price_sketch, 0.95) FROM spiral_1h WHERE symbol_id = 5;
 
 -- STORAGE
 SELECT 
     relname as name,
     pg_size_pretty(pg_total_relation_size(oid)) as total_size
 FROM pg_class 
-WHERE relname IN ('baseline_ticks', 'spiral_ticks', 'spiral_ohlcv_1h', 'baseline_ohlcv_1h', 'spiral_ohlcv_1m', 'baseline_ohlcv_1m')
+WHERE relname IN ('baseline_ticks', 'spiral_ticks', 'spiral_1h', 'baseline_1h', 'spiral_1m', 'baseline_1m')
 ORDER BY relname;
 \n\n-- Acceleration Tests from 1B scenario\n
 -- Benchmark: Spiral 1 Billion Row Transparent Acceleration
@@ -133,9 +133,9 @@ CREATE TABLE stress_raw (
 );
 
 -- Register Spiral Hierarchy
-SELECT spiral_register_view('stress_raw_ohlcv_1m', 'BASE', 60, 'stress_raw', ARRAY[]::text[]);
-SELECT spiral_register_view('stress_raw_ohlcv_1h', 'stress_raw_ohlcv_1m', 3600, 'stress_raw', ARRAY[]::text[]);
-SELECT spiral_register_view('stress_raw_ohlcv_1d', 'stress_raw_ohlcv_1h', 86400, 'stress_raw', ARRAY[]::text[]);
+SELECT spiral_register_view('stress_raw_1m', 'BASE', 60, 'stress_raw', ARRAY[]::text[]);
+SELECT spiral_register_view('stress_raw_1h', 'stress_raw_1m', 3600, 'stress_raw', ARRAY[]::text[]);
+SELECT spiral_register_view('stress_raw_1d', 'stress_raw_1h', 86400, 'stress_raw', ARRAY[]::text[]);
 
 -- 2. Fast Ingestion (10 Million Rows)
 CREATE OR REPLACE PROCEDURE ingest_demo_data(total_target BIGINT, batch_size INT)
@@ -167,7 +167,7 @@ CALL ingest_demo_data(10000000, 1000000);
 \echo 'Changelog state before refresh:'
 SELECT * FROM spiral.changelog;
 
-SELECT spiral_refresh('stress_raw_ohlcv_1m'); 
+SELECT spiral_refresh('stress_raw'); 
 
 \echo 'Changelog state after refresh:'
 SELECT * FROM spiral.changelog;

@@ -1,3 +1,4 @@
+LOAD 'spiral';
 -- Test for table isolation
 SET spiral.kickoff_date = '2026-04-15';
 
@@ -14,8 +15,8 @@ CREATE TABLE table2 (
 INSERT INTO table1 VALUES ('2026-04-15 10:00:05Z', 10.0);
 INSERT INTO table2 VALUES ('2026-04-15 10:00:05Z', 20.0);
 
-SELECT spiral_refresh('table1_sum_1m');
-SELECT spiral_refresh('table2_sum_1m');
+SELECT spiral_refresh('table1');
+SELECT spiral_refresh('table2');
 
 -- Dirty table1
 UPDATE table1 SET val = 15.0;

@@ -5,9 +5,9 @@
 DROP EXTENSION IF EXISTS spiral CASCADE;
 DROP TABLE IF EXISTS baseline_ticks CASCADE;
 DROP TABLE IF EXISTS spiral_ticks CASCADE;
-DROP TABLE IF EXISTS spiral_ohlcv_1m CASCADE;
-DROP TABLE IF EXISTS spiral_ohlcv_5m CASCADE;
-DROP TABLE IF EXISTS spiral_ohlcv_1h CASCADE;
+DROP TABLE IF EXISTS spiral_1m CASCADE;
+DROP TABLE IF EXISTS spiral_5m CASCADE;
+DROP TABLE IF EXISTS spiral_1h CASCADE;
 DROP TYPE IF EXISTS time_value_pg CASCADE;
 
 -- 2. SETUP
@@ -55,25 +55,25 @@ END $$;
 
 -- 4. HIERARCHY CREATION
 \echo '--- Creating Baseline Views ---'
-CREATE MATERIALIZED VIEW baseline_ohlcv_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
-CREATE MATERIALIZED VIEW baseline_ohlcv_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_ohlcv_1m GROUP BY 1, 2;
+CREATE MATERIALIZED VIEW baseline_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
+CREATE MATERIALIZED VIEW baseline_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_1m GROUP BY 1, 2;
 
 \echo '--- Creating Spiral Views ---'
-CREATE UNLOGGED TABLE spiral_ohlcv_1m AS 
+CREATE UNLOGGED TABLE spiral_1m AS 
 SELECT to_timestamptz((spiral(t)/60)*60) as t, symbol_id,
     min(price) as o, max(price) as h, min(price) as l, max(price) as c,
     sum(vol) as volume, spiral_sketch(price) as price_sketch
 FROM spiral_ticks GROUP BY 1, 2;
 
-CREATE UNLOGGED TABLE spiral_ohlcv_1h AS 
+CREATE UNLOGGED TABLE spiral_1h AS 
 SELECT to_timestamptz((spiral(t)/3600)*3600) as t, symbol_id,
     min(o) as o, max(h) as h, min(l) as l, max(c) as c,
     sum(volume) as volume, spiral_sketch_merge(price_sketch) as price_sketch
-FROM spiral_ohlcv_1m GROUP BY 1, 2;
+FROM spiral_1m GROUP BY 1, 2;
 
 -- Inform Spiral about these views manually
-SELECT spiral_register_view('spiral_ohlcv_1m', 'BASE', 60, 'spiral_ticks', ARRAY['symbol_id']);
-SELECT spiral_register_view('spiral_ohlcv_1h', 'spiral_ohlcv_1m', 3600, 'spiral_ticks', ARRAY['symbol_id']);
+SELECT spiral_register_view('spiral_1m', 'BASE', 60, 'spiral_ticks', ARRAY['symbol_id']);
+SELECT spiral_register_view('spiral_1h', 'spiral_1m', 3600, 'spiral_ticks', ARRAY['symbol_id']);
 
 
 -- 5. QUERY PERFORMANCE
@@ -81,9 +81,9 @@ SELECT spiral_register_view('spiral_ohlcv_1h', 'spiral_ohlcv_1m', 3600, 'spiral_
 EXPLAIN ANALYZE SELECT symbol_id, percentile_cont(0.95) WITHIN GROUP (ORDER BY price) FROM baseline_ticks WHERE symbol_id = 5 GROUP BY 1;
 
 \echo '--- P95 Percentile: Spiral Sketch (Pre-aggregated 1h) ---'
-EXPLAIN ANALYZE SELECT symbol_id, spiral_quantile(price_sketch, 0.95) FROM spiral_ohlcv_1h WHERE symbol_id = 5;
+EXPLAIN ANALYZE SELECT symbol_id, spiral_quantile(price_sketch, 0.95) FROM spiral_1h WHERE symbol_id = 5;
 
 -- 6. STORAGE
 SELECT relname as name, pg_size_pretty(pg_total_relation_size(oid)) as total_size
-FROM pg_class WHERE relname IN ('baseline_ticks', 'spiral_ticks', 'spiral_ohlcv_1h', 'baseline_ohlcv_1h')
+FROM pg_class WHERE relname IN ('baseline_ticks', 'spiral_ticks', 'spiral_1h', 'baseline_1h')
 ORDER BY relname;

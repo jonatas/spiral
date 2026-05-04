@@ -5,7 +5,7 @@ LOAD 'spiral';
 -- 1. Setup Data for a multi-day range
 SET spiral.kickoff_date = '2026-04-15';
 DROP TABLE IF EXISTS tz_test CASCADE;
-CREATE TABLE tz_test (t timestamptz NOT NULL, val double precision);
+CREATE TABLE tz_test (t timestamptz NOT NULL, val double precision) WITH (spiral.frames = '1d, 1mon');
 
 -- Register Hierarchy
 SELECT spiral_register_view('tz_test_1m', 'BASE', 60, 'tz_test', ARRAY[]::text[]);
@@ -18,7 +18,7 @@ SELECT '2026-04-15 00:00:00Z'::timestamptz + (n || ' minutes')::interval, 1.0
 FROM generate_series(0, 60 * 24 * 3) n;
 
 -- Materialize
-SELECT spiral_refresh('tz_test_1m');
+SELECT spiral_refresh('tz_test');
 
 -- ============================================================================
 -- TEST 1: UTC Baseline (Perfect Alignment)

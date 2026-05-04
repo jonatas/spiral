@@ -62,7 +62,7 @@ CALL ingest_core_data(100000000, 1000000);
 \timing off
 
 \echo '-> Materializing Core Hierarchy...'
-SELECT spiral_refresh('stress_raw_1m'); 
+SELECT spiral_refresh('stress_raw'); 
 
 \echo '-> EXPLAIN: 2-Hour Query (Should hit 1h, 1m, and Raw tiers)'
 EXPLAIN (COSTS OFF) 
@@ -114,7 +114,7 @@ $$;
 CALL ingest_iot_data(1000000);
 
 \echo '-> Materializing IoT Hierarchy...'
-SELECT spiral_refresh('iot_raw_1m');
+SELECT spiral_refresh('iot_raw');
 
 \echo '-> EXPLAIN: IoT Specific Device Query (Should pass scope_values down)'
 EXPLAIN (COSTS OFF) 

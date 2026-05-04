@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS spiral.sources (
     base_column TEXT NOT NULL,
     formula TEXT NOT NULL,
     mat_column TEXT NOT NULL,
+    rollup_gsub_strategy TEXT,
     metadata JSONB NOT NULL DEFAULT '{}',
     PRIMARY KEY (view_name, base_column, formula)
 );
@@ -63,16 +64,69 @@ $$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
 CREATE OR REPLACE FUNCTION spiral.track_changes_stmt() RETURNS TRIGGER AS $$
 DECLARE
     v_base_view TEXT := TG_ARGV[0];
-    v_ts BIGINT;
-    v_te BIGINT;
+    v_scope_columns TEXT[];
+    v_has_scopes BOOLEAN;
+    v_sql TEXT;
 BEGIN
-    IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
-        -- Explicitly cast to timestamptz to resolve any ambiguity.
-        SELECT MIN(spiral(t::timestamptz)), MAX(spiral(t::timestamptz)) INTO v_ts, v_te FROM new_table;
-        IF v_ts IS NOT NULL THEN
-            INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES (v_base_view, v_ts, v_te);
-        END IF;
+    SELECT scope_columns INTO v_scope_columns
+    FROM spiral.metadata
+    WHERE view_name = v_base_view;
+
+    v_has_scopes := array_length(v_scope_columns, 1) > 0;
+
+    IF v_has_scopes THEN
+        DECLARE
+            v_json_build TEXT;
+            v_cols_csv TEXT;
+            v_union_sql TEXT := '';
+        BEGIN
+            SELECT string_agg(quote_literal(col) || ', "' || col || '"', ', '),
+                   string_agg('"' || col || '"', ', ')
+            INTO v_json_build, v_cols_csv
+            FROM unnest(v_scope_columns) as col;
+            
+            v_json_build := 'jsonb_build_object(' || v_json_build || ')';
+            
+            IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
+                v_union_sql := 'SELECT t, ' || v_cols_csv || ' FROM new_table';
+            END IF;
+            IF (TG_OP = 'DELETE' OR TG_OP = 'UPDATE') THEN
+                IF v_union_sql <> '' THEN
+                    v_union_sql := v_union_sql || ' UNION ALL ';
+                END IF;
+                v_union_sql := v_union_sql || 'SELECT t, ' || v_cols_csv || ' FROM old_table';
+            END IF;
+            
+            v_sql := 'INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) ' ||
+                     'SELECT $1, ' || v_json_build || ', MIN(spiral(t::timestamptz)), MAX(spiral(t::timestamptz)) ' ||
+                     'FROM (' || v_union_sql || ') sub ' ||
+                     'GROUP BY ' || v_cols_csv;
+                     
+            EXECUTE v_sql USING v_base_view;
+        END;
+    ELSE
+        DECLARE
+            v_union_sql TEXT := '';
+        BEGIN
+            IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
+                v_union_sql := 'SELECT t FROM new_table';
+            END IF;
+            IF (TG_OP = 'DELETE' OR TG_OP = 'UPDATE') THEN
+                IF v_union_sql <> '' THEN
+                    v_union_sql := v_union_sql || ' UNION ALL ';
+                END IF;
+                v_union_sql := v_union_sql || 'SELECT t FROM old_table';
+            END IF;
+            
+            v_sql := 'INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) ' ||
+                     'SELECT $1, ''{}''::jsonb, MIN(spiral(t::timestamptz)), MAX(spiral(t::timestamptz)) ' ||
+                     'FROM (' || v_union_sql || ') sub ' ||
+                     'HAVING COUNT(*) > 0';
+                     
+            EXECUTE v_sql USING v_base_view;
+        END;
     END IF;
+    
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
@@ -130,7 +184,8 @@ SELECT
     m.frame_seconds,
     s.base_column,
     s.formula,
-    s.mat_column
+    s.mat_column,
+    s.rollup_gsub_strategy
 FROM spiral.metadata m
 JOIN spiral.sources s ON m.view_name = s.view_name
 ORDER BY m.base_view, m.frame_seconds;

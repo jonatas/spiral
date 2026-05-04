@@ -1,3 +1,4 @@
+LOAD 'spiral';
 -- Test that regular tables are NOT affected by Spiral
 CREATE EXTENSION IF NOT EXISTS spiral;
 SET client_min_messages = info;

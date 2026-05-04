@@ -1,3 +1,4 @@
+LOAD 'spiral';
 -- Test Time-as-Address storage optimization
 CREATE EXTENSION IF NOT EXISTS spiral CASCADE;
 CREATE EXTENSION spiral;

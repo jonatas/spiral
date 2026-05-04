@@ -18,5 +18,5 @@ This directory contains various benchmarks to evaluate Spiral's performance and 
 ## Running Benchmarks
 Most benchmarks can be run via:
 ```bash
-cargo pgrx run pg16 < benchmarks/core.sql
+cargo pgrx run pg18 < benchmarks/core.sql
 ```

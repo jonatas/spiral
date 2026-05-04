@@ -1,3 +1,4 @@
+LOAD 'spiral';
 -- Testing the Ultimate Caching System (Transparent Query Acceleration)
 SET spiral.kickoff_date = '2026-04-15';
 
@@ -21,8 +22,8 @@ INSERT INTO cache_test (t, tenant_id, val) VALUES
 ('2026-04-15 11:05:05Z', 1, 50.0);
 
 -- Materialize views
-SELECT spiral_refresh('cache_test_ohlcv_1m');
-SELECT spiral_refresh('cache_test_ohlcv_1h');
+SELECT spiral_refresh('cache_test');
+-- Cascades
 
 -- Verify they are clean (changelog should be empty for base_view)
 SELECT count(*) FROM spiral.changelog WHERE base_view = 'cache_test';
@@ -77,8 +78,8 @@ GROUP BY tenant_id;
 -- Insert data for another hour
 INSERT INTO cache_test (t, tenant_id, val) VALUES
 ('2026-04-15 12:00:05Z', 1, 60.0);
-SELECT spiral_refresh('cache_test_ohlcv_1m');
-SELECT spiral_refresh('cache_test_ohlcv_1h');
+SELECT spiral_refresh('cache_test');
+-- Cascades
 
 SELECT sum(val) FROM cache_test
 WHERE t >= '2026-04-15 10:00:00Z' AND t < '2026-04-15 13:00:00Z';
@@ -88,3 +89,4 @@ CREATE TABLE baseline_test AS SELECT * FROM cache_test;
 SELECT 
     (SELECT sum(val) FROM cache_test) = (SELECT sum(val) FROM baseline_test) as sum_matches,
     (SELECT count(val) FROM cache_test) = (SELECT count(val) FROM baseline_test) as count_matches;
+ count(val) FROM baseline_test) as count_matches;

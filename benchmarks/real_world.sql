@@ -51,7 +51,7 @@ CALL ingest_real_world();
 -- 3. Materialize
 \echo '--- [STAGE 2] Materializing Hierarchy ---'
 \timing on
-SELECT spiral_refresh('metrics_1m');
+SELECT spiral_refresh('metrics');
 \timing off
 
 -- 4. Accuracy & Performance Comparison

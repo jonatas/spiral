@@ -1,3 +1,4 @@
+LOAD 'spiral';
 SET spiral.kickoff_date = '2026-04-15';
 
 CREATE TABLE multi_tenant (
@@ -22,4 +23,4 @@ WHERE base_view = 'multi_tenant';
 
 -- Check if view index uses Z-Order
 -- View indexes for multi-tenant views use spiral_zorder
-\d multi_tenant_ohlcv_1m
+\d multi_tenant_1m

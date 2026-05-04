@@ -15,8 +15,8 @@ CREATE TABLE accel_bench (
 );
 
 -- Register Spiral Hierarchy manually (more reliable than WITH for benchmarks)
-SELECT spiral_register_view('accel_bench_ohlcv_1m'::text, 'BASE'::text, 60::integer, 'accel_bench'::text, ARRAY[]::text[]);
-SELECT spiral_register_view('accel_bench_ohlcv_1h'::text, 'accel_bench_ohlcv_1m'::text, 3600::integer, 'accel_bench'::text, ARRAY[]::text[]);
+SELECT spiral_register_view('accel_bench_1m'::text, 'BASE'::text, 60::integer, 'accel_bench'::text, ARRAY[]::text[]);
+SELECT spiral_register_view('accel_bench_1h'::text, 'accel_bench_1m'::text, 3600::integer, 'accel_bench'::text, ARRAY[]::text[]);
 
 -- 2. Ingest 100,000 rows over 10 hours
 INSERT INTO accel_bench (t, val)
@@ -26,8 +26,8 @@ SELECT
 FROM generate_series(0, 36000) n;
 
 -- 3. Materialize Spiral Hierarchy
-SELECT spiral_refresh('accel_bench_ohlcv_1m');
-SELECT spiral_refresh('accel_bench_ohlcv_1h');
+SELECT spiral_refresh('accel_bench');
+-- Cascades
 
 -- 4. Baseline Query (Non-accelerated)
 DROP TABLE IF EXISTS baseline_bench CASCADE;
