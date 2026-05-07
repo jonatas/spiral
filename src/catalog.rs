@@ -222,3 +222,20 @@ pub fn get_dirty_ranges(
     })
     .unwrap_or_default()
 }
+
+pub fn get_tenant_scale(metadata: &Metadata) -> i64 {
+    if let serde_json::Value::Object(map) = &metadata.columns_metadata.0 {
+        if let Some(serde_json::Value::String(s)) = map.get("cardinality") {
+            return match s.as_str() {
+                "d" => 10,
+                "h" => 100,
+                "k" => 1000,
+                "M" => 1000000,
+                "B" => 1000000000,
+                "T" => 1000000000000,
+                _ => 1024,
+            };
+        }
+    }
+    1024
+}

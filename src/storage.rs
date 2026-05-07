@@ -23,6 +23,19 @@ fn get_storage_path(rel_oid: i32, suffix: &str) -> PathBuf {
     path
 }
 
+fn get_tenant_scale_for_oid(rel_oid: i32) -> i64 {
+    unsafe {
+        let relname_ptr = pgrx::pg_sys::get_rel_name((rel_oid as u32).into());
+        if !relname_ptr.is_null() {
+            let name = std::ffi::CStr::from_ptr(relname_ptr).to_string_lossy();
+            if let Some(m) = crate::catalog::get_metadata(&name) {
+                return crate::catalog::get_tenant_scale(&m);
+            }
+        }
+    }
+    1024
+}
+
 #[pg_extern]
 pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
     let path = get_storage_path(main_rel_oid, "");
@@ -44,16 +57,17 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
         let tuple_table = client.select(&query, None, &[])?;
         let mut count = 0;
 
+        let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
         for row in tuple_table {
             let t = row.get::<i64>(1)?.unwrap_or(-1);
             let tenant_id = row.get::<i64>(2)?.unwrap_or(-1);
             let price = row.get::<f64>(3)?.unwrap_or(0.0);
 
-            if t < 0 || !(0..1024).contains(&tenant_id) {
+            if t < 0 || !(0..tenant_scale).contains(&tenant_id) {
                 continue;
             }
 
-            let offset = (t * 1024 * 8) + (tenant_id * 8);
+            let offset = (t * tenant_scale * 8) + (tenant_id * 8);
             if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
                 if file.write_all(&price.to_le_bytes()).is_ok() {
                     count += 1;
@@ -83,16 +97,17 @@ pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
         );
         let tuple_table = client.select(&query, None, &[])?;
 
+        let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
         for row in tuple_table {
             let t = row.get::<i64>(1)?.unwrap_or(0);
             let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
             let price = row.get::<f64>(3)?.unwrap_or(0.0);
 
-            if t < 0 || !(0..1024).contains(&tenant_id) {
+            if t < 0 || !(0..tenant_scale).contains(&tenant_id) {
                 continue;
             }
 
-            let offset = (t * 1024 * 16) + (tenant_id * 16);
+            let offset = (t * tenant_scale * 16) + (tenant_id * 16);
             if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
                 let _ = file.write_all(&(t as u32).to_le_bytes());
                 let _ = file.write_all(&(price as f32).to_le_bytes());
@@ -125,12 +140,13 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
         );
         let tuple_table = client.select(&query, None, &[])?;
 
+        let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
         for row in tuple_table {
             let block_id = row.get::<i64>(1)?.unwrap_or(0);
             let tenant_id = row.get::<i64>(2)?.unwrap_or(0);
             let prices: Vec<f64> = row.get::<Vec<f64>>(3)?.unwrap_or_default();
 
-            if prices.is_empty() || block_id < 0 || !(0..1024).contains(&tenant_id) {
+            if prices.is_empty() || block_id < 0 || !(0..tenant_scale).contains(&tenant_id) {
                 continue;
             }
 
@@ -149,7 +165,8 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
                 block.data[(i - 1) * 2 + 1] = bytes[1];
             }
 
-            let offset = (block_id * BLOCK_BUNDLE_SIZE as i64) + (tenant_id * BLOCK_SIZE as i64);
+            let bundle_size = BLOCK_SIZE as i64 * tenant_scale;
+            let offset = (block_id * bundle_size) + (tenant_id * BLOCK_SIZE as i64);
             let bytes: [u8; BLOCK_SIZE] = unsafe { std::mem::transmute(block) };
             if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
                 let _ = file.write_all(&bytes);
@@ -166,10 +183,11 @@ pub fn spiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64
     let kickoff = crate::get_kickoff_epoch();
     let t_rel = t - kickoff;
 
-    if t_rel < 0 || !(0..1024).contains(&tenant_id) {
+    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+    if t_rel < 0 || !(0..tenant_scale).contains(&tenant_id) {
         return None;
     }
-    let offset = (t_rel * 1024 * 8) + (tenant_id * 8);
+    let offset = (t_rel * tenant_scale * 8) + (tenant_id * 8);
     file.seek(SeekFrom::Start(offset as u64)).ok()?;
     let mut buf = [0u8; 8];
     file.read_exact(&mut buf).ok()?;
@@ -180,10 +198,11 @@ pub fn spiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64
 pub fn spiral_read_main_compact(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "_compact");
     let mut file = File::open(path).ok()?;
-    if t < 0 || !(0..1024).contains(&tenant_id) {
+    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+    if t < 0 || !(0..tenant_scale).contains(&tenant_id) {
         return None;
     }
-    let offset = (t * 1024 * 16) + (tenant_id * 16);
+    let offset = (t * tenant_scale * 16) + (tenant_id * 16);
     file.seek(SeekFrom::Start(offset as u64 + 4)).ok()?;
     let mut buf = [0u8; 4];
     file.read_exact(&mut buf).ok()?;
@@ -194,13 +213,15 @@ pub fn spiral_read_main_compact(main_rel_oid: i32, t: i64, tenant_id: i64) -> Op
 pub fn spiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64> {
     let path = get_storage_path(main_rel_oid, "_blocks");
     let mut file = File::open(path).ok()?;
-    if t < 0 || !(0..1024).contains(&tenant_id) {
+    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+    if t < 0 || !(0..tenant_scale).contains(&tenant_id) {
         return None;
     }
     let block_id = t / POINTS_PER_BLOCK;
     let step = (t % POINTS_PER_BLOCK) as usize;
 
-    let offset = (block_id * BLOCK_BUNDLE_SIZE as i64) + (tenant_id * BLOCK_SIZE as i64);
+    let bundle_size = BLOCK_SIZE as i64 * tenant_scale;
+    let offset = (block_id * bundle_size) + (tenant_id * BLOCK_SIZE as i64);
     file.seek(SeekFrom::Start(offset as u64)).ok()?;
 
     let mut buf = [0u8; BLOCK_SIZE];
@@ -231,10 +252,12 @@ pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id:
         Err(_) => return vec![],
     };
 
-    if block_id < 0 || !(0..1024).contains(&tenant_id) {
+    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+    if block_id < 0 || !(0..tenant_scale).contains(&tenant_id) {
         return vec![];
     }
-    let offset = (block_id * BLOCK_BUNDLE_SIZE as i64) + (tenant_id * BLOCK_SIZE as i64);
+    let bundle_size = BLOCK_SIZE as i64 * tenant_scale;
+    let offset = (block_id * bundle_size) + (tenant_id * BLOCK_SIZE as i64);
     if file.seek(SeekFrom::Start(offset as u64)).is_err() {
         return vec![];
     }
@@ -273,13 +296,14 @@ pub fn spiral_scan_zero(
     let mut results = Vec::new();
     let mut buf = [0u8; 8];
 
+    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
     let total_slots = total_size / 8;
     for i in 0..total_slots {
         if file.read_exact(&mut buf).is_ok() {
             let val = f64::from_le_bytes(buf);
             if val != 0.0 {
-                let t = (i / 1024) as i64;
-                let tenant_id = (i % 1024) as i32;
+                let t = (i as i64 / tenant_scale) as i64;
+                let tenant_id = (i as i64 % tenant_scale) as i32;
                 results.push((t, tenant_id, val));
             }
         }

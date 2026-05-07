@@ -114,6 +114,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
             let query_str = CStr::from_ptr(query_string).to_string_lossy();
             let mut extracted_frames = String::new();
             let mut extracted_tenant = String::new();
+            let mut extracted_cardinality = String::new();
 
             let mut process_options = |list: *mut pg_sys::List| -> *mut pg_sys::List {
                 let mut new_options: *mut pg_sys::List = std::ptr::null_mut();
@@ -137,6 +138,12 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                                 if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
                                     let s = arg as *mut pg_sys::String;
                                     extracted_tenant = CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
+                                }
+                            } else if defname == "cardinality" {
+                                let arg = (*cell).arg;
+                                if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
+                                    let s = arg as *mut pg_sys::String;
+                                    extracted_cardinality = CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
                                 }
                             }
                         }
@@ -224,13 +231,18 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 }
 
                 // 4. Register the BASE table metadata
+                let mut base_metadata_map = serde_json::Map::new();
+                if !extracted_cardinality.is_empty() {
+                    base_metadata_map.insert("cardinality".to_string(), serde_json::Value::String(extracted_cardinality.clone()));
+                }
+
                 catalog::insert_metadata(
                     &name,
                     "BASE",
                     0,
                     &name,
                     scope_columns.clone(),
-                    pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
+                    pgrx::JsonB(serde_json::Value::Object(base_metadata_map)),
                 );
 
                 for event in &["INSERT", "UPDATE", "DELETE"] {
