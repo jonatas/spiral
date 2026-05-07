@@ -113,21 +113,144 @@ SELECT sum(val) FROM (
 ### 5. Reactive Backfill Engine & IVM
 Spiral tracks "dirty buckets" in a transactional changelog to provide **Incremental View Maintenance (IVM)**.
 
-- **Surgical Multi-Tenant Healing**: Instead of rebuilding entire views, Spiral identifies exactly which time buckets and **tenants** changed and patches only those records. This provides massive performance gains for backfills or late-arriving data in multi-tenant environments.
-- **Tenant-Isolated Acceleration**: Dirty data for one tenant never slows down queries for another. The planner uses scope constraints to surgically fallback to raw data only where necessary.
-- **ACID Compliance**: Metadata and rollups stay perfectly in sync even during transaction rollbacks.
-- **Cascading Logic**: Refreshing a parent view automatically triggers incremental updates for all downstream children.
-- **Self-Healing Dashboards**: Historical data corrections automatically flag those specific buckets/tenants for re-aggregation in the next refresh cycle.
+- <details><summary><b>Surgical Multi-Tenant Healing</b></summary>
+  
+  Instead of rebuilding entire views, Spiral identifies exactly which time buckets and <b>tenants</b> changed and patches only those records. By integrating with the changelog, the IVM (Incremental View Maintenance) engine calculates precise delta updates. This provides massive performance gains for backfills or late-arriving data in multi-tenant environments by ensuring IO operations scale with the number of changed records rather than the total view size.
+
+  **Mechanism & Example:**
+  When a late record arrives:
+  ```sql
+  -- Late arrival for tenant 42
+  INSERT INTO sensor_readings (t, sensor_id, voltage) 
+  VALUES ('2026-04-15 10:05:00', 42, 220.5);
+  ```
+  Spiral logs this specific `(sensor_id=42, time_bucket='10:05')` to the changelog. The refresh operation:
+  ```sql
+  SELECT spiral_refresh('sensor_readings_1m');
+  ```
+  Executes an internal merge matching only the dirty segment:
+  ```text
+  Merge on sensor_readings_1m
+    -> Nested Loop
+       -> Index Scan on spiral.changelog (dirty segments)
+       -> Index Scan on sensor_readings (fetch new aggregations)
+  ```
+  </details>
+- <details><summary><b>Tenant-Isolated Acceleration</b></summary>
+  
+  Dirty data for one tenant never slows down queries for another. The planner uses scope constraints to surgically fallback to raw data only where necessary. When the hierarchical planner slices a query, it evaluates the changelog to inject union operations exclusively for dirty time ranges of the specific tenant, maintaining optimal performance for all other unmodified data.
+
+  **Mechanism & Example:**
+  If tenant `99` has un-refreshed dirty data but tenant `42` is clean, queries to tenant `42` use the fast rollup entirely:
+  ```sql
+  -- Fast Path (Clean Tenant)
+  SELECT sum(voltage) FROM sensor_readings WHERE sensor_id = 42;
+  -- Plan: Aggregate -> Seq Scan on sensor_readings_1h
+  ```
+  However, for the dirty tenant, the hook transparently union-appends the raw table *only for the dirty time ranges*:
+  ```sql
+  -- Transparent Fallback (Dirty Tenant)
+  SELECT sum(voltage) FROM sensor_readings WHERE sensor_id = 99;
+  -- Plan: Aggregate -> Append
+  --         -> Seq Scan on sensor_readings_1h (Clean segments)
+  --         -> Seq Scan on sensor_readings (Dirty segments filtering via changelog bounds)
+  ```
+  </details>
+- <details><summary><b>ACID Compliance</b></summary>
+  
+  Metadata and rollups stay perfectly in sync even during transaction rollbacks. The changelog leverages PostgreSQL's MVCC (Multi-Version Concurrency Control) and transaction ID visibility. If a massive ingest transaction fails and rolls back, the system ensures those dirty markers are invisible to subsequent operations, avoiding wasteful re-computations and maintaining data consistency.
+
+  **Mechanism & Example:**
+  ```sql
+  BEGIN;
+  INSERT INTO sensor_readings (t, sensor_id, voltage) 
+  VALUES ('2026-04-15 10:05:00', 42, 220.5);
+  -- Changes are written to the table and spiral.changelog but only visible to this TX
+  ROLLBACK; 
+  ```
+  Because the changelog insertions share the same transaction snapshot, the rollback permanently hides the `spiral.changelog` entry. Subsequent `SELECT spiral_refresh('sensor_readings_1m');` will find no new rows and exit cleanly, consuming zero extra IO.
+  </details>
+- <details><summary><b>Cascading Logic</b></summary>
+  
+  Refreshing a parent view automatically triggers incremental updates for all downstream children. For example, when the 1-minute rollup is refreshed, the update process identifies the changed segments and seamlessly propagates those specific deltas to the 1-hour and 1-day rollups, maintaining consistent states across the entire rollup hierarchy without re-reading the root table.
+
+  **Mechanism & Example:**
+  ```sql
+  -- A manual or worker-triggered refresh on the lowest granularity:
+  SELECT spiral_refresh('sensor_readings_1m');
+  ```
+  Internally, the engine tracks which `1m` buckets were recalculated. It then dynamically generates and executes the next tier's refresh by querying the newly generated `1m` data:
+  ```sql
+  -- Auto-triggered internal operation:
+  INSERT INTO sensor_readings_1h (t, sensor_id, voltage)
+  SELECT 
+    date_trunc('hour', t), sensor_id, spiral_stats_merge(voltage)
+  FROM sensor_readings_1m 
+  WHERE t IN (/* propagated dirty bounds from the 1m refresh */)
+  GROUP BY 1, 2
+  ON CONFLICT (t, sensor_id) DO UPDATE ...
+  ```
+  </details>
+- <details><summary><b>Self-Healing Dashboards</b></summary>
+  
+  Historical data corrections automatically flag those specific buckets/tenants for re-aggregation in the next refresh cycle. When a downstream application sends a late-arriving correction, the background worker automatically identifies the affected historical interval and re-aggregates just that segment, ensuring dashboards reflect accurate data seamlessly on their next reload.
+
+  **Mechanism & Example:**
+  Imagine an anomaly detected from last month:
+  ```sql
+  -- Correcting historical data
+  UPDATE sensor_readings 
+  SET voltage = 220.0 
+  WHERE sensor_id = 42 AND t = '2026-03-01 12:00:00';
+  ```
+  The update trigger fires and logs the `2026-03-01 12:00:00` bucket to the changelog. The background worker picks this up:
+  ```text
+  LOG: spiral_worker: found 1 dirty segments for sensor_readings
+  LOG: spiral_worker: refreshing sensor_readings_1m (interval: 2026-03-01 12:00:00 to 2026-03-01 12:01:00)
+  ```
+  The next time the dashboard queries `sensor_readings_1d`, the planner incorporates the healed data without any manual view rebuilds.
+  </details>
 
 ---
 
-### 5. Time-as-Address (8x Storage Reduction)
+### 6. Time-as-Address (8x Storage Reduction)
 For extremely high-density datasets where even a `bigint` timestamp is redundant, Spiral can eliminate the timestamp column entirely from physical storage.
 
-- **Zero-Timestamp Storage**: The time and tenant identity are implicitly encoded in the physical address (file offset).
-- **8x Smaller Footprint**: Reduces row size from 64 bytes down to just **8 bytes** (only the value is stored).
-- **O(1) Direct Access**: Read any point in time for any tenant instantly using bitwise math, bypassing all PostgreSQL indexes.
-- **Safety Headers**: Every binary file includes an `ASPI` header validating the OID, Kickoff Date, and Resolution (Pace) to prevent data corruption.
+- <details><summary><b>Zero-Timestamp Storage</b></summary>
+  
+  The time and tenant identity are implicitly encoded in the physical address (file offset). By defining a strict minimal pace (resolution) and a constant kickoff date, the exact time can be derived mathematically from the storage location, eliminating the need to physically store timestamp fields on disk.
+
+  **Mechanism & Example:**
+  ```sql
+  -- Create a pure-value table without 't' or 'tenant_id'
+  CREATE TABLE ticks_raw_data (
+      price numeric,
+      vol int
+  ) WITH (spiral.storage = 'addressable');
+  ```
+  Instead of storing `(t, symbol_id, price, vol)`, we only write `(price, vol)`. When querying, a Set-Returning Function reconstructs the timestamp via: `t = kickoff_date + (offset / row_size) * pace`.
+  </details>
+- <details><summary><b>8x Smaller Footprint</b></summary>Reduces row size from 64 bytes down to just <b>8 bytes</b> (only the value is stored). This extreme compression means that an entire month of high-frequency sensor data can fit efficiently within PostgreSQL's shared buffers, drastically reducing cache eviction rates and accelerating I/O bound queries.</details>
+- <details><summary><b>O(1) Direct Access</b></summary>Read any point in time for any tenant instantly using bitwise math, bypassing all PostgreSQL indexes. Traditional B-trees degrade at scale, but calculating an exact file offset requires a constant number of CPU cycles regardless of dataset size, offering unprecedented and predictable lookup speeds.</details>
+- <details><summary><b>Safety Headers</b></summary>
+  
+  Every binary file includes an <code>ASPI</code> header validating the OID, Kickoff Date, and Resolution (Pace) to prevent data corruption. This validation layer ensures that if files are copied, moved, or corrupted, the system can instantly detect mismatches between the PostgreSQL catalog metadata and the physical binary file configuration.
+
+  **Mechanism & Example:**
+  ```c
+  // C/Rust pseudo-code validating the 16-byte header on open:
+  struct AspiHeader {
+      char magic[4]; // "ASPI"
+      uint32_t rel_oid;
+      uint64_t kickoff_epoch;
+  };
+  ```
+  If a DBA mistakenly attaches a wrong file, querying it:
+  ```sql
+  SELECT * FROM spiral_scan_zero('wrong_file_oid');
+  -- ERROR: ASPI header mismatch: expected OID 12345, found 99999
+  ```
+  </details>
 
 **Configuration:**
 ```sql
@@ -139,13 +262,26 @@ SET spiral.kickoff_date = '2026-04-15';
 
 ### 1. The Spiral Mapping (Time to Epoch)
 Spiral maps `timestamptz` to a relative `bigint` epoch starting from a configurable `kickoff_date`. This constant-time conversion allows for efficient bitwise operations and Z-Order interleaving.
-- **Session Caching**: The kickoff epoch is cached in a thread-local variable to eliminate redundant SPI queries during bulk operations.
+- <details><summary><b>Session Caching</b></summary>The kickoff epoch is cached in a thread-local variable to eliminate redundant SPI queries during bulk operations. By caching this configuration within the Rust extension's memory space, it prevents repetitive catalog lookups and significantly reduces query execution latency across the session.</details>
 
 ### 2. Segment-Based Change Tracking (Joining Unions)
 Traditional IVM often struggles with high-volume updates because tracking every single row is expensive. Spiral uses a **Segment Unification** strategy:
-- **Statement-Level Triggers**: Uses PostgreSQL **Transition Tables** (`REFERENCING NEW TABLE`) to capture thousands of changes in a single Rust-side iteration.
-- **Unification Algorithm**: Overlapping or adjacent "dirty" time ranges are merged into unified segments (unions of intervals). This keeps the `spiral.changelog` extremely compact.
-- **JOIN-Based Refresh**: The incremental refresh logic performs a direct `JOIN` between the rollup table and the unified segments, ensuring PostgreSQL only touches the minimal set of pages needed.
+- <details><summary><b>Statement-Level Triggers</b></summary>
+  
+  Uses PostgreSQL <b>Transition Tables</b> (<code>REFERENCING NEW TABLE</code>) to capture thousands of changes in a single Rust-side iteration. Instead of executing trigger logic per row, this approach processes entire batches of modified records natively, minimizing context switching between SQL and Rust.
+
+  **Mechanism & Example:**
+  ```sql
+  -- Trigger definition internal to Spiral
+  CREATE TRIGGER spiral_changelog_trig
+  AFTER INSERT OR UPDATE OR DELETE ON sensor_readings
+  REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION spiral_process_changes();
+  ```
+  When an `UPDATE` modifies 10,000 rows, the trigger fires exactly once. The Rust function receives all 10,000 rows as a single virtual table, iterating them efficiently in memory to extract distinct time-buckets.
+  </details>
+- <details><summary><b>Unification Algorithm</b></summary>Overlapping or adjacent "dirty" time ranges are merged into unified segments (unions of intervals). This keeps the <code>spiral.changelog</code> extremely compact. Even under heavy concurrent workloads with scattered updates, the tracking tables remain small, ensuring that the maintenance phase remains highly performant.</details>
+- <details><summary><b>JOIN-Based Refresh</b></summary>The incremental refresh logic performs a direct <code>JOIN</code> between the rollup table and the unified segments, ensuring PostgreSQL only touches the minimal set of pages needed. This set-based operation allows the query planner to utilize index scans effectively, making the IVM refresh cycle highly IO-efficient.</details>
 
 ### 3. Cascading Hierarchical Refresh
 Refreshing a root view automatically triggers a recursive, incremental update down the entire hierarchy (e.g., 1m -> 5m -> 1h). Each level only re-aggregates data from its direct parent for the specific segments that were flagged as dirty.
@@ -233,3 +369,6 @@ Spiral's background worker is auto-configured. It will automatically start for a
 
 ---
 Built with ❤️ using `pgrx` and `ta-statistics`.
+th ❤️ using `pgrx` and `ta-statistics`.
+istics`.
+th ❤️ using `pgrx` and `ta-statistics`.
