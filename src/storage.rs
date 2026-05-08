@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 const BLOCK_SIZE: usize = 128; // 128 bytes per sensor/block
 const POINTS_PER_BLOCK: i64 = 64;
-const BLOCK_BUNDLE_SIZE: usize = BLOCK_SIZE * 1024; // Pre-allocate for 1024 tenants
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -47,8 +46,13 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
         .expect("Failed to open Main Store file");
 
     let kickoff = crate::get_kickoff_epoch();
-    notice!("Spiral: packing delta from '{}' to '{}' (kickoff={})", delta_table_name, path.display(), kickoff);
-    
+    notice!(
+        "Spiral: packing delta from '{}' to '{}' (kickoff={})",
+        delta_table_name,
+        path.display(),
+        kickoff
+    );
+
     let _ = Spi::connect(|client| {
         let query = format!(
             "SELECT (spiral(t) - {kickoff}) as t_rel, tenant_id, price FROM {delta_table_name} ORDER BY t ASC",
@@ -68,10 +72,10 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
             }
 
             let offset = (t * tenant_scale * 8) + (tenant_id * 8);
-            if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
-                if file.write_all(&price.to_le_bytes()).is_ok() {
-                    count += 1;
-                }
+            if file.seek(SeekFrom::Start(offset as u64)).is_ok()
+                && file.write_all(&price.to_le_bytes()).is_ok()
+            {
+                count += 1;
             }
         }
         notice!("Spiral: packed {} rows into O(1) store", count);
@@ -302,7 +306,7 @@ pub fn spiral_scan_zero(
         if file.read_exact(&mut buf).is_ok() {
             let val = f64::from_le_bytes(buf);
             if val != 0.0 {
-                let t = (i as i64 / tenant_scale) as i64;
+                let t = i as i64 / tenant_scale;
                 let tenant_id = (i as i64 % tenant_scale) as i32;
                 results.push((t, tenant_id, val));
             }

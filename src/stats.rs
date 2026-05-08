@@ -42,7 +42,7 @@ impl StatsState {
         self.m2 += term1;
     }
 
-    /// Merges another `StatsState` into this one, combining their statistics 
+    /// Merges another `StatsState` into this one, combining their statistics
     /// (Chan et al. parallel variance algorithm).
     ///
     /// # Examples
@@ -366,4 +366,3 @@ extension_sql!(
         spiral_sketch_combine
     ]
 );
-

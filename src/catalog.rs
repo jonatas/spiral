@@ -60,15 +60,14 @@ pub fn get_children(view_name: &str) -> Vec<String> {
 pub fn is_spiral_relation(name: &str) -> bool {
     Spi::connect(|client| {
         let table = unsafe {
-            client
-                .select(
-                    "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
-                    None,
-                    &[DatumWithOid::new(
-                        name.into_datum(),
-                        PgBuiltInOids::TEXTOID.value(),
-                    )],
-                )?
+            client.select(
+                "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
+                None,
+                &[DatumWithOid::new(
+                    name.into_datum(),
+                    PgBuiltInOids::TEXTOID.value(),
+                )],
+            )?
         };
         Ok::<bool, spi::Error>(!table.is_empty())
     })
@@ -83,9 +82,8 @@ pub fn insert_metadata(
     scope_columns: Vec<String>,
     columns_metadata: pgrx::JsonB,
 ) {
-    let _ = Spi::connect(|_client| {
-        unsafe {
-            Spi::run_with_args(
+    let _ = Spi::connect(|_client| unsafe {
+        Spi::run_with_args(
                 "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
                  VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
@@ -98,10 +96,10 @@ pub fn insert_metadata(
                     DatumWithOid::new(columns_metadata.into_datum().unwrap(), PgBuiltInOids::JSONBOID.value()),
                 ],
             )
-        }
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_source(
     view_name: &str,
     base_view: &str,
@@ -125,21 +123,40 @@ pub fn insert_source(
         rgs_val
     );
 
-    let _ = Spi::connect(|_client| {
-        unsafe {
-            Spi::run_with_args(
-                &sql,
-                &[
-                    DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(frame_seconds.into_datum().unwrap(), PgBuiltInOids::INT4OID.value()),
-                    DatumWithOid::new(base_column.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(formula.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(mat_column.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(metadata.into_datum().unwrap(), PgBuiltInOids::JSONBOID.value()),
-                ],
-            )
-        }
+    let _ = Spi::connect(|_client| unsafe {
+        Spi::run_with_args(
+            &sql,
+            &[
+                DatumWithOid::new(
+                    view_name.into_datum().unwrap(),
+                    PgBuiltInOids::TEXTOID.value(),
+                ),
+                DatumWithOid::new(
+                    base_view.into_datum().unwrap(),
+                    PgBuiltInOids::TEXTOID.value(),
+                ),
+                DatumWithOid::new(
+                    frame_seconds.into_datum().unwrap(),
+                    PgBuiltInOids::INT4OID.value(),
+                ),
+                DatumWithOid::new(
+                    base_column.into_datum().unwrap(),
+                    PgBuiltInOids::TEXTOID.value(),
+                ),
+                DatumWithOid::new(
+                    formula.into_datum().unwrap(),
+                    PgBuiltInOids::TEXTOID.value(),
+                ),
+                DatumWithOid::new(
+                    mat_column.into_datum().unwrap(),
+                    PgBuiltInOids::TEXTOID.value(),
+                ),
+                DatumWithOid::new(
+                    metadata.into_datum().unwrap(),
+                    PgBuiltInOids::JSONBOID.value(),
+                ),
+            ],
+        )
     });
 }
 
@@ -182,12 +199,14 @@ pub fn get_dirty_ranges(
                      WHERE base_view = $1
                        AND NOT (t_end < $2 OR t_start > $3)
                        AND (scope_values = '{}'::jsonb OR scope_values = $4)
-                     ORDER BY t_start".to_string()
+                     ORDER BY t_start"
+                .to_string()
         } else {
             "SELECT t_start, t_end FROM spiral.changelog
                      WHERE base_view = $1
                        AND NOT (t_end < $2 OR t_start > $3)
-                     ORDER BY t_start".to_string()
+                     ORDER BY t_start"
+                .to_string()
         };
 
         let mut args = Vec::new();

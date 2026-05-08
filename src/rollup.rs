@@ -10,7 +10,7 @@ pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 
 /// Parses a comma-separated string of time frames into a vector of `Frame` structs.
 ///
-/// This function understands suffixes like `s` (seconds), `m` (minutes), `h` (hours), 
+/// This function understands suffixes like `s` (seconds), `m` (minutes), `h` (hours),
 /// `d` (days), `w` (weeks), and `M` (months of 30 days).
 ///
 /// # Examples
@@ -19,7 +19,7 @@ pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 /// use spiral::rollup::parse_frames;
 ///
 /// let frames = parse_frames("1m, 1h, 1M");
-/// 
+///
 /// assert_eq!(frames.len(), 3);
 /// assert_eq!(frames[0].seconds, 60); // 1 minute
 /// assert_eq!(frames[1].seconds, 3600); // 1 hour
@@ -142,7 +142,7 @@ pub fn derive_child_sql(
             } else {
                 sources = loaded_sources;
             }
-            
+
             for src in &sources {
                 if let Some(strategy) = &src.rollup_gsub_strategy {
                     let col_ident = if parent_is_view { &src.mat_column } else { &src.base_column };
@@ -227,4 +227,3 @@ pub fn derive_child_sql(
         error!("Spiral failed to derive child SQL for {}: {:?}", parent_name, e);
     })
 }
-

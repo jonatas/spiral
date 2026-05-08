@@ -18,7 +18,7 @@ VALUES ('2026-04-05 08:00:00Z', 1, 100.0);
 INSERT INTO ivm_ticks (t, symbol_id, price)
 VALUES ('2026-04-05 08:00:00Z', 2, 200.0);
 
-SELECT t, spiral(t) as a_t, spiral_now() as a_now FROM ivm_ticks;
+SELECT t, spiral(t) as a_t FROM ivm_ticks;
 
 -- Initial Sync
 SELECT spiral_refresh('ivm_ticks');
@@ -37,4 +37,4 @@ SELECT spiral_refresh('ivm_ticks', 'symbol_id = 1');
 -- Display raw counts first
 SELECT count(*) FROM ivm_ticks_1h;
 
-SELECT symbol_id, round(price_h::numeric, 2) as high FROM ivm_ticks_1h ORDER BY symbol_id;
+SELECT symbol_id, round(price_ohlcv_h::numeric, 2) as high FROM ivm_ticks_1h ORDER BY symbol_id;

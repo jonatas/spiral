@@ -64,7 +64,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     _pscan: pg_sys::ParallelTableScanDesc,
     _flags: u32,
 ) -> pg_sys::TableScanDesc {
-    let spiral_scan = pgrx::pg_sys::palloc0(std::mem::size_of::<SpiralScanDescData>()) as *mut SpiralScanDescData;
+    let spiral_scan =
+        pgrx::pg_sys::palloc0(std::mem::size_of::<SpiralScanDescData>()) as *mut SpiralScanDescData;
     let scan = spiral_scan as pg_sys::TableScanDesc;
     if !scan.is_null() {
         (*scan).rs_rd = rel;
@@ -124,7 +125,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
             state.current_index += 1;
 
             if val != 0.0 {
-                let t = (idx as i64 / state.tenant_scale) as i64;
+                let t = idx as i64 / state.tenant_scale;
                 let tenant_id = (idx as i64 % state.tenant_scale) as i32;
 
                 pg_sys::ExecClearTuple(slot);

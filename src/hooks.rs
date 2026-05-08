@@ -118,7 +118,9 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
             let mut process_options = |list: *mut pg_sys::List| -> *mut pg_sys::List {
                 let mut new_options: *mut pg_sys::List = std::ptr::null_mut();
-                if list.is_null() { return new_options; }
+                if list.is_null() {
+                    return new_options;
+                }
                 for i in 0..(*list).length {
                     let cell = pg_sys::list_nth(list, i) as *mut pg_sys::DefElem;
                     let mut is_spiral = false;
@@ -131,19 +133,22 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                                 let arg = (*cell).arg;
                                 if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
                                     let s = arg as *mut pg_sys::String;
-                                    extracted_frames = CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
+                                    extracted_frames =
+                                        CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
                                 }
                             } else if defname == "tenant" {
                                 let arg = (*cell).arg;
                                 if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
                                     let s = arg as *mut pg_sys::String;
-                                    extracted_tenant = CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
+                                    extracted_tenant =
+                                        CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
                                 }
                             } else if defname == "cardinality" {
                                 let arg = (*cell).arg;
                                 if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
                                     let s = arg as *mut pg_sys::String;
-                                    extracted_cardinality = CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
+                                    extracted_cardinality =
+                                        CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
                                 }
                             }
                         }
@@ -202,7 +207,10 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
                 // 3. Detect Scope (Tenant) columns via Foreign Keys or extracted tenant
                 let scope_columns = if !extracted_tenant.is_empty() {
-                    extracted_tenant.split(',').map(|s| s.trim().to_string()).collect()
+                    extracted_tenant
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect()
                 } else {
                     Spi::connect(|client| {
                         let q = format!(
@@ -233,7 +241,10 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 // 4. Register the BASE table metadata
                 let mut base_metadata_map = serde_json::Map::new();
                 if !extracted_cardinality.is_empty() {
-                    base_metadata_map.insert("cardinality".to_string(), serde_json::Value::String(extracted_cardinality.clone()));
+                    base_metadata_map.insert(
+                        "cardinality".to_string(),
+                        serde_json::Value::String(extracted_cardinality.clone()),
+                    );
                 }
 
                 catalog::insert_metadata(
@@ -248,7 +259,8 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 for event in &["INSERT", "UPDATE", "DELETE"] {
                     let mut transition = String::new();
                     if *event == "UPDATE" {
-                        transition.push_str("REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table ");
+                        transition
+                            .push_str("REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table ");
                     } else if *event == "INSERT" {
                         transition.push_str("REFERENCING NEW TABLE AS new_table ");
                     } else if *event == "DELETE" {
@@ -524,7 +536,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                 build_time_constraints(query.jointree as *mut pg_sys::Node, rtable);
 
             for i in 0..(*rtable).length {
-                let varno = i + 1 ;
+                let varno = i + 1;
                 let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
                 if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                     let relid = (*rte).relid;
@@ -836,16 +848,15 @@ pub fn generate_hierarchy_internal(
                 let cols = client.select(&q, None, &[]).unwrap();
                 for row in cols {
                     let col = row.get::<String>(1).unwrap().unwrap();
-                    if !seen_cols.contains(&col) && col != "t"
-                        && seen_cols.insert(col.clone()) {
-                            select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
-                            sources.push(rollup::SourceDef {
-                                base_column: col.clone(),
-                                formula: "sum".to_string(),
-                                mat_column: col.clone(),
-                                rollup_gsub_strategy: None,
-                            });
-                        }
+                    if !seen_cols.contains(&col) && col != "t" && seen_cols.insert(col.clone()) {
+                        select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
+                        sources.push(rollup::SourceDef {
+                            base_column: col.clone(),
+                            formula: "sum".to_string(),
+                            mat_column: col.clone(),
+                            rollup_gsub_strategy: None,
+                        });
+                    }
                 }
             });
         } else {
@@ -861,8 +872,9 @@ pub fn generate_hierarchy_internal(
                     continue;
                 }
                 if let Some(strategy) = &src.rollup_gsub_strategy {
-                    let sql = strategy.replace("rollup(\"\\1\")", &format!("\"{}\"", src.mat_column))
-                                      .replace("\\1", &src.mat_column);
+                    let sql = strategy
+                        .replace("rollup(\"\\1\")", &format!("\"{}\"", src.mat_column))
+                        .replace("\\1", &src.mat_column);
                     select_parts.push(sql);
                 } else if src.formula == "stats" {
                     select_parts.push(format!(
@@ -886,7 +898,6 @@ pub fn generate_hierarchy_internal(
                 sources.push(src);
             }
         }
-
 
         let scope_cols_str = scope_columns
             .iter()
@@ -955,7 +966,7 @@ unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
     pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query
 }
 
-/// Maps an aggregate function name to its corresponding column projection, 
+/// Maps an aggregate function name to its corresponding column projection,
 /// adjusting for whether it's querying a rollup view or the base table.
 ///
 /// # Examples
@@ -1166,10 +1177,9 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
 
     let success = crate::refresh_incremental(base_name, where_clause.clone(), 0);
 
-    if success && is_root
-        && where_clause.is_none() {
-            let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
-        }
+    if success && is_root && where_clause.is_none() {
+        let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
+    }
 
     if is_root {
         let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
@@ -1208,7 +1218,7 @@ pub fn spiral_explain(query_sql: &str) -> String {
             build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
 
         for i in 0..(*rtable).length {
-            let varno = i + 1 ;
+            let varno = i + 1;
             let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
             if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
                 continue;
@@ -1297,4 +1307,3 @@ pub unsafe fn init_hooks() {
     PREV_PLANNER_HOOK = pg_sys::planner_hook;
     pg_sys::planner_hook = Some(spiral_planner_hook);
 }
-

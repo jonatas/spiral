@@ -395,7 +395,7 @@ fn spiral_status(base_table: &str) -> pgrx::JsonB {
 
         let dirty_count_res = client.select("SELECT count(*) FROM spiral.changelog WHERE base_view = $1", Some(1),
             unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] });
-        
+
         let dirty_count = match dirty_count_res {
             Ok(t) => t.get_one::<i64>().unwrap_or(Some(0)).unwrap_or(0),
             Err(_) => 0,
@@ -448,7 +448,7 @@ fn spiral_register_view(
         rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
 
     if !table_exists && !sql.is_empty() {
-        let select_part = if let Some(part) = sql.splitn(2, " AS ").nth(1) {
+        let select_part = if let Some(part) = sql.split_once(" AS ").map(|x| x.1) {
             part.split(';').next().unwrap_or("")
         } else {
             ""
@@ -457,8 +457,7 @@ fn spiral_register_view(
         if !select_part.is_empty() {
             let create_sql = format!(
                 "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0",
-                view_name,
-                select_part
+                view_name, select_part
             );
             let _ = Spi::run(&create_sql);
         }
@@ -536,8 +535,8 @@ pub mod pg_test {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    use pgrx::prelude::*;
     use crate::catalog;
+    use pgrx::prelude::*;
 
     #[pg_test]
     fn test_pg_framework() {
@@ -589,6 +588,3 @@ mod tests {
         assert_eq!(children[1], "child2");
     }
 }
-
-
-
