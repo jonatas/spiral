@@ -278,7 +278,7 @@ fn refresh_incremental(
         } else {
             let scope_cols_json = scope_cols_raw
                 .iter()
-                .map(|s| format!("'{}', \"{}\"::text", s, s))
+                .map(|s| format!("'{}', \"{}\"", s, s))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(

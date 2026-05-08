@@ -6,11 +6,11 @@ DROP EXTENSION IF EXISTS spiral CASCADE;
 CREATE EXTENSION spiral;
 \! rm -rf /tmp/spiral_main/*.bin
 
-SET spiral.kickoff_date = '2026-04-01';
+SET spiral.kickoff_date = '2026-04-01 00:00:00Z';
 SET spiral.minimal_pace = 1.0;
 
-CREATE TABLE production_data (t bigint, tenant_id int, price double precision);
-INSERT INTO production_data SELECT i/2, i%2, 100 + i FROM generate_series(0, 9) i;
+CREATE TABLE production_data (t timestamptz, tenant_id int, price double precision);
+INSERT INTO production_data SELECT '2026-04-01 00:00:00Z'::timestamptz + (i || ' seconds')::interval, i%2, 100 + i FROM generate_series(0, 9) i;
 
 -- Pack into optimized binary storage
 SELECT spiral_pack_delta_zero('production_data', 7777);
@@ -32,14 +32,15 @@ DROP TABLE backup_reconstructed;
 -- 4. RESTORE PHASE
 \echo '--- [RESTORE PHASE] ---'
 -- Re-create the standard table from our SQL dump (simulated by this table)
-CREATE TABLE restore_source (t bigint, tenant_id int, price double precision);
+DROP TABLE IF EXISTS restore_source;
+CREATE TABLE restore_source (t timestamptz, tenant_id int, price double precision);
 INSERT INTO restore_source VALUES
-(0, 0, 100), (0, 1, 101), (1, 0, 102), (1, 1, 103), (2, 0, 104),
-(2, 1, 105), (3, 0, 106), (3, 1, 107), (4, 0, 108), (4, 1, 109);
+('2026-04-01 00:00:00Z', 0, 100), ('2026-04-01 00:00:01Z', 1, 101), ('2026-04-01 00:00:02Z', 0, 102), ('2026-04-01 00:00:03Z', 1, 103), ('2026-04-01 00:00:04Z', 0, 104),
+('2026-04-01 00:00:05Z', 1, 105), ('2026-04-01 00:00:06Z', 0, 106), ('2026-04-01 00:00:07Z', 1, 107), ('2026-04-01 00:00:08Z', 0, 108), ('2026-04-01 00:00:09Z', 1, 109);
 
 -- Re-pack into optimized storage on the new "system"
 -- Ensure GUCs are set correctly first!
-SET spiral.kickoff_date = '2026-04-01';
+SET spiral.kickoff_date = '2026-04-01 00:00:00Z';
 SET spiral.minimal_pace = 1.0;
 SELECT spiral_pack_delta_zero('restore_source', 7777);
 
@@ -48,10 +49,10 @@ SELECT spiral_pack_delta_zero('restore_source', 7777);
 -- Check if O(1) reads work on the restored data
 SELECT 
     t as coordinate,
-    to_timestamptz(t) as time,
-    spiral_read_main_zero(7777, t, 0) as price_tenant_0,
-    spiral_read_main_zero(7777, t, 1) as price_tenant_1
-FROM generate_series(0, 4) t;
+    to_timestamp(t + extract(epoch from '2026-04-01 00:00:00Z'::timestamptz)) as time,
+    spiral_read_main_zero(7777, t + spiral('2026-04-01 00:00:00Z'::timestamptz), 0) as price_tenant_0,
+    spiral_read_main_zero(7777, t + spiral('2026-04-01 00:00:00Z'::timestamptz), 1) as price_tenant_1
+FROM generate_series(0, 9) t;
 
 -- Compare counts
 SELECT COUNT(*) as restored_count FROM spiral_scan_zero(7777);

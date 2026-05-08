@@ -33,4 +33,5 @@ SELECT '--- Incremental MERGE Refresh ---' as msg;
 SELECT spiral_refresh('ivm_ticks');
 
 -- 3. VERIFY RESULTS
-SELECT round(price_h::numeric, 2) as high, round(price_sum::numeric, 2) as total FROM ivm_ticks_1h;
+SELECT COUNT(*) FROM ivm_ticks_1h;
+SELECT round(price_ohlcv_h::numeric, 2) as high, round(price::numeric, 2) as total FROM ivm_ticks_1h;

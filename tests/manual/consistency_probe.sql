@@ -1,6 +1,20 @@
 -- Spiral Edge Case & Inconsistency Probe
 SET client_min_messages TO NOTICE;
-LOAD 'spiral';
+DROP EXTENSION IF EXISTS spiral CASCADE;
+CREATE EXTENSION spiral;
+
+DROP TABLE IF EXISTS stress_raw CASCADE;
+DROP TABLE IF EXISTS regular_table CASCADE;
+
+CREATE TABLE stress_raw (
+    t timestamptz NOT NULL,
+    symbol_id int NOT NULL,
+    val numeric
+) WITH (spiral.frames = '1m', spiral.tenant = 'symbol_id');
+
+CREATE TABLE regular_table (
+    val int
+);
 
 -- ============================================================================
 -- SCENARIO 1: Unmapped Aggregates
