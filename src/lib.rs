@@ -18,6 +18,7 @@ use std::ffi::CStr;
 
 pub static WORKER_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static WORKER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
 
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
@@ -28,19 +29,30 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     hooks::init_hooks();
 
     GucRegistry::define_bool_guc(
-        CStr::from_bytes_with_nul_unchecked(b"spiral.worker_enabled\0"),
-        CStr::from_bytes_with_nul_unchecked(b"Enable or disable the autonomous background worker\0"),
-        CStr::from_bytes_with_nul_unchecked(b"When true, the background worker will periodically refresh dirty segments.\0"),
+        c"spiral.worker_enabled",
+        c"Enable or disable the autonomous background worker",
+        c"When true, the background worker will periodically refresh dirty segments.",
         &WORKER_ENABLED,
         GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_bool_guc(
-        CStr::from_bytes_with_nul_unchecked(b"spiral.worker_debug\0"),
-        CStr::from_bytes_with_nul_unchecked(b"Enable debug logging for the autonomous background worker\0"),
-        CStr::from_bytes_with_nul_unchecked(b"When true, the background worker will emit debug2 logs.\0"),
+        c"spiral.worker_debug",
+        c"Enable debug logging for the autonomous background worker",
+        c"When true, the background worker will emit debug2 logs.",
         &WORKER_DEBUG,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"spiral.max_workers",
+        c"Maximum number of parallel background workers",
+        c"Caps the number of workers that can refresh materialized views concurrently.",
+        &WORKER_MAX,
+        1, 
+        100,
         GucContext::Sighup,
         GucFlags::default(),
     );
