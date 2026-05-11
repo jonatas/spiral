@@ -287,6 +287,11 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols);
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
+                
+                // 6. Ensure background worker is running for this database
+                unsafe {
+                    crate::bgworker::maybe_start_worker();
+                }
 
                 IN_UTILITY.with(|h| h.set(false));
                 return;
