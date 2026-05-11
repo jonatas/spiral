@@ -337,8 +337,11 @@ CREATE TABLE ticks (
     spiral.tenant = 'symbol_id'
 );
 
--- Background worker handles refreshes, or manual refresh:
-SELECT spiral_refresh('ticks_1m');
+-- The autonomous background worker automatically detects new inserts and
+-- refreshes 'ticks_1m' in the background!
+--
+-- You can still trigger manual refreshes if desired:
+-- SELECT spiral_refresh('ticks');
 ```
 
 ## 🧪 Benchmarks & Examples
@@ -365,10 +368,25 @@ shared_preload_libraries = 'spiral'
 ```
 
 ### Background Worker Configuration
-Spiral's background worker is auto-configured. It will automatically start for any database where a table is created using `WITH (spiral = ...)`. No manual database name configuration is required.
+Spiral's background worker is fully autonomous. It automatically starts for any database where a table is created using `WITH (spiral.frames = ...)`. No manual database name configuration is required. The worker polls the `spiral.changelog` every 1 second and seamlessly triggers cascading incremental view maintenance across all registered hierarchies.
+
+You can control the background worker using standard PostgreSQL custom variables (GUCs). These can be set in `postgresql.conf` or dynamically via `ALTER SYSTEM`:
+
+- **`spiral.worker_enabled` (boolean, default `true`)**: Allows you to pause the autonomous worker. This is particularly useful during massive data migrations, schema refactorings, or special maintenance windows where you prefer to delay view refreshes until all transactions are completely finalized.
+- **`spiral.worker_debug` (boolean, default `false`)**: By default, the worker logs standard `INFO` messages to the PostgreSQL log when refreshing views. Setting this to `true` switches the output to `DEBUG2` level, silencing the standard logs unless your `log_min_messages` is configured to capture deep debug traces.
+
+**Example Configuration:**
+```sql
+-- Pause the worker globally to perform heavy batch ingestion
+ALTER SYSTEM SET spiral.worker_enabled = false;
+SELECT pg_reload_conf();
+
+-- ... perform massive ingestion ...
+
+-- Re-enable the worker and let it catch up autonomously
+ALTER SYSTEM SET spiral.worker_enabled = true;
+SELECT pg_reload_conf();
+```
 
 ---
 Built with ❤️ using `pgrx` and `ta-statistics`.
-th ❤️ using `pgrx` and `ta-statistics`.
-istics`.
-th ❤️ using `pgrx` and `ta-statistics`.

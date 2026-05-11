@@ -1,4 +1,5 @@
 use pgrx::prelude::*;
+use pgrx::guc::{GucContext, GucRegistry, GucSetting, GucFlags};
 use std::cell::Cell;
 
 pub mod bgworker;
@@ -13,6 +14,11 @@ pgrx::pg_module_magic!();
 
 extension_sql_file!("../sql/spiral.sql", name = "spiral_setup");
 
+use std::ffi::CStr;
+
+pub static WORKER_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub static WORKER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
 }
@@ -20,6 +26,24 @@ thread_local! {
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
     hooks::init_hooks();
+
+    GucRegistry::define_bool_guc(
+        CStr::from_bytes_with_nul_unchecked(b"spiral.worker_enabled\0"),
+        CStr::from_bytes_with_nul_unchecked(b"Enable or disable the autonomous background worker\0"),
+        CStr::from_bytes_with_nul_unchecked(b"When true, the background worker will periodically refresh dirty segments.\0"),
+        &WORKER_ENABLED,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        CStr::from_bytes_with_nul_unchecked(b"spiral.worker_debug\0"),
+        CStr::from_bytes_with_nul_unchecked(b"Enable debug logging for the autonomous background worker\0"),
+        CStr::from_bytes_with_nul_unchecked(b"When true, the background worker will emit debug2 logs.\0"),
+        &WORKER_DEBUG,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 }
 
 /// Computes the Z-order curve for a timestamp and a set of string dimensions.

@@ -31,6 +31,13 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
     while BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(1))) {
         BackgroundWorker::transaction(|| {
             let _ = Spi::connect(|client| {
+                let enabled = crate::WORKER_ENABLED.get();
+                if !enabled {
+                    return Ok::<(), spi::Error>(());
+                }
+
+                let debug_logging = crate::WORKER_DEBUG.get();
+
                 // Find all root materialized views (parent_view = 'BASE')
                 let tuple_table = client.select(
                     "SELECT view_name FROM spiral.metadata WHERE parent_view = 'BASE'",
@@ -56,7 +63,11 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                             .unwrap_or(false);
 
                         if has_dirty {
-                            info!("Spiral Worker: Auto-refreshing root view '{}'", view_name);
+                            if debug_logging {
+                                debug2!("Spiral Worker: Auto-refreshing root view '{}'", view_name);
+                            } else {
+                                info!("Spiral Worker: Auto-refreshing root view '{}'", view_name);
+                            }
                             let _ = Spi::run(&format!("SELECT spiral_refresh('{}')", view_name));
                         }
                     }
