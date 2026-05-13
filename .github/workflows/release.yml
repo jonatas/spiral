@@ -54,12 +54,7 @@ jobs:
         run: cargo install cargo-pgrx --version 0.17.0 --locked
 
       - name: Initialize pgrx
-        run: |
-          if command -v pg_config > /dev/null; then
-            cargo pgrx init --pg${{ matrix.pg_version }}=$(command -v pg_config)
-          else
-            cargo pgrx init
-          fi
+        run: cargo pgrx init
 
       - name: Build Package
         run: cargo pgrx package --features pg${{ matrix.pg_version }}
