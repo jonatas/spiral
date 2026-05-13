@@ -1052,8 +1052,10 @@ unsafe fn extract_query_columns_simple(
 }
 
 fn format_epoch(epoch: i64) -> String {
+    // Add PostgreSQL epoch offset (946684800 = 2000-01-01 - 1970-01-01 in seconds)
+    // so to_timestamp correctly converts it to a human-readable date.
     let date = Spi::get_one_with_args::<String>(
-        "SELECT to_char(to_timestamp($1::double precision), 'YYYY-MM-DD HH24:MI:SS')",
+        "SELECT to_char(to_timestamp(($1 + 946684800)::double precision), 'YYYY-MM-DD HH24:MI:SS')",
         &[unsafe { pgrx::datum::DatumWithOid::new(epoch.into_datum().unwrap(), pg_sys::INT8OID) }],
     )
     .unwrap()

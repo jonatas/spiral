@@ -390,3 +390,37 @@ SELECT pg_reload_conf();
 
 ---
 Built with ❤️ using `pgrx` and `ta-statistics`.
+
+## 📦 Releasing
+
+Spiral uses GitHub Actions to automate the release process. When a new version is tagged and pushed, a GitHub Release is automatically created with pre-built binaries for Linux and macOS.
+
+### Automated Release
+1. Tag the release: `git tag v0.1.0`
+2. Push the tag: `git push origin v0.1.0`
+
+The `.github/workflows/release.yml` will:
+- Build the extension for PostgreSQL 18 on Ubuntu and macOS.
+- Bundle the extension files (`.so`/`.dylib`, `.control`, and `.sql`) into tarballs.
+- Create a GitHub Release and upload the tarballs.
+- Update the Homebrew formula in `Formula/spiral.rb`.
+
+### Local Release
+You can also package the extension locally using the provided script:
+```bash
+./scripts/release.sh
+```
+This requires `cargo-pgrx` to be installed and initialized.
+
+### Homebrew (macOS)
+To install Spiral via Homebrew:
+1. Ensure you have `postgresql@18` installed: `brew install postgresql@18`
+2. Install Spiral using the local formula:
+   ```bash
+   brew install --build-from-source ./Formula/spiral.rb
+   ```
+3. Follow the instructions in the `caveats` section to link the extension files into your PostgreSQL directory.
+
+---
+## 📜 License
+Apache-2.0
