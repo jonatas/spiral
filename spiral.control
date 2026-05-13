@@ -1,5 +1,5 @@
 comment = 'spiral:  Created by pgrx'
-default_version = '0.0.0'
+default_version = '0.0.1'
 module_pathname = '$libdir/spiral'
 relocatable = false
 superuser = true
