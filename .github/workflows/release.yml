@@ -134,6 +134,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -146,9 +148,6 @@ jobs:
           VERSION="${TAG_NAME#v}"
           URL="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG_NAME}.tar.gz"
           
-          # Find the linux asset to calculate SHA256 for the formula (usually from source)
-          # Homebrew usually builds from source, but we can use the source tarball's SHA256.
-          # The script will download the source tarball if we don't provide the SHA256.
           ./scripts/update-homebrew.sh "${VERSION}" "${URL}"
 
       - name: Commit formula update
