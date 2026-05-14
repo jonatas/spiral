@@ -72,7 +72,23 @@ jobs:
           fi
 
       - name: Build Package
-        run: cargo pgrx package --features pg${{ matrix.pg_version }}
+        run: |
+          # Try to find the correct pg_config for the target version
+          if command -v pg_config > /dev/null; then
+            SYS_PG_CONFIG=$(command -v pg_config)
+            PG_VER=$($SYS_PG_CONFIG --version | awk '{print $2}' | cut -d. -f1)
+            if [ "$PG_VER" = "${{ matrix.pg_version }}" ]; then
+              PG_CONFIG=$SYS_PG_CONFIG
+            fi
+          fi
+          
+          if [ -z "$PG_CONFIG" ]; then
+            # Look for pgrx-managed version
+            PG_CONFIG=$(find ~/.pgrx -name pg_config | grep "/${{ matrix.pg_version }}.*/" | head -n 1)
+          fi
+          
+          echo "Using pg_config: $PG_CONFIG"
+          cargo pgrx package --features pg${{ matrix.pg_version }} -c "$PG_CONFIG"
 
       - name: Create Tarball
         run: |
