@@ -1,8 +1,8 @@
 class Spiral < Formula
   desc "Spiral: PostgreSQL extension for advanced analytics"
   homepage "https://github.com/spiral-database/spiral" # Update with actual homepage
-  url "https://github.com/spiral-database/spiral/archive/refs/tags/v0.0.0.tar.gz" # Update with actual tag
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  url "https://github.com/jonatas/spiral/archive/refs/tags/v0.0.1.tar.gz" # Update with actual tag
+  sha256 "0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5"
   license "Apache-2.0" # Update with actual license
 
   depends_on "rust" => :build
