@@ -228,14 +228,6 @@ pub struct SketchState {
 }
 
 impl SketchState {
-    fn new() -> Self {
-        SketchState {
-            max: f64::MIN,
-            min: f64::MAX,
-            ..Default::default()
-        }
-    }
-
     pub fn add(&mut self, val: f64) {
         if let Some(c) = self.centroids.iter_mut().find(|c| (c.0 - val).abs() < 1e-9) {
             c.1 += 1.0;
