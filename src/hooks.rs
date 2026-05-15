@@ -1123,14 +1123,10 @@ pub(crate) unsafe fn extract_supported_query_columns(
 /// assert_eq!(map_agg_inner("SUM", "col_a", true), "\"col_a\"");
 /// ```
 pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool) -> String {
-    let lower = agg_fn.to_lowercase();
     if !is_rollup {
         return format!("{}(\"{}\")", agg_fn, mapped_col);
     }
-    match lower.as_str() {
-        "sum" => format!("\"{}\"", mapped_col),
-        _ => format!("\"{}\"", mapped_col),
-    }
+    format!("\"{}\"", mapped_col)
 }
 
 fn format_epoch(epoch: i64) -> String {

@@ -639,6 +639,25 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_planner_rejects_grouped_sum_target_lists_for_now() {
+        Spi::run(
+            "CREATE TABLE planner_grouped (t timestamptz, tenant_id int, val double precision)",
+        )
+        .unwrap();
+
+        unsafe {
+            let query = hooks::parse_sql_to_query(
+                "SELECT sum(val), tenant_id FROM planner_grouped GROUP BY tenant_id",
+            );
+            assert!(!query.is_null());
+
+            let cols =
+                hooks::extract_supported_query_columns(query, (*query).rtable, "planner_grouped");
+            assert!(cols.is_none());
+        }
+    }
+
+    #[pg_test]
     fn test_planner_rejects_unsupported_aggregate_target_lists() {
         Spi::run(
             "CREATE TABLE planner_fallback (t timestamptz, tenant_id int, val double precision)",
@@ -652,6 +671,8 @@ mod tests {
             "SELECT sum(val), avg(val) FROM planner_fallback",
             "SELECT sum(val + 1) FROM planner_fallback",
             "SELECT DISTINCT sum(val) FROM planner_fallback",
+            "SELECT sum(val) FILTER (WHERE val > 0) FROM planner_fallback",
+            "SELECT sum(val) FROM planner_fallback HAVING count(*) > 0",
         ] {
             unsafe {
                 let query = hooks::parse_sql_to_query(sql);

@@ -1,5 +1,5 @@
-use pgrx::prelude::*;
 use pgrx::pg_sys;
+use pgrx::prelude::*;
 use pgrx::PgRelation;
 
 const BLOCK_SIZE: usize = 128; // 128 bytes per sensor/block
@@ -40,7 +40,9 @@ fn get_tenant_scale_for_oid(rel_oid: i32) -> i64 {
     unsafe {
         let relname_ptr = pg_sys::get_rel_name((rel_oid as u32).into());
         if !relname_ptr.is_null() {
-            let name = std::ffi::CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
+            let name = std::ffi::CStr::from_ptr(relname_ptr)
+                .to_string_lossy()
+                .into_owned();
             pg_sys::pfree(relname_ptr as *mut std::ffi::c_void);
             if let Some(m) = crate::catalog::get_metadata(&name) {
                 return crate::catalog::get_tenant_scale(&m);
@@ -80,7 +82,10 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
     }
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::RowExclusiveLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::RowExclusiveLock as i32,
+        );
         let rel = pg_rel.as_ptr();
         if rel.is_null() {
             panic!("Spiral: relation pointer is NULL for OID {}", main_rel_oid);
@@ -96,12 +101,18 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
                 let page = pg_sys::BufferGetPage(buffer);
-                pg_sys::PageInit(page, BLCKSZ as pg_sys::Size, std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size);
+                pg_sys::PageInit(
+                    page,
+                    BLCKSZ as pg_sys::Size,
+                    std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size,
+                );
                 pg_sys::MarkBufferDirty(buffer);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                 pg_sys::ReleaseBuffer(buffer);
                 nblocks += 1;
-                if nblocks > 100000 { break; }
+                if nblocks > 100000 {
+                    break;
+                }
             }
 
             let buffer = pg_sys::ReadBuffer(rel, blkno);
@@ -116,10 +127,12 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
             pg_sys::ReleaseBuffer(buffer);
             count += 1;
         }
-        notice!("Spiral: packed {} rows into O(1) buffer-managed store", count);
+        notice!(
+            "Spiral: packed {} rows into O(1) buffer-managed store",
+            count
+        );
     }
 }
-
 
 #[pg_extern]
 pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
@@ -127,7 +140,10 @@ pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
     let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::RowExclusiveLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::RowExclusiveLock as i32,
+        );
         let rel = pg_rel.as_ptr();
 
         let _ = Spi::connect(|client| {
@@ -154,13 +170,19 @@ pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
                     let page = pg_sys::BufferGetPage(buffer);
 
-                    pg_sys::PageInit(page, BLCKSZ as pg_sys::Size, std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size);
+                    pg_sys::PageInit(
+                        page,
+                        BLCKSZ as pg_sys::Size,
+                        std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size,
+                    );
 
                     pg_sys::MarkBufferDirty(buffer);
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                     pg_sys::ReleaseBuffer(buffer);
                     nblocks += 1;
-                    if nblocks > 200000 { break; } // Safety break
+                    if nblocks > 200000 {
+                        break;
+                    } // Safety break
                 }
 
                 let state = pg_sys::GenericXLogStart(rel);
@@ -189,7 +211,10 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
     let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::RowExclusiveLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::RowExclusiveLock as i32,
+        );
         let rel = pg_rel.as_ptr();
 
         let _ = Spi::connect(|client| {
@@ -237,12 +262,18 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
                     let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
                     let page = pg_sys::BufferGetPage(buffer);
-                    pg_sys::PageInit(page, BLCKSZ as pg_sys::Size, std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size);
+                    pg_sys::PageInit(
+                        page,
+                        BLCKSZ as pg_sys::Size,
+                        std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size,
+                    );
                     pg_sys::MarkBufferDirty(buffer);
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                     pg_sys::ReleaseBuffer(buffer);
                     nblocks += 1;
-                    if nblocks > 200000 { break; } // Safety break
+                    if nblocks > 200000 {
+                        break;
+                    } // Safety break
                 }
 
                 let state = pg_sys::GenericXLogStart(rel);
@@ -277,7 +308,10 @@ pub fn spiral_read_main(main_rel_oid: i32, t: i64, tenant_id: i64) -> Option<f64
     let (blkno, page_offset) = logical_to_physical_offset(logical_offset);
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::AccessShareLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::AccessShareLock as i32,
+        );
         let rel = pg_rel.as_ptr();
 
         if blkno >= get_block_count(rel) {
@@ -307,7 +341,10 @@ pub fn spiral_read_main_compact(main_rel_oid: i32, t: i64, tenant_id: i64) -> Op
     let (blkno, page_offset) = logical_to_physical_offset(logical_offset);
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::AccessShareLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::AccessShareLock as i32,
+        );
         let rel = pg_rel.as_ptr();
 
         if blkno >= get_block_count(rel) {
@@ -341,7 +378,10 @@ pub fn spiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) -
     let (blkno, page_offset) = logical_to_physical_offset(logical_offset);
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::AccessShareLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::AccessShareLock as i32,
+        );
         let rel = pg_rel.as_ptr();
 
         if blkno >= get_block_count(rel) {
@@ -366,7 +406,9 @@ pub fn spiral_read_main_block_point(main_rel_oid: i32, t: i64, tenant_id: i64) -
         }
 
         for i in 0..step {
-            if i >= 60 { break; }
+            if i >= 60 {
+                break;
+            }
             let xor_delta = u16::from_le_bytes([block.data[i * 2], block.data[i * 2 + 1]]) as u64;
             current_bits ^= xor_delta;
         }
@@ -386,7 +428,10 @@ pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id:
     let (blkno, page_offset) = logical_to_physical_offset(logical_offset);
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::AccessShareLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::AccessShareLock as i32,
+        );
         let rel = pg_rel.as_ptr();
 
         if blkno >= pg_sys::RelationGetNumberOfBlocksInFork(rel, 0) {
@@ -427,7 +472,10 @@ pub fn spiral_scan_zero(
     let mut results = Vec::new();
 
     unsafe {
-        let pg_rel = PgRelation::with_lock(pg_sys::Oid::from(main_rel_oid as u32), pg_sys::AccessShareLock as i32);
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(main_rel_oid as u32),
+            pg_sys::AccessShareLock as i32,
+        );
         let rel = pg_rel.as_ptr();
 
         let nblocks = get_block_count(rel);
