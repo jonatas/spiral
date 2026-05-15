@@ -579,7 +579,7 @@ How does Spiral know how to roll up your data? It uses deterministic rules for c
 | `_h` / `_max` | `max()` | Peak is peak. |
 | `_l` / `_min` | `min()` | Low is low. |
 | `_sum` / `_count` | `sum()` | Accumulate totals. |
-| `_sketch` | `merge()` | Mathematically unified sketches. |
+| `_sketch` | `merge()` | Compact centroid sketch; exact for ≤100 distinct values, approximate otherwise. |
 
 # Incremental Maintenance: Tracking Changes via Changelog
 
