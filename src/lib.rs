@@ -626,22 +626,22 @@ mod tests {
     #[pg_test]
     fn test_zorder_correctness() {
         use crate::spiral_zorder_int_array;
-        
+
         // Test case 1: 0, 0 -> 0
         assert_eq!(spiral_zorder_int_array(0, vec![0]), 0);
-        
+
         // Test case 2: 1, 0 -> 1 (Time bit 0 at position 0)
         assert_eq!(spiral_zorder_int_array(1, vec![0]), 1);
-        
+
         // Test case 3: 0, 1 -> 2 (Dimension bit 0 at position 1)
         assert_eq!(spiral_zorder_int_array(0, vec![1]), 2);
-        
+
         // Test case 4: 1, 1 -> 3 (Both bits 0 at positions 0 and 1)
         assert_eq!(spiral_zorder_int_array(1, vec![1]), 3);
 
         // Test case 5: 2, 0 -> 4 (Time bit 1 at position 2)
         assert_eq!(spiral_zorder_int_array(2, vec![0]), 4);
-        
+
         // Test case 6: 0, 2 -> 8 (Dimension bit 1 at position 3)
         assert_eq!(spiral_zorder_int_array(0, vec![2]), 8);
     }
