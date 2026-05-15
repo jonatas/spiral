@@ -50,6 +50,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_nontransactional_truncate(
 }
 
 #[pg_guard]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
     _old_heap: pg_sys::Relation,
     _new_heap: pg_sys::Relation,

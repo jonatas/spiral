@@ -1,5 +1,5 @@
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
-use pgrx::guc::{GucContext, GucRegistry, GucSetting, GucFlags};
 use std::cell::Cell;
 
 pub mod bgworker;
@@ -49,7 +49,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         c"Maximum number of parallel background workers",
         c"Caps the number of workers that can refresh materialized views concurrently.",
         &WORKER_MAX,
-        1, 
+        1,
         100,
         GucContext::Sighup,
         GucFlags::default(),
@@ -565,7 +565,7 @@ pub mod pg_test {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    use crate::catalog;
+    use crate::{catalog, hooks};
     use pgrx::prelude::*;
 
     #[pg_test]
@@ -616,5 +616,53 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(children[0], "child1");
         assert_eq!(children[1], "child2");
+    }
+
+    #[pg_test]
+    fn test_planner_supports_plain_sum_target_lists() {
+        Spi::run(
+            "CREATE TABLE planner_support (t timestamptz, tenant_id int, val double precision)",
+        )
+        .unwrap();
+
+        unsafe {
+            let query = hooks::parse_sql_to_query("SELECT sum(val) FROM planner_support");
+            assert!(!query.is_null());
+
+            let cols =
+                hooks::extract_supported_query_columns(query, (*query).rtable, "planner_support");
+            assert_eq!(
+                cols,
+                Some(vec![("val".to_string(), Some("sum".to_string()))])
+            );
+        }
+    }
+
+    #[pg_test]
+    fn test_planner_rejects_unsupported_aggregate_target_lists() {
+        Spi::run(
+            "CREATE TABLE planner_fallback (t timestamptz, tenant_id int, val double precision)",
+        )
+        .unwrap();
+
+        for sql in [
+            "SELECT avg(val) FROM planner_fallback",
+            "SELECT count(*) FROM planner_fallback",
+            "SELECT min(val), max(val) FROM planner_fallback",
+            "SELECT sum(val), avg(val) FROM planner_fallback",
+            "SELECT sum(val + 1) FROM planner_fallback",
+            "SELECT DISTINCT sum(val) FROM planner_fallback",
+        ] {
+            unsafe {
+                let query = hooks::parse_sql_to_query(sql);
+                assert!(!query.is_null(), "expected parser output for {sql}");
+                let cols = hooks::extract_supported_query_columns(
+                    query,
+                    (*query).rtable,
+                    "planner_fallback",
+                );
+                assert!(cols.is_none(), "expected fallback for {sql}, got {cols:?}");
+            }
+        }
     }
 }

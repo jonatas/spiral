@@ -171,7 +171,7 @@ pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
                 let ptr = (page as *mut u8).add(page_offset as usize);
 
                 *(ptr as *mut u32) = t as u32;
-                *((ptr as *mut u8).add(4) as *mut f32) = price as f32;
+                *(ptr.add(4) as *mut f32) = price as f32;
 
                 pg_sys::MarkBufferDirty(buffer);
                 pg_sys::GenericXLogFinish(state);

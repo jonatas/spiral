@@ -5,7 +5,7 @@ SET spiral.kickoff_date = '2026-04-15';
 CREATE TABLE cache_test (
     t timestamptz NOT NULL,
     tenant_id int,
-    val double precision -- Spiral: sum, count, avg, min, max
+    val double precision -- Spiral: sum
 ) WITH (
     spiral.frames = '1m,1h',
     spiral.tenant = 'tenant_id'
@@ -31,6 +31,11 @@ SELECT count(*) FROM spiral.changelog WHERE base_view = 'cache_test';
 -- 1. Test: Full Hour Query (Should use 1h rollup)
 -- We expect the notice from the planner hook to show acceleration
 SELECT sum(val), count(val), avg(val), min(val), max(val)
+FROM cache_test
+WHERE t >= '2026-04-15 10:00:00Z' AND t < '2026-04-15 11:00:00Z';
+
+-- 1b. Supported aggregate-only query should remain eligible for acceleration.
+SELECT sum(val)
 FROM cache_test
 WHERE t >= '2026-04-15 10:00:00Z' AND t < '2026-04-15 11:00:00Z';
 
