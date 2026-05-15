@@ -55,6 +55,9 @@ END $$;
 
 -- 4. HIERARCHY CREATION
 \echo '--- Creating Baseline Views ---'
+DROP MATERIALIZED VIEW IF EXISTS baseline_1m CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS baseline_1h CASCADE;
+
 CREATE MATERIALIZED VIEW baseline_1m AS SELECT date_trunc('minute', t) as t, symbol_id, (first_pg(price, t)).v as o, max(price) as h, min(price) as l, (last_pg(price, t)).v as c, sum(vol) as volume FROM baseline_ticks GROUP BY 1, 2;
 CREATE MATERIALIZED VIEW baseline_1h AS SELECT date_trunc('hour', t) as t, symbol_id, (first_pg(o, t)).v as o, max(h) as h, min(l) as l, (last_pg(c, t)).v as c, sum(volume) as volume FROM baseline_1m GROUP BY 1, 2;
 

@@ -3,25 +3,143 @@ use pgrx::prelude::*;
 
 // Table Access Method (TAM) Handler for Spiral
 #[pg_extern(sql = "
-        CREATE FUNCTION spiral_tam_handler(internal) RETURNS table_am_handler LANGUAGE c AS 'MODULE_PATHNAME', 'spiral_tam_handler_wrapper' STRICT;
+        CREATE FUNCTION spiral_tam_handler(internal) RETURNS table_am_handler LANGUAGE c AS 'MODULE_PATHNAME', 'spiral_tam_handler_wrapper';
         CREATE ACCESS METHOD spiral TYPE TABLE HANDLER spiral_tam_handler;
     ")]
 /// # Safety
 /// This function is unsafe because it interacts with PostgreSQL C internals.
 pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
     let routine =
-        pgrx::PgMemoryContexts::TopMemoryContext.palloc_struct::<pg_sys::TableAmRoutine>();
+        pgrx::PgMemoryContexts::TopMemoryContext.palloc0_struct::<pg_sys::TableAmRoutine>();
 
     (*routine).type_ = pg_sys::NodeTag::T_TableAmRoutine;
 
     // Wire up the O(1) logic callbacks
+    (*routine).slot_callbacks = Some(spiral_slot_callbacks);
     (*routine).tuple_insert = Some(spiral_slot_insert);
+    
     (*routine).scan_begin = Some(spiral_scan_begin);
     (*routine).scan_getnextslot = Some(spiral_scan_getnextslot);
     (*routine).scan_end = Some(spiral_scan_end);
     (*routine).scan_rescan = Some(spiral_scan_rescan);
 
+    (*routine).relation_size = Some(spiral_relation_size);
+    (*routine).relation_estimate_size = Some(spiral_relation_estimate_size);
+    (*routine).relation_set_new_filelocator = Some(spiral_relation_set_new_filelocator);
+    (*routine).relation_nontransactional_truncate = Some(spiral_relation_nontransactional_truncate);
+    (*routine).relation_copy_for_cluster = Some(spiral_relation_copy_for_cluster);
+    (*routine).tuple_fetch_row_version = Some(spiral_tuple_fetch_row_version);
+    (*routine).tuple_tid_valid = Some(spiral_tuple_tid_valid);
+    (*routine).tuple_satisfies_snapshot = Some(spiral_tuple_satisfies_snapshot);
+    (*routine).relation_needs_toast_table = Some(spiral_relation_needs_toast_table);
+
     pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)))
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_needs_toast_table(
+    _rel: pg_sys::Relation,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_nontransactional_truncate(
+    _rel: pg_sys::Relation,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
+    _old_heap: pg_sys::Relation,
+    _new_heap: pg_sys::Relation,
+    _old_index: pg_sys::Relation,
+    _use_sort: bool,
+    _oldest_xmin: pg_sys::TransactionId,
+    _freeze_xid: *mut pg_sys::TransactionId,
+    _minmulti: *mut pg_sys::MultiXactId,
+    _pages: *mut f64,
+    _tuples: *mut f64,
+    _allvisfrac: *mut f64,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
+    _rel: pg_sys::Relation,
+    _tid: pg_sys::ItemPointer,
+    _snapshot: pg_sys::Snapshot,
+    _slot: *mut pg_sys::TupleTableSlot,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_tid_valid(
+    _scan: pg_sys::TableScanDesc,
+    _tid: pg_sys::ItemPointer,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_satisfies_snapshot(
+    _rel: pg_sys::Relation,
+    _slot: *mut pg_sys::TupleTableSlot,
+    _snapshot: pg_sys::Snapshot,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
+    _rel: pg_sys::Relation,
+    _newrlocator: *const pg_sys::RelFileLocator,
+    _persistence: std::os::raw::c_char,
+    _freeze_xid: *mut pg_sys::TransactionId,
+    _multi_xid: *mut pg_sys::MultiXactId,
+) {
+    unsafe {
+        *_freeze_xid = pg_sys::TransactionId::from(0);
+        *_multi_xid = pg_sys::MultiXactId::from(0);
+        pg_sys::RelationCreateStorage(*_newrlocator, _persistence, true);
+    }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_slot_callbacks(
+    _rel: pg_sys::Relation,
+) -> *const pg_sys::TupleTableSlotOps {
+    &pg_sys::TTSOpsVirtual
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_size(
+    rel: pg_sys::Relation,
+    _fork_number: pg_sys::ForkNumber::Type,
+) -> u64 {
+    unsafe {
+        pg_sys::RelationGetSmgr(rel);
+        let nblocks = pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
+        (nblocks as u64) * 8192
+    }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
+    rel: pg_sys::Relation,
+    _attr_widths: *mut i32,
+    _pages: *mut pg_sys::BlockNumber,
+    _tuples: *mut f64,
+    _allvisfrac: *mut f64,
+) {
+    unsafe {
+        pg_sys::RelationGetSmgr(rel);
+        let nblocks = pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
+        *_pages = nblocks;
+        *_tuples = (nblocks as f64) * 1024.0; 
+        *_allvisfrac = 1.0;
+    }
 }
 
 #[pg_guard]
@@ -39,14 +157,12 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
 }
 
 use std::ffi::CStr;
-use std::fs::File;
-use std::io::{Read, Seek};
 
 struct SpiralScanState {
-    file: File,
     tenant_scale: i64,
-    current_index: u64,
-    total_slots: u64,
+    current_blkno: pg_sys::BlockNumber,
+    total_blks: pg_sys::BlockNumber,
+    current_offset_in_page: u32,
 }
 
 #[repr(C)]
@@ -72,30 +188,24 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
         (*scan).rs_snapshot = snapshot;
 
         let oid = (*rel).rd_id;
-        let mut path = std::path::PathBuf::from("/tmp/spiral_main/");
-        path.push(format!("{}.bin", oid));
-
         let mut tenant_scale = 1024;
         let relname_ptr = pg_sys::get_rel_name(oid);
         if !relname_ptr.is_null() {
-            let name = CStr::from_ptr(relname_ptr).to_string_lossy();
+            let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
+            pg_sys::pfree(relname_ptr as *mut std::ffi::c_void);
             if let Some(m) = crate::catalog::get_metadata(&name) {
                 tenant_scale = crate::catalog::get_tenant_scale(&m);
             }
         }
 
-        if let Ok(file) = File::open(&path) {
-            let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let state = Box::new(SpiralScanState {
-                file,
-                tenant_scale,
-                current_index: 0,
-                total_slots: total_size / 8,
-            });
-            (*spiral_scan).state = Box::into_raw(state);
-        } else {
-            (*spiral_scan).state = std::ptr::null_mut();
-        }
+        let total_blks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+        let state = Box::new(SpiralScanState {
+            tenant_scale,
+            current_blkno: 0,
+            total_blks,
+            current_offset_in_page: crate::storage::HEADER_SIZE as u32,
+        });
+        (*spiral_scan).state = Box::into_raw(state);
     }
     scan
 }
@@ -116,38 +226,52 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
     }
 
     let state = &mut *(*spiral_scan).state;
-    let mut buf = [0u8; 8];
+    let rel = (*scan).rs_rd;
 
-    while state.current_index < state.total_slots {
-        if state.file.read_exact(&mut buf).is_ok() {
-            let val = f64::from_le_bytes(buf);
-            let idx = state.current_index;
-            state.current_index += 1;
+    while state.current_blkno < state.total_blks {
+        let buffer = pg_sys::ReadBuffer(rel, state.current_blkno);
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+
+        let page = pg_sys::BufferGetPage(buffer);
+        let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
+
+        while state.current_offset_in_page + 8 <= upper_bound {
+            let ptr = (page as *const u8).add(state.current_offset_in_page as usize);
+            let val = *(ptr as *const f64);
+            let offset_in_page = state.current_offset_in_page;
+            state.current_offset_in_page += 8;
 
             if val != 0.0 {
-                let t = idx as i64 / state.tenant_scale;
-                let tenant_id = (idx as i64 % state.tenant_scale) as i32;
+                let items_before = (offset_in_page - crate::storage::HEADER_SIZE as u32) / 8;
+                let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64) + items_before as i64;
+
+                let t = idx / state.tenant_scale;
+                let tenant_id = (idx % state.tenant_scale) as i32;
 
                 pg_sys::ExecClearTuple(slot);
-
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 *values.add(0) = t.into_datum().unwrap();
                 *isnull.add(0) = false;
-
                 *values.add(1) = tenant_id.into_datum().unwrap();
                 *isnull.add(1) = false;
-
                 *values.add(2) = val.into_datum().unwrap();
                 *isnull.add(2) = false;
 
                 pg_sys::ExecStoreVirtualTuple(slot);
+
+                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                pg_sys::ReleaseBuffer(buffer);
                 return true;
             }
-        } else {
-            break;
         }
+
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+        pg_sys::ReleaseBuffer(buffer);
+
+        state.current_blkno += 1;
+        state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
     }
     false
 }
@@ -177,8 +301,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
         let spiral_scan = scan as *mut SpiralScanDescData;
         if !(*spiral_scan).state.is_null() {
             let state = &mut *(*spiral_scan).state;
-            state.current_index = 0;
-            let _ = state.file.seek(std::io::SeekFrom::Start(0));
+            state.current_blkno = 0;
+            state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
         }
     }
 }

@@ -76,9 +76,9 @@ pub fn derive_child_sql(
 ) -> (String, Vec<SourceDef>) {
     Spi::connect(|client| {
         let exists_res = client.select(
-            "SELECT 1 FROM pg_class WHERE relname = $1",
+            &format!("SELECT 1 FROM pg_class WHERE relname = '{}'", child_name.replace("'", "''")),
             Some(1),
-            unsafe { &[pgrx::datum::DatumWithOid::new(child_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
+            &[]
         );
         let exists = match exists_res {
             Ok(t) => !t.is_empty(),
@@ -95,9 +95,9 @@ pub fn derive_child_sql(
         }
 
         let parent_is_view_res = client.select(
-            "SELECT frame_seconds FROM spiral.metadata WHERE view_name = $1",
+            &format!("SELECT frame_seconds FROM spiral.metadata WHERE view_name = '{}'", parent_name.replace("'", "''")),
             Some(1),
-            unsafe { &[pgrx::datum::DatumWithOid::new(parent_name.into_datum().unwrap(), pg_sys::TEXTOID)] }
+            &[]
         );
         let parent_is_view = match parent_is_view_res {
             Ok(t) => {

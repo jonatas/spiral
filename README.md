@@ -214,11 +214,11 @@ Spiral tracks "dirty buckets" in a transactional changelog to provide **Incremen
 ---
 
 ### 6. Time-as-Address (8x Storage Reduction)
-For extremely high-density datasets where even a `bigint` timestamp is redundant, Spiral can eliminate the timestamp column entirely from physical storage.
+For extremely high-density datasets where even a `bigint` timestamp is redundant, Spiral can eliminate the timestamp column entirely from physical storage by leveraging custom **Table Access Methods (TAM)**.
 
 - <details><summary><b>Zero-Timestamp Storage</b></summary>
   
-  The time and tenant identity are implicitly encoded in the physical address (file offset). By defining a strict minimal pace (resolution) and a constant kickoff date, the exact time can be derived mathematically from the storage location, eliminating the need to physically store timestamp fields on disk.
+  The time and tenant identity are implicitly encoded in the physical address (block number and offset). By defining a strict minimal pace (resolution) and a constant kickoff date, the exact time is derived mathematically from the buffer location, eliminating the need to physically store timestamp fields on disk.
 
   **Mechanism & Example:**
   ```sql
@@ -226,29 +226,21 @@ For extremely high-density datasets where even a `bigint` timestamp is redundant
   CREATE TABLE ticks_raw_data (
       price numeric,
       vol int
-  ) WITH (spiral.storage = 'addressable');
+  ) USING spiral; -- Uses the custom TAM
   ```
-  Instead of storing `(t, symbol_id, price, vol)`, we only write `(price, vol)`. When querying, a Set-Returning Function reconstructs the timestamp via: `t = kickoff_date + (offset / row_size) * pace`.
+  Instead of storing `(t, symbol_id, price, vol)`, we only write `(price, vol)`. When querying, the `spiral` access method reconstructs the timestamp via: `t = kickoff_date + (physical_index) * pace`.
   </details>
 - <details><summary><b>8x Smaller Footprint</b></summary>Reduces row size from 64 bytes down to just <b>8 bytes</b> (only the value is stored). This extreme compression means that an entire month of high-frequency sensor data can fit efficiently within PostgreSQL's shared buffers, drastically reducing cache eviction rates and accelerating I/O bound queries.</details>
-- <details><summary><b>O(1) Direct Access</b></summary>Read any point in time for any tenant instantly using bitwise math, bypassing all PostgreSQL indexes. Traditional B-trees degrade at scale, but calculating an exact file offset requires a constant number of CPU cycles regardless of dataset size, offering unprecedented and predictable lookup speeds.</details>
-- <details><summary><b>Safety Headers</b></summary>
+- <details><summary><b>O(1) Direct Access</b></summary>Read any point in time for any tenant instantly using bitwise math, bypassing all PostgreSQL indexes. Traditional B-trees degrade at scale, but calculating an exact buffer offset requires a constant number of CPU cycles regardless of dataset size, offering unprecedented and predictable lookup speeds.</details>
+- <details><summary><b>Native Postgres Integration</b></summary>
   
-  Every binary file includes an <code>ASPI</code> header validating the OID, Kickoff Date, and Resolution (Pace) to prevent data corruption. This validation layer ensures that if files are copied, moved, or corrupted, the system can instantly detect mismatches between the PostgreSQL catalog metadata and the physical binary file configuration.
+  Unlike external binary files, the `spiral` TAM is fully integrated with the <b>Postgres Buffer Manager and WAL (Write-Ahead Log)</b>. This means your high-density data is crash-safe, replication-ready, and fully compatible with standard <code>pg_dump</code> and <code>pg_basebackup</code>.
 
   **Mechanism & Example:**
-  ```c
-  // C/Rust pseudo-code validating the 16-byte header on open:
-  struct AspiHeader {
-      char magic[4]; // "ASPI"
-      uint32_t rel_oid;
-      uint64_t kickoff_epoch;
-  };
-  ```
-  If a DBA mistakenly attaches a wrong file, querying it:
   ```sql
-  SELECT * FROM spiral_scan_zero('wrong_file_oid');
-  -- ERROR: ASPI header mismatch: expected OID 12345, found 99999
+  -- Standard Postgres operations work out of the box
+  SELECT * FROM ticks_raw_data WHERE t > '2026-04-15';
+  -- Data is retrieved via O(1) buffer mapping inside the TAM
   ```
   </details>
 
@@ -291,24 +283,6 @@ The Hierarchical Planner doesn't just replace tables; it **grafts subqueries**. 
 
 ### 5. Join Constraint Propagation
 In multi-table queries, Spiral performs a recursive walk of the **JoinTree**. If it detects an equijoin on time (e.g., `a.t = b.t`) where only one side has a defined range, Spiral **propagates the constraint** to the other side. This enables the simultaneous acceleration of multiple independent time-series datasets in a single join operation.
-
----
-
-### 7. Backup & Restore (SQL Dump Compatibility)
-Because optimized binary files live outside the standard PostgreSQL data directory, standard `pg_dump` will not capture them by default. 
-
-**To perform a backup:**
-Materialize the optimized storage back into a standard PostgreSQL table using the provided Set-Returning Function:
-```sql
-CREATE TABLE backup_ticks AS SELECT * FROM spiral_scan_zero(ticks_oid);
-```
-Standard backup tools will then see and capture `backup_ticks`.
-
-**To restore:**
-After restoring the SQL dump, re-pack the data into the optimized format:
-```sql
-SELECT spiral_pack_delta_zero('backup_ticks', new_ticks_oid);
-```
 
 ## 📖 Quick Start
 

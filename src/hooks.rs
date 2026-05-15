@@ -175,8 +175,13 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 query_str.len()
             );
 
-            if !extracted_frames.is_empty() {
-                notice!("Spiral: WITH parameters found, calling standard_ProcessUtility...");
+            if !extracted_frames.is_empty() || !extracted_tenant.is_empty() || !extracted_cardinality.is_empty() {
+                if tag == pg_sys::NodeTag::T_CreateStmt {
+                    let stmt = utility_stmt as *mut pg_sys::CreateStmt;
+                    (*stmt).accessMethod = pg_sys::pstrdup(c"spiral".as_ptr());
+                }
+                
+                notice!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
                         pstmt,
@@ -554,8 +559,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                             let table_exists = !client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.is_empty();
                             if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
 
-                            let table = client.select("SELECT view_name FROM spiral.metadata WHERE base_view = $1", None,
-                                unsafe { &[pgrx::datum::DatumWithOid::new(base_table.clone().into_datum().unwrap(), pg_sys::TEXTOID)] })?;
+                            let table = client.select(&format!("SELECT view_name FROM spiral.metadata WHERE base_view = '{}'", base_table.replace("'", "''")), None, &[])?;
                             for row in table { views.push(row.get::<String>(1)?.unwrap()); }
                             Ok::<Vec<String>, spi::Error>(views)
                         }).unwrap_or_default();
@@ -1052,15 +1056,12 @@ unsafe fn extract_query_columns_simple(
 }
 
 fn format_epoch(epoch: i64) -> String {
-    // Add PostgreSQL epoch offset (946684800 = 2000-01-01 - 1970-01-01 in seconds)
-    // so to_timestamp correctly converts it to a human-readable date.
-    let date = Spi::get_one_with_args::<String>(
-        "SELECT to_char(to_timestamp(($1 + 946684800)::double precision), 'YYYY-MM-DD HH24:MI:SS')",
-        &[unsafe { pgrx::datum::DatumWithOid::new(epoch.into_datum().unwrap(), pg_sys::INT8OID) }],
-    )
-    .unwrap()
-    .unwrap_or_else(|| epoch.to_string());
-    date
+    Spi::get_one::<String>(&format!(
+        "SELECT to_char(to_timestamp({}::double precision), 'YYYY-MM-DD HH24:MI:SS')",
+        epoch
+    ))
+    .unwrap_or_default()
+    .unwrap_or_else(|| epoch.to_string())
 }
 
 fn construct_union_sql_hierarchical(
@@ -1068,25 +1069,40 @@ fn construct_union_sql_hierarchical(
     segments: &[Segment],
     cols: &[(String, Option<String>)],
 ) -> String {
-    let mut union_parts = Vec::new();
-    for (i, seg) in segments.iter().enumerate() {
+    let mut sources: Vec<String> = segments.iter().map(|s| s.source.clone()).collect();
+    sources.sort();
+    sources.dedup();
+
+    let mut sources_with_seconds: Vec<(String, i32)> = sources
+        .into_iter()
+        .map(|s| {
+            let secs = if s == base_table {
+                0
+            } else {
+                catalog::get_metadata(&s).map(|m| m.frame_seconds).unwrap_or(0)
+            };
+            (s, secs)
+        })
+        .collect();
+    sources_with_seconds.sort_by_key(|s| -s.1);
+
+    let mut cte_parts = Vec::new();
+    let mut tier_names = Vec::new();
+
+    for (src, secs) in sources_with_seconds {
+        let is_rollup = src != base_table;
         let mut inner_select = Vec::new();
-        inner_select.push(format!(
-            "to_timestamp({}::double precision) as t",
-            seg._t_start + 946684800
-        ));
+        inner_select.push("t".to_string());
+
         for (col, agg) in cols {
             if let Some(agg_fn) = agg {
-                let is_rollup = seg.source != base_table;
                 let mapped = if is_rollup {
                     Spi::connect(|client| {
-                        client.select("SELECT mat_column FROM spiral.sources WHERE view_name = $1 AND base_column = $2 AND formula = $3 LIMIT 1", None,
-                            unsafe { &[
-                                pgrx::datum::DatumWithOid::new(seg.source.clone().into_datum().unwrap(), pg_sys::TEXTOID),
-                                pgrx::datum::DatumWithOid::new(col.clone().into_datum().unwrap(), pg_sys::TEXTOID),
-                                pgrx::datum::DatumWithOid::new(agg_fn.to_lowercase().into_datum().unwrap(), pg_sys::TEXTOID)
-                            ]}
-                        )?.get_one::<String>()
+                        client.select(&format!("SELECT mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' AND formula = '{}' LIMIT 1",
+                            src.replace("'", "''"),
+                            col.replace("'", "''"),
+                            agg_fn.to_lowercase().replace("'", "''")
+                        ), None, &[])?.get_one::<String>()
                     }).unwrap_or(None).unwrap_or_else(|| col.clone())
                 } else {
                     col.clone()
@@ -1102,11 +1118,19 @@ fn construct_union_sql_hierarchical(
                 }
             }
         }
-        let where_clause = format!(
-            "spiral(t) >= {} AND spiral(t) < {}",
-            seg._t_start, seg._t_end
-        );
-        let group_by_str = if seg.source == base_table {
+
+        let mut range_strs = Vec::new();
+        for seg in segments.iter().filter(|s| s.source == src) {
+            let ts_start = format_epoch(seg._t_start);
+            let ts_end = format_epoch(seg._t_end);
+            range_strs.push(format!("[\"{}\", \"{}\")", ts_start, ts_end));
+        }
+        
+        if range_strs.is_empty() { continue; }
+
+        let multirange_lit = format!("'{{ {} }}'::tstzmultirange", range_strs.join(", "));
+        
+        let group_by_str = if !is_rollup {
             let group_by = cols
                 .iter()
                 .filter(|(c, agg)| agg.is_none() && c != "t")
@@ -1120,27 +1144,34 @@ fn construct_union_sql_hierarchical(
         } else {
             "".to_string()
         };
-        let alias = if seg.source == base_table {
-            format!("raw_fallback_{}", i)
-        } else {
-            let tier = match catalog::get_metadata(&seg.source).map(|m| m.frame_seconds) {
-                Some(86400) => "daily",
-                Some(3600) => "hourly",
-                Some(60) => "minutely",
-                _ => "rollup",
-            };
-            format!("{}_tier_{}", tier, i)
+
+        let tier_name = match secs {
+            86400 => "daily_tier".to_string(),
+            3600 => "hourly_tier".to_string(),
+            60 => "minutely_tier".to_string(),
+            0 => "raw_tier".to_string(),
+            _ => format!("rollup_{}_tier", secs),
         };
-        union_parts.push(format!(
-            "SELECT * FROM (SELECT {} FROM {} WHERE {}{}) AS {}",
+        tier_names.push(tier_name.clone());
+
+        cte_parts.push(format!(
+            "{} AS (SELECT {} FROM {} WHERE t <@ {} {})",
+            tier_name,
             inner_select.join(", "),
-            seg.source,
-            where_clause,
-            group_by_str,
-            alias
+            src,
+            multirange_lit,
+            group_by_str
         ));
     }
-    union_parts.join(" UNION ALL ")
+
+    let mut sql = String::from("WITH ");
+    sql.push_str(&cte_parts.join(", "));
+    sql.push_str(" ");
+    
+    let union_selects: Vec<String> = tier_names.iter().map(|n| format!("SELECT * FROM {}", n)).collect();
+    sql.push_str(&union_selects.join(" UNION ALL "));
+    sql.push_str(" ORDER BY t");
+    sql
 }
 
 pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
@@ -1161,15 +1192,10 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
 
     if is_root {
         // Bootstrap: If changelog is empty for this base table, insert a full range to force initial materialization
-        let count: i64 = Spi::get_one_with_args(
-            "SELECT count(*) FROM spiral.changelog WHERE base_view = $1",
-            &[unsafe {
-                pgrx::datum::DatumWithOid::new(
-                    real_base.clone().into_datum().unwrap(),
-                    pg_sys::TEXTOID,
-                )
-            }],
-        )
+        let count: i64 = Spi::get_one(&format!(
+            "SELECT count(*) FROM spiral.changelog WHERE base_view = '{}'",
+            real_base.replace("'", "''")
+        ))
         .unwrap()
         .unwrap();
         if count == 0 {
@@ -1242,8 +1268,7 @@ pub fn spiral_explain(query_sql: &str) -> String {
                 let table_exists = !client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.is_empty();
                 if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
 
-                let table = client.select("SELECT view_name FROM spiral.metadata WHERE base_view = $1", None,
-                    &[pgrx::datum::DatumWithOid::new(base_table.clone().into_datum().unwrap(), pg_sys::TEXTOID)])?;
+                let table = client.select(&format!("SELECT view_name FROM spiral.metadata WHERE base_view = '{}'", base_table.replace("'", "''")), None, &[])?;
                 for row in table { views.push(row.get::<String>(1)?.unwrap()); }
                 Ok::<Vec<String>, spi::Error>(views)
             }).unwrap_or_default();

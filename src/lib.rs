@@ -14,8 +14,6 @@ pgrx::pg_module_magic!();
 
 extension_sql_file!("../sql/spiral.sql", name = "spiral_setup");
 
-use std::ffi::CStr;
-
 pub static WORKER_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static WORKER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
@@ -179,10 +177,12 @@ fn spiral_is_loaded() -> bool {
     true
 }
 
+const POSTGRES_EPOCH_JDATE: i64 = 946684800; // seconds between 1970-01-01 and 2000-01-01
+
 #[pg_extern(immutable, parallel_safe)]
 fn spiral(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
     let micros = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
-    micros / 1000000
+    (micros / 1000000) + POSTGRES_EPOCH_JDATE
 }
 
 #[pg_extern(immutable, parallel_safe, name = "spiral")]
@@ -240,12 +240,10 @@ fn refresh_incremental(
     let changelog_key = metadata.base_view.clone();
 
     let source_table = if parent_view == "BASE" {
-        let res = Spi::get_one_with_args::<String>(
-            "SELECT base_view FROM spiral.metadata WHERE view_name = $1",
-            &[unsafe {
-                pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)
-            }],
-        );
+        let res = Spi::get_one::<String>(&format!(
+            "SELECT base_view FROM spiral.metadata WHERE view_name = '{}'",
+            view_name.replace("'", "''")
+        ));
 
         match res {
             Ok(Some(v)) => v,
@@ -389,7 +387,7 @@ fn spiral_to_epoch(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
 
 #[pg_extern]
 fn spiral_from_epoch(epoch: i64) -> pgrx::datum::TimestampWithTimeZone {
-    let micros = epoch * 1000000;
+    let micros = (epoch - POSTGRES_EPOCH_JDATE) * 1000000;
     unsafe {
         pgrx::datum::TimestampWithTimeZone::from_datum(micros.into_datum().unwrap(), false).unwrap()
     }
@@ -410,8 +408,7 @@ fn spiral_status(base_table: &str) -> pgrx::JsonB {
         let mut status = serde_json::Map::new();
 
         let mut views = Vec::new();
-        let table = client.select("SELECT view_name, frame_seconds, parent_view FROM spiral.metadata WHERE base_view = $1 ORDER BY frame_seconds ASC", None,
-            unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] })?;
+        let table = client.select(&format!("SELECT view_name, frame_seconds, parent_view FROM spiral.metadata WHERE base_view = '{}' ORDER BY frame_seconds ASC", base_table.replace("'", "''")), None, &[])?;
 
         for row in table {
             let mut v_info = serde_json::Map::new();
@@ -429,8 +426,7 @@ fn spiral_status(base_table: &str) -> pgrx::JsonB {
         }
         status.insert("hierarchy".to_string(), serde_json::Value::Array(views));
 
-        let dirty_count_res = client.select("SELECT count(*) FROM spiral.changelog WHERE base_view = $1", Some(1),
-            unsafe { &[pgrx::datum::DatumWithOid::new(base_table.into_datum().unwrap(), pg_sys::TEXTOID)] });
+        let dirty_count_res = client.select(&format!("SELECT count(*) FROM spiral.changelog WHERE base_view = '{}'", base_table.replace("'", "''")), Some(1), &[]);
 
         let dirty_count = match dirty_count_res {
             Ok(t) => t.get_one::<i64>().unwrap_or(Some(0)).unwrap_or(0),
@@ -466,12 +462,10 @@ fn spiral_register_view(
         base_view
     );
 
-    let table_exists = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1)",
-        &[unsafe {
-            pgrx::datum::DatumWithOid::new(view_name.into_datum().unwrap(), pg_sys::TEXTOID)
-        }],
-    )
+    let table_exists = Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = '{}')",
+        view_name.replace("'", "''")
+    ))
     .unwrap_or(Some(false))
     .unwrap_or(false);
 

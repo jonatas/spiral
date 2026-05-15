@@ -1,4 +1,3 @@
-use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
 pub struct Metadata {
@@ -11,13 +10,11 @@ pub struct Metadata {
 
 pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     Spi::connect(|client| {
-        let table = unsafe {
-            client.select(
-                "SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata WHERE view_name = $1",
-                None,
-                &[DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value())]
-            )?
-        };
+        let table = client.select(
+            &format!("SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata WHERE view_name = '{}'", view_name.replace("'", "''")),
+            None,
+            &[]
+        )?;
         if table.is_empty() {
             return Ok::<Option<Metadata>, spi::Error>(None);
         }
@@ -29,46 +26,33 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
             scope_columns: row.get::<Vec<String>>(4)?.unwrap_or_default(),
             columns_metadata: row.get::<pgrx::JsonB>(5)?.unwrap_or_else(|| pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))),
         }))
-    }).unwrap_or_else(|e| {
-        notice!("Spiral: get_metadata error for '{}': {:?}", view_name, e);
-        None
-    })
+    }).unwrap_or_default()
 }
 
 pub fn get_children(view_name: &str) -> Vec<String> {
     Spi::connect(|client| {
         let mut children = Vec::new();
-        let tuple_table = unsafe {
-            client.select(
-                "SELECT view_name FROM spiral.metadata WHERE parent_view = $1 ORDER BY frame_seconds ASC",
-                None,
-                &[DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value())]
-            )?
-        };
+        let tuple_table = client.select(
+            &format!("SELECT view_name FROM spiral.metadata WHERE parent_view = '{}' ORDER BY frame_seconds ASC", view_name.replace("'", "''")),
+            None,
+            &[]
+        )?;
         for row in tuple_table {
             if let Ok(Some(child)) = row.get::<String>(1) {
                 children.push(child);
             }
         }
         Ok::<Vec<String>, spi::Error>(children)
-    }).unwrap_or_else(|e| {
-        notice!("Spiral: get_children error for '{}': {:?}", view_name, e);
-        vec![]
-    })
+    }).unwrap_or_default()
 }
 
 pub fn is_spiral_relation(name: &str) -> bool {
     Spi::connect(|client| {
-        let table = unsafe {
-            client.select(
-                "SELECT 1 FROM spiral.metadata WHERE view_name = $1",
-                None,
-                &[DatumWithOid::new(
-                    name.into_datum(),
-                    PgBuiltInOids::TEXTOID.value(),
-                )],
-            )?
-        };
+        let table = client.select(
+            &format!("SELECT 1 FROM spiral.metadata WHERE view_name = '{}'", name.replace("'", "''")),
+            None,
+            &[]
+        )?;
         Ok::<bool, spi::Error>(!table.is_empty())
     })
     .unwrap_or(false)
@@ -82,20 +66,22 @@ pub fn insert_metadata(
     scope_columns: Vec<String>,
     columns_metadata: pgrx::JsonB,
 ) {
-    let _ = Spi::connect(|_client| unsafe {
-        Spi::run_with_args(
-                "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
-                &[
-                    DatumWithOid::new(view_name.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(parent_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(frame_seconds.into_datum().unwrap(), PgBuiltInOids::INT4OID.value()),
-                    DatumWithOid::new(base_view.into_datum().unwrap(), PgBuiltInOids::TEXTOID.value()),
-                    DatumWithOid::new(scope_columns.into_datum().unwrap(), PgBuiltInOids::TEXTARRAYOID.value()),
-                    DatumWithOid::new(columns_metadata.into_datum().unwrap(), PgBuiltInOids::JSONBOID.value()),
-                ],
-            )
+    let scope_cols_json = serde_json::to_string(&scope_columns).unwrap_or_else(|_| "[]".to_string());
+    let metadata_json = serde_json::to_string(&columns_metadata.0).unwrap_or_else(|_| "{}".to_string());
+
+    let _ = Spi::connect(|_client| {
+        let sql = format!(
+            "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
+             VALUES ('{}', '{}', {}, '{}', '{}'::text[], '{}'::jsonb)
+             ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
+            view_name.replace("'", "''"),
+            parent_view.replace("'", "''"),
+            frame_seconds,
+            base_view.replace("'", "''"),
+            scope_cols_json.replace("[", "{").replace("]", "}"), // Simple array format
+            metadata_json.replace("'", "''")
+        );
+        Spi::run(&sql)
     });
 }
 
@@ -115,49 +101,23 @@ pub fn insert_source(
     } else {
         "NULL".to_string()
     };
+    let metadata_json = serde_json::to_string(&metadata.0).unwrap_or_else(|_| "{}".to_string());
 
     let sql = format!(
         "INSERT INTO spiral.sources (view_name, base_view, frame_seconds, base_column, formula, mat_column, rollup_gsub_strategy, metadata)
-         VALUES ($1, $2, $3, $4, $5, $6, {}, $7)
+         VALUES ('{0}', '{1}', {2}, '{3}', '{4}', '{5}', {6}, '{7}'::jsonb)
          ON CONFLICT (view_name, base_column, formula) DO UPDATE SET base_view = EXCLUDED.base_view, frame_seconds = EXCLUDED.frame_seconds, mat_column = EXCLUDED.mat_column, rollup_gsub_strategy = EXCLUDED.rollup_gsub_strategy, metadata = EXCLUDED.metadata",
-        rgs_val
+        view_name.replace("'", "''"),
+        base_view.replace("'", "''"),
+        frame_seconds,
+        base_column.replace("'", "''"),
+        formula.replace("'", "''"),
+        mat_column.replace("'", "''"),
+        rgs_val,
+        metadata_json.replace("'", "''")
     );
 
-    let _ = Spi::connect(|_client| unsafe {
-        Spi::run_with_args(
-            &sql,
-            &[
-                DatumWithOid::new(
-                    view_name.into_datum().unwrap(),
-                    PgBuiltInOids::TEXTOID.value(),
-                ),
-                DatumWithOid::new(
-                    base_view.into_datum().unwrap(),
-                    PgBuiltInOids::TEXTOID.value(),
-                ),
-                DatumWithOid::new(
-                    frame_seconds.into_datum().unwrap(),
-                    PgBuiltInOids::INT4OID.value(),
-                ),
-                DatumWithOid::new(
-                    base_column.into_datum().unwrap(),
-                    PgBuiltInOids::TEXTOID.value(),
-                ),
-                DatumWithOid::new(
-                    formula.into_datum().unwrap(),
-                    PgBuiltInOids::TEXTOID.value(),
-                ),
-                DatumWithOid::new(
-                    mat_column.into_datum().unwrap(),
-                    PgBuiltInOids::TEXTOID.value(),
-                ),
-                DatumWithOid::new(
-                    metadata.into_datum().unwrap(),
-                    PgBuiltInOids::JSONBOID.value(),
-                ),
-            ],
-        )
-    });
+    let _ = Spi::connect(|_client| Spi::run(&sql));
 }
 
 pub fn unify_changelog(base_view: &str) {
@@ -194,47 +154,35 @@ pub fn get_dirty_ranges(
 ) -> Vec<(i64, i64)> {
     Spi::connect(|client| {
         let mut ranges = Vec::new();
-        let sql = if scope_values.is_some() {
-            "SELECT t_start, t_end FROM spiral.changelog
-                     WHERE base_view = $1
-                       AND NOT (t_end < $2 OR t_start > $3)
-                       AND (scope_values = '{}'::jsonb OR scope_values = $4)
-                     ORDER BY t_start"
-                .to_string()
+        let sql = if let Some(sv) = scope_values {
+            let sv_json = serde_json::to_string(&sv.0).unwrap_or_else(|_| "{}".to_string());
+            format!(
+                "SELECT t_start, t_end FROM spiral.changelog
+                         WHERE base_view = '{}'
+                           AND NOT (t_end < {} OR t_start > {})
+                           AND (scope_values = '{{}}'::jsonb OR scope_values = '{}'::jsonb)
+                         ORDER BY t_start",
+                base_view.replace("'", "''"),
+                ts,
+                te,
+                sv_json.replace("'", "''")
+            )
         } else {
-            "SELECT t_start, t_end FROM spiral.changelog
-                     WHERE base_view = $1
-                       AND NOT (t_end < $2 OR t_start > $3)
-                     ORDER BY t_start"
-                .to_string()
+            format!(
+                "SELECT t_start, t_end FROM spiral.changelog
+                         WHERE base_view = '{}'
+                           AND NOT (t_end < {} OR t_start > {})
+                         ORDER BY t_start",
+                base_view.replace("'", "''"),
+                ts,
+                te
+            )
         };
 
-        let mut args = Vec::new();
-        unsafe {
-            args.push(DatumWithOid::new(
-                base_view.into_datum().unwrap(),
-                PgBuiltInOids::TEXTOID.value(),
-            ));
-            args.push(DatumWithOid::new(
-                ts.into_datum().unwrap(),
-                PgBuiltInOids::INT8OID.value(),
-            ));
-            args.push(DatumWithOid::new(
-                te.into_datum().unwrap(),
-                PgBuiltInOids::INT8OID.value(),
-            ));
-            if let Some(sv) = scope_values {
-                args.push(DatumWithOid::new(
-                    sv.into_datum(),
-                    PgBuiltInOids::JSONBOID.value(),
-                ));
-            }
-        }
-
-        let tuple_table = client.select(&sql, None, &args).unwrap();
+        let tuple_table = client.select(&sql, None, &[])?;
         for row in tuple_table {
-            let s = row.get::<i64>(1).unwrap().unwrap();
-            let e = row.get::<i64>(2).unwrap().unwrap();
+            let s = row.get::<i64>(1)?.unwrap_or(0);
+            let e = row.get::<i64>(2)?.unwrap_or(0);
             ranges.push((s, e));
         }
         Ok::<Vec<(i64, i64)>, spi::Error>(ranges)

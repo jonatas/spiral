@@ -4,7 +4,6 @@
 -- 1. SETUP & INITIAL POPULATION
 DROP EXTENSION IF EXISTS spiral CASCADE;
 CREATE EXTENSION spiral;
-\! rm -rf /tmp/spiral_main/*.bin
 
 SET spiral.kickoff_date = '2026-04-01 00:00:00Z';
 SET spiral.minimal_pace = 1.0;
@@ -12,22 +11,20 @@ SET spiral.minimal_pace = 1.0;
 CREATE TABLE production_data (t timestamptz, tenant_id int, price double precision);
 INSERT INTO production_data SELECT '2026-04-01 00:00:00Z'::timestamptz + (i || ' seconds')::interval, i%2, 100 + i FROM generate_series(0, 9) i;
 
--- Pack into optimized binary storage
-SELECT spiral_pack_delta_zero('production_data', 7777);
-\! ls -lh /tmp/spiral_main/7777_zero.bin
+-- Pack into optimized buffer-managed storage
+-- Use the actual OID of production_data
+SELECT spiral_pack_delta_zero('production_data', 'production_data'::regclass::oid::int);
 
 -- 2. SIMULATE BACKUP
 \echo '--- [BACKUP PHASE] ---'
--- Standard pg_dump would not see the binary files.
--- We create a backup table using spiral_scan_zero()
-CREATE TABLE backup_reconstructed AS SELECT * FROM spiral_scan_zero(7777);
+-- Since we migrated to the Postgres Buffer Manager (smgr), a standard pg_dump WILL now see the data!
+-- However, for this specific raw-packing test, we reconstruct it via scan to show the O(1) retrieval.
+CREATE TABLE backup_reconstructed AS SELECT * FROM spiral_scan_zero('production_data'::regclass::oid::int);
 
 -- 3. SIMULATE DISASTER (Drop everything)
 \echo '--- [DISASTER PHASE] ---'
 DROP TABLE production_data;
-DROP TABLE backup_reconstructed;
--- In a real disaster, the binary files might be lost or we might be on a new server.
-\! rm -rf /tmp/spiral_main/*.bin
+-- The relation files in PGDATA associated with the original OID would be lost here in a real disaster.
 
 -- 4. RESTORE PHASE
 \echo '--- [RESTORE PHASE] ---'
@@ -42,7 +39,7 @@ INSERT INTO restore_source VALUES
 -- Ensure GUCs are set correctly first!
 SET spiral.kickoff_date = '2026-04-01 00:00:00Z';
 SET spiral.minimal_pace = 1.0;
-SELECT spiral_pack_delta_zero('restore_source', 7777);
+SELECT spiral_pack_delta_zero('restore_source', 'restore_source'::regclass::oid::int);
 
 -- 5. FINAL VALIDATION
 \echo '--- [VALIDATION PHASE] ---'
@@ -50,9 +47,9 @@ SELECT spiral_pack_delta_zero('restore_source', 7777);
 SELECT 
     t as coordinate,
     to_timestamp(t + extract(epoch from '2026-04-01 00:00:00Z'::timestamptz)) as time,
-    spiral_read_main_zero(7777, t + spiral('2026-04-01 00:00:00Z'::timestamptz), 0) as price_tenant_0,
-    spiral_read_main_zero(7777, t + spiral('2026-04-01 00:00:00Z'::timestamptz), 1) as price_tenant_1
+    spiral_read_main_zero('restore_source'::regclass::oid::int, t + spiral('2026-04-01 00:00:00Z'::timestamptz), 0) as price_tenant_0,
+    spiral_read_main_zero('restore_source'::regclass::oid::int, t + spiral('2026-04-01 00:00:00Z'::timestamptz), 1) as price_tenant_1
 FROM generate_series(0, 9) t;
 
 -- Compare counts
-SELECT COUNT(*) as restored_count FROM spiral_scan_zero(7777);
+SELECT COUNT(*) as restored_count FROM spiral_scan_zero('restore_source'::regclass::oid::int);

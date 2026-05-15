@@ -16,9 +16,8 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
         let mut slot = None;
         for i in 0..max_workers {
             let lock_id: i64 = 0x41535049 + i as i64;
-            let got_lock: bool = Spi::get_one_with_args::<bool>(
-                "SELECT pg_try_advisory_lock($1)",
-                &[Some(lock_id.into_datum()).into()],
+            let got_lock: bool = Spi::get_one::<bool>(
+                &format!("SELECT pg_try_advisory_lock({})", lock_id)
             )
             .unwrap_or(Some(false))
             .unwrap_or(false);
@@ -72,14 +71,9 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         // Avoid contention: try to acquire a transaction-level advisory lock for this specific view
                         // We use a constant namespace 0x41535050 = 1095983184 and the hashtext of the view name.
                         let got_view_lock: bool = client.select(
-                            "SELECT pg_try_advisory_xact_lock(1095983184, hashtext($1))",
+                            &format!("SELECT pg_try_advisory_xact_lock(1095983184, hashtext('{}'))", view_name.replace("'", "''")),
                             Some(1),
-                            &[unsafe {
-                                pgrx::datum::DatumWithOid::new(
-                                    view_name.clone().into_datum().unwrap(),
-                                    pg_sys::TEXTOID,
-                                )
-                            }],
+                            &[],
                         )?.first().get_one::<bool>().unwrap_or(Some(false)).unwrap_or(false);
 
                         if !got_view_lock {
@@ -89,14 +83,9 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         // Only refresh if there are dirty buckets
                         let has_dirty: bool = client
                             .select(
-                                "SELECT 1 FROM spiral.changelog WHERE base_view = $1 LIMIT 1",
+                                &format!("SELECT 1 FROM spiral.changelog WHERE base_view = '{}' LIMIT 1", view_name.replace("'", "''")),
                                 Some(1),
-                                &[unsafe {
-                                pgrx::datum::DatumWithOid::new(
-                                    view_name.clone().into_datum().unwrap(),
-                                    pg_sys::TEXTOID,
-                                )
-                            }],
+                                &[],
                             )
                             .map(|t| !t.is_empty())
                             .unwrap_or(false);
