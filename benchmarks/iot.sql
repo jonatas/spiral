@@ -11,6 +11,14 @@ CREATE TABLE delta_iot (
     price double precision
 );
 
+DROP TABLE IF EXISTS standard_storage;
+DROP TABLE IF EXISTS compact_storage;
+DROP TABLE IF EXISTS blocks_storage;
+
+CREATE TABLE standard_storage (price double precision) USING spiral;
+CREATE TABLE compact_storage (price double precision) USING spiral;
+CREATE TABLE blocks_storage (price double precision) USING spiral;
+
 -- Results tracking table
 CREATE TEMP TABLE bench_results (
     format TEXT,
@@ -27,43 +35,45 @@ SELECT (i / 1000), (i % 1000), random() * 100 FROM generate_series(0, 999999) i;
 DO $$
 DECLARE
     s_t timestamptz;
-    main_oid int := 987654;
+    std_oid int := 'standard_storage'::regclass::oid;
+    comp_oid int := 'compact_storage'::regclass::oid;
+    blk_oid int := 'blocks_storage'::regclass::oid;
     dur interval;
 BEGIN
     -- 1. Ingestion
-    s_t := clock_timestamp(); PERFORM spiral_pack_delta('delta_iot', main_oid); dur := clock_timestamp() - s_t;
+    s_t := clock_timestamp(); PERFORM spiral_pack_delta('delta_iot', std_oid); dur := clock_timestamp() - s_t;
     INSERT INTO bench_results VALUES ('Standard', 'Ingestion Time', dur::text, extract(epoch from dur));
 
-    s_t := clock_timestamp(); PERFORM spiral_pack_delta_compact('delta_iot', main_oid); dur := clock_timestamp() - s_t;
+    s_t := clock_timestamp(); PERFORM spiral_pack_delta_compact('delta_iot', comp_oid); dur := clock_timestamp() - s_t;
     INSERT INTO bench_results VALUES ('Compact', 'Ingestion Time', dur::text, extract(epoch from dur));
 
-    s_t := clock_timestamp(); PERFORM spiral_pack_delta_blocks('delta_iot', main_oid); dur := clock_timestamp() - s_t;
+    s_t := clock_timestamp(); PERFORM spiral_pack_delta_blocks('delta_iot', blk_oid); dur := clock_timestamp() - s_t;
     INSERT INTO bench_results VALUES ('Block (XOR)', 'Ingestion Time', dur::text, extract(epoch from dur));
 
     -- 2. Random Read (10k)
-    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM spiral_read_main(main_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM spiral_read_main(std_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
     INSERT INTO bench_results VALUES ('Standard', 'Random Read (10k)', dur::text, extract(epoch from dur));
 
-    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM spiral_read_main_compact(main_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM spiral_read_main_compact(comp_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
     INSERT INTO bench_results VALUES ('Compact', 'Random Read (10k)', dur::text, extract(epoch from dur));
 
-    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM spiral_read_main_block_point(main_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    s_t := clock_timestamp(); FOR i IN 1..10000 LOOP PERFORM spiral_read_main_block_point(blk_oid, (i%1000)::bigint, (i%1000)::bigint); END LOOP; dur := clock_timestamp() - s_t;
     INSERT INTO bench_results VALUES ('Block (XOR)', 'Random Read (10k)', dur::text, extract(epoch from dur));
 
     -- 3. Range Read (6,400 points)
-    s_t := clock_timestamp(); FOR i IN 1..100 LOOP PERFORM spiral_read_main_block_range(main_oid, i::bigint, 5::bigint); END LOOP; dur := clock_timestamp() - s_t;
+    s_t := clock_timestamp(); FOR i IN 1..100 LOOP PERFORM spiral_read_main_block_range(blk_oid, i::bigint, 5::bigint); END LOOP; dur := clock_timestamp() - s_t;
     INSERT INTO bench_results VALUES ('Block (XOR)', 'Range Read (Optimized)', dur::text, extract(epoch from dur));
 END $$;
 
 -- 4. Storage Sizes
 INSERT INTO bench_results (format, metric, val_num, val_text)
-SELECT 'Standard', 'Storage Size', pg_size_bytes(size), size FROM (SELECT pg_ls_dir('/tmp/spiral_main/') as name) s, LATERAL (SELECT (pg_stat_file('/tmp/spiral_main/' || name)).size::text as size WHERE name = '987654.bin') f;
+SELECT 'Standard', 'Storage Size', pg_relation_size('standard_storage'), pg_size_pretty(pg_relation_size('standard_storage'));
 
 INSERT INTO bench_results (format, metric, val_num, val_text)
-SELECT 'Compact', 'Storage Size', pg_size_bytes(size), size FROM (SELECT pg_ls_dir('/tmp/spiral_main/') as name) s, LATERAL (SELECT (pg_stat_file('/tmp/spiral_main/' || name)).size::text as size WHERE name = '987654_compact.bin') f;
+SELECT 'Compact', 'Storage Size', pg_relation_size('compact_storage'), pg_size_pretty(pg_relation_size('compact_storage'));
 
 INSERT INTO bench_results (format, metric, val_num, val_text)
-SELECT 'Block (XOR)', 'Storage Size', pg_size_bytes(size), size FROM (SELECT pg_ls_dir('/tmp/spiral_main/') as name) s, LATERAL (SELECT (pg_stat_file('/tmp/spiral_main/' || name)).size::text as size WHERE name = '987654_blocks.bin') f;
+SELECT 'Block (XOR)', 'Storage Size', pg_relation_size('blocks_storage'), pg_size_pretty(pg_relation_size('blocks_storage'));
 
 \echo ''
 \echo '--- SPIRAL SIDE-BY-SIDE STORAGE COMPARISON ---'
