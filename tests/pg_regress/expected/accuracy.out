@@ -1,0 +1,17 @@
+CREATE TABLE accuracy_test (val double precision);
+CREATE TABLE
+INSERT INTO accuracy_test VALUES ...
+INSERT 0 1002
+SELECT 
+    round(spiral_stats_mean(spiral_stats(val))::numeric, 6) as mean,
+    round(spiral_stats_variance(spiral_stats(val))::numeric, 6) as variance,
+    round(spiral_stats_skewness(spiral_stats(val))::numeric, 6) as skewness,
+    round(spiral_stats_kurtosis(spiral_stats(val))::numeric, 6) as kurtosis
+FROM accuracy_test;
+   mean    |   variance    | skewness |  kurtosis  
+-----------+---------------+----------+------------
+ 503.493014 | 203617.656794 | 7.492286 | 215.594915
+(1 row)
+
+DROP TABLE accuracy_test;
+DROP TABLE
