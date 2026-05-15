@@ -189,49 +189,32 @@ pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
         .kurtosis()
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+use tdigest::TDigest;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SketchState {
-    pub centroids: Vec<(f64, f64)>,
-    pub sum: f64,
-    pub count: f64,
+    pub td: TDigest,
     pub max: f64,
     pub min: f64,
+}
+
+impl Default for SketchState {
+    fn default() -> Self {
+        Self {
+            td: TDigest::new_with_size(100),
+            max: f64::MIN,
+            min: f64::MAX,
+        }
+    }
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
     let mut s = state
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
-        .unwrap_or_else(|| SketchState {
-            max: f64::MIN,
-            min: f64::MAX,
-            ..Default::default()
-        });
+        .unwrap_or_default();
 
-    // Simple centroid addition for now
-    if let Some(c) = s.centroids.iter_mut().find(|c| (c.0 - val).abs() < 1e-9) {
-        c.1 += 1.0;
-    } else if s.centroids.len() < 100 {
-        s.centroids.push((val, 1.0));
-    } else {
-        // Merge into nearest
-        let mut nearest_idx = 0;
-        let mut min_dist = f64::MAX;
-        for (i, c) in s.centroids.iter().enumerate() {
-            let dist = (c.0 - val).abs();
-            if dist < min_dist {
-                min_dist = dist;
-                nearest_idx = i;
-            }
-        }
-        let c = &mut s.centroids[nearest_idx];
-        let new_weight = c.1 + 1.0;
-        c.0 = (c.0 * c.1 + val) / new_weight;
-        c.1 = new_weight;
-    }
-
-    s.sum += val;
-    s.count += 1.0;
+    s.td.insert(val);
     if val > s.max {
         s.max = val;
     }
@@ -249,50 +232,19 @@ pub fn spiral_sketch_combine(
 ) -> pgrx::JsonB {
     let mut s1 = state1
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
-        .unwrap_or_else(|| SketchState {
-            max: f64::MIN,
-            min: f64::MAX,
-            ..Default::default()
-        });
+        .unwrap_or_default();
     let s2 = state2
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
-        .unwrap_or_else(|| SketchState {
-            max: f64::MIN,
-            min: f64::MAX,
-            ..Default::default()
-        });
+        .unwrap_or_default();
 
-    if s2.count == 0.0 {
+    if s2.td.count() == 0.0 {
         return pgrx::JsonB(serde_json::to_value(s1).unwrap());
     }
-    if s1.count == 0.0 {
+    if s1.td.count() == 0.0 {
         return pgrx::JsonB(serde_json::to_value(s2).unwrap());
     }
 
-    for (val, weight) in s2.centroids {
-        if let Some(c) = s1.centroids.iter_mut().find(|c| (c.0 - val).abs() < 1e-9) {
-            c.1 += weight;
-        } else if s1.centroids.len() < 100 {
-            s1.centroids.push((val, weight));
-        } else {
-            let mut nearest_idx = 0;
-            let mut min_dist = f64::MAX;
-            for (i, c) in s1.centroids.iter().enumerate() {
-                let dist = (c.0 - val).abs();
-                if dist < min_dist {
-                    min_dist = dist;
-                    nearest_idx = i;
-                }
-            }
-            let c = &mut s1.centroids[nearest_idx];
-            let new_weight = c.1 + weight;
-            c.0 = (c.0 * c.1 + val * weight) / new_weight;
-            c.1 = new_weight;
-        }
-    }
-
-    s1.sum += s2.sum;
-    s1.count += s2.count;
+    s1.td.merge(&s2.td);
     if s2.max > s1.max {
         s1.max = s2.max;
     }
@@ -305,21 +257,24 @@ pub fn spiral_sketch_combine(
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
-    let mut s = serde_json::from_value::<SketchState>(state.0).unwrap();
-    if s.count == 0.0 {
+    let s = serde_json::from_value::<SketchState>(state.0).unwrap();
+    if s.td.count() == 0.0 {
         return 0.0;
     }
-    s.centroids.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    s.td.quantile(q)
+}
 
-    let target = q * s.count;
-    let mut cum = 0.0;
-    for (val, weight) in s.centroids {
-        cum += weight;
-        if cum >= target {
-            return val;
-        }
-    }
-    s.max
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_tdigest_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
+    spiral_sketch_accum(state, val)
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_tdigest_combine(
+    state1: Option<pgrx::JsonB>,
+    state2: Option<pgrx::JsonB>,
+) -> pgrx::JsonB {
+    spiral_sketch_combine(state1, state2)
 }
 
 extension_sql!(
@@ -357,12 +312,28 @@ extension_sql!(
         COMBINEFUNC = spiral_sketch_combine,
         PARALLEL = SAFE
     );
+
+    CREATE AGGREGATE spiral_tdigest(double precision) (
+        SFUNC = spiral_tdigest_accum,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_tdigest_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_tdigest_merge(jsonb) (
+        SFUNC = spiral_tdigest_combine,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_tdigest_combine,
+        PARALLEL = SAFE
+    );
     "#,
     name = "create_spiral_stats_aggregates",
     requires = [
         spiral_stats_accum,
         spiral_stats_combine,
         spiral_sketch_accum,
-        spiral_sketch_combine
+        spiral_sketch_combine,
+        spiral_tdigest_accum,
+        spiral_tdigest_combine
     ]
 );

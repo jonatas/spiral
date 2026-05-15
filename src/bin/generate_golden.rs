@@ -10,6 +10,9 @@ struct GoldenResult {
     stddev: f64,
     skewness: f64,
     kurtosis: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
 }
 
 fn main() {
@@ -46,7 +49,15 @@ fn main() {
     // Fisher-Pearson definitions
     let skewness = (n.sqrt() * m3) / m2.powf(1.5);
     let kurtosis = (n * m4) / (m2 * m2) - 3.0;
+
+    let mut sorted_values = values.clone();
+    sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     
+    let get_quantile = |q: f64| {
+        let idx = (q * (n - 1.0)).round() as usize;
+        sorted_values[idx]
+    };
+
     let result = GoldenResult {
         n,
         mean,
@@ -54,6 +65,9 @@ fn main() {
         stddev,
         skewness,
         kurtosis,
+        p50: get_quantile(0.5),
+        p95: get_quantile(0.95),
+        p99: get_quantile(0.99),
     };
     
     // Write CSV
