@@ -218,13 +218,25 @@ pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
 /// Merging two sketches that have both hit capacity is also lossy.
 pub const MAX_CENTROIDS: usize = 100;
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SketchState {
     pub centroids: Vec<(f64, f64)>,
     pub sum: f64,
     pub count: f64,
     pub max: f64,
     pub min: f64,
+}
+
+impl Default for SketchState {
+    fn default() -> Self {
+        SketchState {
+            centroids: Vec::new(),
+            sum: 0.0,
+            count: 0.0,
+            max: f64::MIN,
+            min: f64::MAX,
+        }
+    }
 }
 
 impl SketchState {
@@ -323,7 +335,7 @@ impl SketchState {
 pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
     let mut s = state
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
-        .unwrap_or_else(SketchState::new);
+        .unwrap_or_default();
 
     s.add(val);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
@@ -336,10 +348,10 @@ pub fn spiral_sketch_combine(
 ) -> pgrx::JsonB {
     let mut s1 = state1
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
-        .unwrap_or_else(SketchState::new);
+        .unwrap_or_default();
     let s2 = state2
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
-        .unwrap_or_else(SketchState::new);
+        .unwrap_or_default();
 
     s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
@@ -402,7 +414,7 @@ mod tests {
     use super::*;
 
     fn sketch_from(vals: &[f64]) -> SketchState {
-        let mut s = SketchState::new();
+        let mut s = SketchState::default();
         for &v in vals {
             s.add(v);
         }
@@ -456,7 +468,7 @@ mod tests {
     #[test]
     fn sketch_merge_empty_identity() {
         let s = sketch_from(&[1.0, 2.0, 3.0]);
-        let empty = SketchState::new();
+        let empty = SketchState::default();
 
         let mut merged_left = s.clone();
         merged_left.merge(&empty);
