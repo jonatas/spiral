@@ -175,12 +175,15 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 query_str.len()
             );
 
-            if !extracted_frames.is_empty() || !extracted_tenant.is_empty() || !extracted_cardinality.is_empty() {
+            if !extracted_frames.is_empty()
+                || !extracted_tenant.is_empty()
+                || !extracted_cardinality.is_empty()
+            {
                 if tag == pg_sys::NodeTag::T_CreateStmt {
                     let stmt = utility_stmt as *mut pg_sys::CreateStmt;
                     (*stmt).accessMethod = pg_sys::pstrdup(c"spiral".as_ptr());
                 }
-                
+
                 notice!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
@@ -292,7 +295,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols);
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
-                
+
                 // 6. Ensure background worker is running for this database
                 unsafe {
                     crate::bgworker::maybe_start_worker();
@@ -419,8 +422,8 @@ unsafe fn build_time_constraints(
                     && (*right).type_ == pg_sys::NodeTag::T_Const
                 {
                     let var = var_node as *mut pg_sys::Var;
-                    let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32)
-                        as *mut pg_sys::RangeTblEntry;
+                    let rte =
+                        pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                     let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                     if !varname_ptr.is_null() {
                         let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
@@ -477,10 +480,10 @@ unsafe fn build_time_constraints(
                 {
                     let v1 = left as *mut pg_sys::Var;
                     let v2 = right as *mut pg_sys::Var;
-                    let rte1 = pg_sys::list_nth(rtable, ((*v1).varno - 1) as i32)
-                        as *mut pg_sys::RangeTblEntry;
-                    let rte2 = pg_sys::list_nth(rtable, ((*v2).varno - 1) as i32)
-                        as *mut pg_sys::RangeTblEntry;
+                    let rte1 =
+                        pg_sys::list_nth(rtable, (*v1).varno - 1) as *mut pg_sys::RangeTblEntry;
+                    let rte2 =
+                        pg_sys::list_nth(rtable, (*v2).varno - 1) as *mut pg_sys::RangeTblEntry;
                     let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
                     let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
                     if !n1.is_null()
@@ -1018,8 +1021,7 @@ unsafe fn extract_query_columns_simple(
         match (*node).type_ {
             pg_sys::NodeTag::T_Var => {
                 let var = node as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32)
-                    as *mut pg_sys::RangeTblEntry;
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                 let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                 if !varname.is_null() {
                     cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None));
@@ -1036,7 +1038,7 @@ unsafe fn extract_query_columns_simple(
                         let arg_expr = (*arg).expr as *mut pg_sys::Node;
                         if !arg_expr.is_null() && (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
                             let var = arg_expr as *mut pg_sys::Var;
-                            let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32)
+                            let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
                                 as *mut pg_sys::RangeTblEntry;
                             let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                             if !varname.is_null() {
@@ -1079,7 +1081,9 @@ fn construct_union_sql_hierarchical(
             let secs = if s == base_table {
                 0
             } else {
-                catalog::get_metadata(&s).map(|m| m.frame_seconds).unwrap_or(0)
+                catalog::get_metadata(&s)
+                    .map(|m| m.frame_seconds)
+                    .unwrap_or(0)
             };
             (s, secs)
         })
@@ -1125,11 +1129,13 @@ fn construct_union_sql_hierarchical(
             let ts_end = format_epoch(seg._t_end);
             range_strs.push(format!("[\"{}\", \"{}\")", ts_start, ts_end));
         }
-        
-        if range_strs.is_empty() { continue; }
+
+        if range_strs.is_empty() {
+            continue;
+        }
 
         let multirange_lit = format!("'{{ {} }}'::tstzmultirange", range_strs.join(", "));
-        
+
         let group_by_str = if !is_rollup {
             let group_by = cols
                 .iter()
@@ -1166,9 +1172,12 @@ fn construct_union_sql_hierarchical(
 
     let mut sql = String::from("WITH ");
     sql.push_str(&cte_parts.join(", "));
-    sql.push_str(" ");
-    
-    let union_selects: Vec<String> = tier_names.iter().map(|n| format!("SELECT * FROM {}", n)).collect();
+    sql.push(' ');
+
+    let union_selects: Vec<String> = tier_names
+        .iter()
+        .map(|n| format!("SELECT * FROM {}", n))
+        .collect();
     sql.push_str(&union_selects.join(" UNION ALL "));
     sql.push_str(" ORDER BY t");
     sql
