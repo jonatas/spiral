@@ -60,6 +60,9 @@ pub unsafe extern "C-unwind" fn _PG_init() {
 ///
 /// Hashes string dimensions and interleaves their bits with the time bit representation.
 ///
+/// Time is encoded using the low 32 bits of `t` (Unix epoch seconds), giving coverage
+/// from 1970-01-01 to approximately 2106-02-07 without loss of ordering information.
+///
 /// # Examples
 /// ```rust
 /// use spiral::spiral_zorder;
@@ -69,36 +72,44 @@ pub unsafe extern "C-unwind" fn _PG_init() {
 /// ```
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
-    let mut x = t as u32;
-    let mut y = 0u32;
+    // Mask t to 32 bits so the bit-spreading step (which maps input bit k → output bit 2k)
+    // cannot have bits 32+ collide with correctly-placed bits from bits 0–31.
+    // This gives correct ordering for t in [0, 2^32) ≈ Unix epoch seconds until ~2106.
+    let mut x = (t as u64) & 0x0000_0000_FFFF_FFFF;
+    let mut y = 0u64;
     for (i, dim) in dimensions.iter().enumerate() {
         if let Some(d) = dim {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             use std::hash::Hasher;
             hasher.write(d.as_bytes());
-            let hash = hasher.finish() as u32;
+            let hash = hasher.finish();
             y ^= hash << (i % 8);
         }
     }
+    y &= 0x0000_0000_FFFF_FFFF;
 
-    x = (x | (x << 16)) & 0x0000FFFF;
-    x = (x | (x << 8)) & 0x00FF00FF;
-    x = (x | (x << 4)) & 0x0F0F0F0F;
-    x = (x | (x << 2)) & 0x33333333;
-    x = (x | (x << 1)) & 0x55555555;
+    // Spread 32 bits of each input into the even/odd bit positions of a 64-bit result.
+    x = (x | (x << 16)) & 0x0000FFFF0000FFFF_u64;
+    x = (x | (x << 8))  & 0x00FF00FF00FF00FF_u64;
+    x = (x | (x << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
+    x = (x | (x << 2))  & 0x3333333333333333_u64;
+    x = (x | (x << 1))  & 0x5555555555555555_u64;
 
-    y = (y | (y << 16)) & 0x0000FFFF;
-    y = (y | (y << 8)) & 0x00FF00FF;
-    y = (y | (y << 4)) & 0x0F0F0F0F;
-    y = (y | (y << 2)) & 0x33333333;
-    y = (y | (y << 1)) & 0x55555555;
+    y = (y | (y << 16)) & 0x0000FFFF0000FFFF_u64;
+    y = (y | (y << 8))  & 0x00FF00FF00FF00FF_u64;
+    y = (y | (y << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
+    y = (y | (y << 2))  & 0x3333333333333333_u64;
+    y = (y | (y << 1))  & 0x5555555555555555_u64;
 
-    (x as i64) | ((y as i64) << 1)
+    (x | (y << 1)) as i64
 }
 
 /// Computes the Z-order curve for a timestamp and a set of integer dimensions.
 ///
 /// Interleaves the lower bits of the dimensions with the time bit representation.
+///
+/// Time is encoded using the low 32 bits of `t` (Unix epoch seconds), giving correct
+/// ordering for t in [0, 2^32) — Unix epoch coverage from 1970-01-01 to ~2106-02-07.
 ///
 /// # Examples
 /// ```rust
@@ -109,28 +120,36 @@ pub fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
 /// ```
 #[pg_extern(immutable, parallel_safe, name = "spiral_zorder")]
 pub fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> i64 {
-    let mut x = t as u32;
-    let mut y = 0u32;
+    // Mask t to 32 bits so the bit-spreading step (which maps input bit k → output bit 2k)
+    // cannot have bits 32+ collide with correctly-placed bits from bits 0–31.
+    let mut x = (t as u64) & 0x0000_0000_FFFF_FFFF;
+    let mut y = 0u64;
     for (i, dim) in dimensions.iter().enumerate() {
-        y ^= (*dim as u32) << (i % 8);
+        y ^= (*dim as u64) << (i % 8);
     }
+    y &= 0x0000_0000_FFFF_FFFF;
 
-    x = (x | (x << 16)) & 0x0000FFFF;
-    x = (x | (x << 8)) & 0x00FF00FF;
-    x = (x | (x << 4)) & 0x0F0F0F0F;
-    x = (x | (x << 2)) & 0x33333333;
-    x = (x | (x << 1)) & 0x55555555;
+    // Spread 32 bits of each input into the even/odd bit positions of a 64-bit result.
+    x = (x | (x << 16)) & 0x0000FFFF0000FFFF_u64;
+    x = (x | (x << 8))  & 0x00FF00FF00FF00FF_u64;
+    x = (x | (x << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
+    x = (x | (x << 2))  & 0x3333333333333333_u64;
+    x = (x | (x << 1))  & 0x5555555555555555_u64;
 
-    y = (y | (y << 16)) & 0x0000FFFF;
-    y = (y | (y << 8)) & 0x00FF00FF;
-    y = (y | (y << 4)) & 0x0F0F0F0F;
-    y = (y | (y << 2)) & 0x33333333;
-    y = (y | (y << 1)) & 0x55555555;
+    y = (y | (y << 16)) & 0x0000FFFF0000FFFF_u64;
+    y = (y | (y << 8))  & 0x00FF00FF00FF00FF_u64;
+    y = (y | (y << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
+    y = (y | (y << 2))  & 0x3333333333333333_u64;
+    y = (y | (y << 1))  & 0x5555555555555555_u64;
 
-    (x as i64) | ((y as i64) << 1)
+    (x | (y << 1)) as i64
 }
 
 /// Computes the 3D Z-order curve for a timestamp (`x`) and two integer dimensions (`y` and `z`).
+///
+/// Interleaves 21 bits from each of the three inputs into a 63-bit result (63 = 21 × 3),
+/// fitting within the positive range of i64. This gives `x` a time-domain range of 2^21
+/// seconds (~24 days) per period; callers should normalize `x` to a suitable epoch if needed.
 ///
 /// # Examples
 /// ```rust
@@ -145,7 +164,7 @@ pub fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> i64 {
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_zorder_3d(x: i64, y: i32, z: i32) -> i64 {
     let mut res = 0i64;
-    for i in 0..20 {
+    for i in 0..21 {
         res |= ((x >> i) & 1) << (3 * i);
         res |= (((y as i64) >> i) & 1) << (3 * i + 1);
         res |= (((z as i64) >> i) & 1) << (3 * i + 2);
@@ -616,5 +635,79 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(children[0], "child1");
         assert_eq!(children[1], "child2");
+    }
+}
+
+#[cfg(test)]
+mod zorder_tests {
+    use super::*;
+
+    #[test]
+    fn test_zorder_zero() {
+        assert_eq!(spiral_zorder(0, vec![]), 0);
+    }
+
+    #[test]
+    fn test_zorder_int_array_basic() {
+        assert_eq!(spiral_zorder_int_array(1, vec![1]), 3);
+    }
+
+    #[test]
+    fn test_zorder_3d_basic() {
+        assert_eq!(spiral_zorder_3d(1, 1, 1), 7);
+        assert_eq!(spiral_zorder_3d(2, 0, 0), 8);
+    }
+
+    #[test]
+    fn test_zorder_large_timestamp_wraps_at_2_32() {
+        // t is masked to 32 bits before spreading; values ≥ 2^32 cycle back.
+        // t=0 and t=2^32 both have low 32 bits = 0, so they produce the same result.
+        let t_over_u32 = u32::MAX as i64 + 1; // 2^32
+        assert_eq!(spiral_zorder_int_array(t_over_u32, vec![0]), spiral_zorder_int_array(0, vec![0]));
+    }
+
+    #[test]
+    fn test_zorder_no_collision_within_u32_range() {
+        // Distinct values in [0, 2^32) must produce distinct results (no collision).
+        let r1 = spiral_zorder_int_array(1 << 16, vec![0]);
+        let r2 = spiral_zorder_int_array((1 << 16) + 1, vec![0]);
+        assert_ne!(r1, r2);
+        // And bit 32 of t does NOT interfere with bit 16 (was a bug without explicit masking).
+        let r3 = spiral_zorder_int_array(1_i64 << 32, vec![0]); // wraps to 0
+        assert_eq!(r3, spiral_zorder_int_array(0, vec![0]));
+    }
+
+    #[test]
+    fn test_zorder_ordering_preserved() {
+        // Increasing t with same dimension must yield strictly increasing z-order.
+        let results: Vec<i64> = (0..4).map(|t| spiral_zorder_int_array(t, vec![0])).collect();
+        for w in results.windows(2) {
+            assert!(w[0] < w[1], "z-order not monotone: {} >= {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn test_zorder_u32_boundary() {
+        // Values around u32::MAX encode correctly and in order.
+        let near_max = u32::MAX as i64 - 1;
+        let at_max = u32::MAX as i64;
+        let r1 = spiral_zorder_int_array(near_max, vec![0]);
+        let r2 = spiral_zorder_int_array(at_max, vec![0]);
+        assert!(r1 < r2, "z-order not monotone near u32::MAX: {} >= {}", r1, r2);
+    }
+
+    #[test]
+    fn test_zorder_3d_uses_21_bits() {
+        // Bit 20 of x (index 20, the 21st bit) maps to output position 3*20=60.
+        let x = 1i64 << 20;
+        let result = spiral_zorder_3d(x, 0, 0);
+        assert_eq!(result, 1i64 << 60);
+    }
+
+    #[test]
+    fn test_zorder_deterministic() {
+        let r1 = spiral_zorder(12345, vec![Some("sensor_a".to_string()), Some("region_eu".to_string())]);
+        let r2 = spiral_zorder(12345, vec![Some("sensor_a".to_string()), Some("region_eu".to_string())]);
+        assert_eq!(r1, r2);
     }
 }
