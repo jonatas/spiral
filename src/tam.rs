@@ -306,3 +306,57 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
         }
     }
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    #[pg_test]
+    fn test_tam_insert_placeholder() {
+        Spi::connect_mut(|client| {
+            client.update("CREATE TABLE tam_test_internal (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
+            client.update("INSERT INTO tam_test_internal (t, tenant_id, value) VALUES (1, 1, 42.0);", None, &[])?;
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_test_internal").unwrap().unwrap();
+            // Since INSERT is a placeholder, count should be 0
+            assert_eq!(count, 0);
+            Ok::<(), spi::Error>(())
+        }).unwrap();
+    }
+
+    #[pg_test]
+    fn test_tam_scan_with_seeded_data() {
+        Spi::connect_mut(|client| {
+            client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
+            client.update("CREATE TABLE tam_scan_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
+            client.update("CREATE TABLE tam_delta_input (t bigint, tenant_id int, price double precision);", None, &[])?;
+            client.update("INSERT INTO tam_delta_input (t, tenant_id, price) VALUES (1, 1, 42.0), (2, 2, 84.0);", None, &[])?;
+            
+            // Pack data bypassing TAM
+            let main_oid = Spi::get_one::<i32>("SELECT 'tam_scan_test'::regclass::oid::int").unwrap().unwrap();
+            client.update(&format!("SELECT spiral_pack_delta('tam_delta_input', {});", main_oid), None, &[])?;
+            
+            // Now SCAN via TAM
+            let mut results = client.select("SELECT t, tenant_id, value FROM tam_scan_test ORDER BY t", None, &[])?;
+            
+            let row1 = results.next().unwrap();
+            assert_eq!(row1.get::<i64>(1).unwrap().unwrap(), 1);
+            assert_eq!(row1.get::<i32>(2).unwrap().unwrap(), 1);
+            assert_eq!(row1.get::<f64>(3).unwrap().unwrap(), 42.0);
+            
+            let row2 = results.next().unwrap();
+            assert_eq!(row2.get::<i64>(1).unwrap().unwrap(), 2);
+            assert_eq!(row2.get::<i32>(2).unwrap().unwrap(), 2);
+            assert_eq!(row2.get::<f64>(3).unwrap().unwrap(), 84.0);
+            
+            // NOTE: UPDATE/DELETE are currently UNSUPPORTED and will fail with 
+            // "failed to fetch tuple being updated" because tuple_fetch_row_version returns false.
+            /*
+            client.update("UPDATE tam_scan_test SET value = 99.0 WHERE t = 1", None, &[])?;
+            client.update("DELETE FROM tam_scan_test WHERE t = 2", None, &[])?;
+            */
+            
+            Ok::<(), spi::Error>(())
+        }).unwrap();
+    }
+}
