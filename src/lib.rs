@@ -1,5 +1,5 @@
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
-use pgrx::guc::{GucContext, GucRegistry, GucSetting, GucFlags};
 use std::cell::Cell;
 
 pub mod bgworker;
@@ -49,7 +49,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         c"Maximum number of parallel background workers",
         c"Caps the number of workers that can refresh materialized views concurrently.",
         &WORKER_MAX,
-        1, 
+        1,
         100,
         GucContext::Sighup,
         GucFlags::default(),

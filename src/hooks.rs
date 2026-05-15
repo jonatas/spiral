@@ -183,12 +183,16 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 query_str.len()
             );
 
-            if !extracted_frames.is_empty() || !extracted_tenant.is_empty() || !extracted_cardinality.is_empty() || !extracted_time_column.is_empty() {
+            if !extracted_frames.is_empty()
+                || !extracted_tenant.is_empty()
+                || !extracted_cardinality.is_empty()
+                || !extracted_time_column.is_empty()
+            {
                 if tag == pg_sys::NodeTag::T_CreateStmt {
                     let stmt = utility_stmt as *mut pg_sys::CreateStmt;
                     (*stmt).accessMethod = pg_sys::pstrdup(c"spiral".as_ptr());
                 }
-                
+
                 notice!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
@@ -242,9 +246,11 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                         "t".to_string() // Fallback
                     };
 
-                    let offsets: Vec<String> = tstz_cols.into_iter().filter(|c| c != &anchor).collect();
+                    let offsets: Vec<String> =
+                        tstz_cols.into_iter().filter(|c| c != &anchor).collect();
                     Ok::<(String, Vec<String>), spi::Error>((anchor, offsets))
-                }).unwrap_or_else(|e| {
+                })
+                .unwrap_or_else(|e| {
                     warning!("Spiral failed to detect timestamptz columns: {:?}", e);
                     ("t".to_string(), Vec::new())
                 });
@@ -299,7 +305,12 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 );
                 base_metadata_map.insert(
                     "offset_columns".to_string(),
-                    serde_json::Value::Array(offset_cols.iter().map(|c| serde_json::Value::String(c.clone())).collect()),
+                    serde_json::Value::Array(
+                        offset_cols
+                            .iter()
+                            .map(|c| serde_json::Value::String(c.clone()))
+                            .collect(),
+                    ),
                 );
 
                 catalog::insert_metadata(
@@ -343,7 +354,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols);
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
-                
+
                 // 6. Ensure background worker is running for this database
                 unsafe {
                     crate::bgworker::maybe_start_worker();
@@ -929,7 +940,10 @@ pub fn create_reconstruction_view(rel_name: &str) {
             if col == "t" {
                 select_parts.push(format!("t AS \"{}\"", time_col));
             } else if offset_cols.contains(&col) && !is_tstz {
-                select_parts.push(format!("t + make_interval(secs => \"{}\"::double precision) AS \"{}\"", col, col));
+                select_parts.push(format!(
+                    "t + make_interval(secs => \"{}\"::double precision) AS \"{}\"",
+                    col, col
+                ));
             } else {
                 select_parts.push(format!("\"{}\"", col));
             }
@@ -968,20 +982,39 @@ pub fn generate_hierarchy_internal(
     let mut current_parent = base_name.to_string();
 
     let (anchor_col, offset_cols) = Spi::connect(|client| {
-        let metadata_res = client.select(&format!("SELECT columns_metadata FROM spiral.metadata WHERE view_name = '{}'", base_name.replace("'", "''")), Some(1), &[]);
+        let metadata_res = client.select(
+            &format!(
+                "SELECT columns_metadata FROM spiral.metadata WHERE view_name = '{}'",
+                base_name.replace("'", "''")
+            ),
+            Some(1),
+            &[],
+        );
         if let Ok(m) = metadata_res {
             if !m.is_empty() {
                 let json: pgrx::JsonB = m.first().get(1).unwrap().unwrap();
-                let anchor = json.0.get("time_column").and_then(|v| v.as_str()).unwrap_or("t").to_string();
-                let offsets: Vec<String> = json.0.get("offset_columns")
+                let anchor = json
+                    .0
+                    .get("time_column")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("t")
+                    .to_string();
+                let offsets: Vec<String> = json
+                    .0
+                    .get("offset_columns")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|v| v.as_str().unwrap().to_string())
+                            .collect()
+                    })
                     .unwrap_or_default();
-                return Ok::< (String, Vec<String>), spi::Error>((anchor, offsets));
+                return Ok::<(String, Vec<String>), spi::Error>((anchor, offsets));
             }
         }
-        Ok::< (String, Vec<String>), spi::Error>(("t".to_string(), Vec::new()))
-    }).unwrap_or(("t".to_string(), Vec::new()));
+        Ok::<(String, Vec<String>), spi::Error>(("t".to_string(), Vec::new()))
+    })
+    .unwrap_or(("t".to_string(), Vec::new()));
 
     for (i, frame) in frames.iter().enumerate() {
         let child_name = format!("{}_{}", base_prefix, frame.name);
@@ -992,10 +1025,12 @@ pub fn generate_hierarchy_internal(
         let mut sources = Vec::new();
         let mut select_parts = vec![format!(
             "to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision) as t",
-            anchor_col,
-            frame.seconds
+            anchor_col, frame.seconds
         )];
-        let mut group_parts = vec![format!("(spiral(\"{0}\") / {1}) * {1}", anchor_col, frame.seconds)];
+        let mut group_parts = vec![format!(
+            "(spiral(\"{0}\") / {1}) * {1}",
+            anchor_col, frame.seconds
+        )];
         let mut seen_cols = std::collections::HashSet::new();
         seen_cols.insert("t".to_string());
         seen_cols.insert(anchor_col.clone());
@@ -1047,16 +1082,14 @@ pub fn generate_hierarchy_internal(
                         });
                     }
                 }
-                if formula_lower.contains("max") {
-                    if seen_cols.insert(col.clone()) {
-                        select_parts.push(format!("max(\"{}\") as \"{}\"", col, col));
-                        sources.push(rollup::SourceDef {
-                            base_column: col.clone(),
-                            formula: "max".to_string(),
-                            mat_column: col.clone(),
-                            rollup_gsub_strategy: None,
-                        });
-                    }
+                if formula_lower.contains("max") && seen_cols.insert(col.clone()) {
+                    select_parts.push(format!("max(\"{}\") as \"{}\"", col, col));
+                    sources.push(rollup::SourceDef {
+                        base_column: col.clone(),
+                        formula: "max".to_string(),
+                        mat_column: col.clone(),
+                        rollup_gsub_strategy: None,
+                    });
                 }
             }
             // Add other columns as sum or range_merge by default
@@ -1068,7 +1101,10 @@ pub fn generate_hierarchy_internal(
                     if !seen_cols.contains(&col) && col != "t" && seen_cols.insert(col.clone()) {
                         if offset_cols.contains(&col) {
                             let bucket_expr = format!("to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision)", anchor_col, frame.seconds);
-                            select_parts.push(format!("date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"", col, bucket_expr, col));
+                            select_parts.push(format!(
+                                "date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"",
+                                col, bucket_expr, col
+                            ));
                             sources.push(rollup::SourceDef {
                                 base_column: col.clone(),
                                 formula: "range_merge".to_string(),
@@ -1173,7 +1209,11 @@ pub fn generate_hierarchy_internal(
                 }
                 current_parent = child_name;
             }
-            Err(e) => warning!("Spiral failed to create child table {}: {:?}", child_name, e),
+            Err(e) => warning!(
+                "Spiral failed to create child table {}: {:?}",
+                child_name,
+                e
+            ),
         }
     }
 }
@@ -1320,7 +1360,9 @@ fn construct_union_sql_hierarchical(
             let secs = if s == base_table {
                 0
             } else {
-                catalog::get_metadata(&s).map(|m| m.frame_seconds).unwrap_or(0)
+                catalog::get_metadata(&s)
+                    .map(|m| m.frame_seconds)
+                    .unwrap_or(0)
             };
             (s, secs)
         })
@@ -1358,11 +1400,12 @@ fn construct_union_sql_hierarchical(
                 inner_select.push(format!("{} as \"{}\"", col_sql, col));
             } else {
                 if col != "t" {
-                    let col_sql = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
-                        reconstruction_expr(col, &oc.formula, is_rollup)
-                    } else {
-                        format!("\"{}\"", col)
-                    };
+                    let col_sql =
+                        if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
+                            reconstruction_expr(col, &oc.formula, is_rollup)
+                        } else {
+                            format!("\"{}\"", col)
+                        };
                     inner_select.push(col_sql);
                 }
             }
@@ -1374,11 +1417,13 @@ fn construct_union_sql_hierarchical(
             let ts_end = format_epoch(seg._t_end);
             range_strs.push(format!("[\"{}\", \"{}\")", ts_start, ts_end));
         }
-        
-        if range_strs.is_empty() { continue; }
+
+        if range_strs.is_empty() {
+            continue;
+        }
 
         let multirange_lit = format!("'{{ {} }}'::tstzmultirange", range_strs.join(", "));
-        
+
         let group_by_str = if !is_rollup {
             let group_by = cols
                 .iter()
@@ -1415,9 +1460,12 @@ fn construct_union_sql_hierarchical(
 
     let mut sql = String::from("WITH ");
     sql.push_str(&cte_parts.join(", "));
-    sql.push_str(" ");
-    
-    let union_selects: Vec<String> = tier_names.iter().map(|n| format!("SELECT * FROM {}", n)).collect();
+    sql.push(' ');
+
+    let union_selects: Vec<String> = tier_names
+        .iter()
+        .map(|n| format!("SELECT * FROM {}", n))
+        .collect();
     sql.push_str(&union_selects.join(" UNION ALL "));
     sql.push_str(" ORDER BY t");
     sql

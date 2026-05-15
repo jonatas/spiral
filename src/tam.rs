@@ -17,7 +17,7 @@ pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::dat
     // Wire up the O(1) logic callbacks
     (*routine).slot_callbacks = Some(spiral_slot_callbacks);
     (*routine).tuple_insert = Some(spiral_slot_insert);
-    
+
     (*routine).scan_begin = Some(spiral_scan_begin);
     (*routine).scan_getnextslot = Some(spiral_scan_getnextslot);
     (*routine).scan_end = Some(spiral_scan_end);
@@ -37,19 +37,15 @@ pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::dat
 }
 
 #[pg_guard]
-pub unsafe extern "C-unwind" fn spiral_relation_needs_toast_table(
-    _rel: pg_sys::Relation,
-) -> bool {
+pub unsafe extern "C-unwind" fn spiral_relation_needs_toast_table(_rel: pg_sys::Relation) -> bool {
     false
 }
 
 #[pg_guard]
-pub unsafe extern "C-unwind" fn spiral_relation_nontransactional_truncate(
-    _rel: pg_sys::Relation,
-) {
-}
+pub unsafe extern "C-unwind" fn spiral_relation_nontransactional_truncate(_rel: pg_sys::Relation) {}
 
 #[pg_guard]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
     _old_heap: pg_sys::Relation,
     _new_heap: pg_sys::Relation,
@@ -137,7 +133,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
         pg_sys::RelationGetSmgr(rel);
         let nblocks = pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
         *_pages = nblocks;
-        *_tuples = (nblocks as f64) * 1024.0; 
+        *_tuples = (nblocks as f64) * 1024.0;
         *_allvisfrac = 1.0;
     }
 }
@@ -198,7 +194,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
             }
         }
 
-        let total_blks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+        let total_blks =
+            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
         let state = Box::new(SpiralScanState {
             tenant_scale,
             current_blkno: 0,
@@ -243,7 +240,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
 
             if val != 0.0 {
                 let items_before = (offset_in_page - crate::storage::HEADER_SIZE as u32) / 8;
-                let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64) + items_before as i64;
+                let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64)
+                    + items_before as i64;
 
                 let t = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
