@@ -175,12 +175,15 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 query_str.len()
             );
 
-            if !extracted_frames.is_empty() || !extracted_tenant.is_empty() || !extracted_cardinality.is_empty() {
+            if !extracted_frames.is_empty()
+                || !extracted_tenant.is_empty()
+                || !extracted_cardinality.is_empty()
+            {
                 if tag == pg_sys::NodeTag::T_CreateStmt {
                     let stmt = utility_stmt as *mut pg_sys::CreateStmt;
                     (*stmt).accessMethod = pg_sys::pstrdup(c"spiral".as_ptr());
                 }
-                
+
                 notice!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
@@ -308,7 +311,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols);
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
-                
+
                 // 6. Ensure background worker is running for this database
                 unsafe {
                     crate::bgworker::maybe_start_worker();
@@ -852,11 +855,24 @@ pub fn generate_hierarchy_internal(
                             rollup_gsub_strategy: None,
                         });
                     }
-                } else if formula_lower.contains("sketch") || formula_lower.contains("tdigest") || formula_lower.contains("quantile") {
+                } else if formula_lower.contains("sketch")
+                    || formula_lower.contains("tdigest")
+                    || formula_lower.contains("quantile")
+                {
                     let mat = alias.clone().unwrap_or_else(|| format!("{}_tdigest", col));
-                    let formula_name = if formula_lower.contains("tdigest") || formula_lower.contains("quantile") { "tdigest" } else { "sketch" };
+                    let formula_name = if formula_lower.contains("tdigest")
+                        || formula_lower.contains("quantile")
+                    {
+                        "tdigest"
+                    } else {
+                        "sketch"
+                    };
                     if seen_cols.insert(mat.clone()) {
-                        let agg_fn = if formula_name == "tdigest" { "spiral_tdigest" } else { "spiral_sketch" };
+                        let agg_fn = if formula_name == "tdigest" {
+                            "spiral_tdigest"
+                        } else {
+                            "spiral_sketch"
+                        };
                         select_parts.push(format!("{}(\"{}\") as \"{}\"", agg_fn, col, mat));
                         sources.push(rollup::SourceDef {
                             base_column: col.clone(),
@@ -1112,7 +1128,9 @@ fn construct_union_sql_hierarchical(
             let secs = if s == base_table {
                 0
             } else {
-                catalog::get_metadata(&s).map(|m| m.frame_seconds).unwrap_or(0)
+                catalog::get_metadata(&s)
+                    .map(|m| m.frame_seconds)
+                    .unwrap_or(0)
             };
             (s, secs)
         })
@@ -1158,11 +1176,13 @@ fn construct_union_sql_hierarchical(
             let ts_end = format_epoch(seg._t_end);
             range_strs.push(format!("[\"{}\", \"{}\")", ts_start, ts_end));
         }
-        
-        if range_strs.is_empty() { continue; }
+
+        if range_strs.is_empty() {
+            continue;
+        }
 
         let multirange_lit = format!("'{{ {} }}'::tstzmultirange", range_strs.join(", "));
-        
+
         let group_by_str = if !is_rollup {
             let group_by = cols
                 .iter()
@@ -1200,8 +1220,11 @@ fn construct_union_sql_hierarchical(
     let mut sql = String::from("WITH ");
     sql.push_str(&cte_parts.join(", "));
     sql.push_str(" ");
-    
-    let union_selects: Vec<String> = tier_names.iter().map(|n| format!("SELECT * FROM {}", n)).collect();
+
+    let union_selects: Vec<String> = tier_names
+        .iter()
+        .map(|n| format!("SELECT * FROM {}", n))
+        .collect();
     sql.push_str(&union_selects.join(" UNION ALL "));
     sql.push_str(" ORDER BY t");
     sql

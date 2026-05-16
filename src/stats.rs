@@ -214,7 +214,7 @@ pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB 
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
         .unwrap_or_default();
 
-    s.td.insert(val);
+    s.td = s.td.merge_unsorted(vec![val]);
     if val > s.max {
         s.max = val;
     }
@@ -244,7 +244,7 @@ pub fn spiral_sketch_combine(
         return pgrx::JsonB(serde_json::to_value(s2).unwrap());
     }
 
-    s1.td.merge(&s2.td);
+    s1.td = TDigest::merge_digests(vec![s1.td, s2.td]);
     if s2.max > s1.max {
         s1.max = s2.max;
     }
@@ -261,7 +261,7 @@ pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
     if s.td.count() == 0.0 {
         return 0.0;
     }
-    s.td.quantile(q)
+    s.td.estimate_quantile(q)
 }
 
 #[pg_extern(immutable, parallel_safe)]

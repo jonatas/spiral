@@ -1,6 +1,6 @@
+use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
-use serde::Serialize;
 
 #[derive(Serialize)]
 struct GoldenResult {
@@ -17,12 +17,10 @@ struct GoldenResult {
 
 fn main() {
     let mut values = Vec::new();
-    
     // Set 1: Normal-ish distribution
     for i in 0..1000 {
         values.push(i as f64);
     }
-    
     // Set 2: Outliers
     values.push(10000.0);
     values.push(-5000.0);
@@ -34,7 +32,6 @@ fn main() {
     let mut m2 = 0.0;
     let mut m3 = 0.0;
     let mut m4 = 0.0;
-    
     for &x in &values {
         let delta = x - mean;
         let delta2 = delta * delta;
@@ -42,11 +39,8 @@ fn main() {
         m3 += delta2 * delta;
         m4 += delta2 * delta2;
     }
-    
     let variance = m2 / (n - 1.0);
     let stddev = variance.sqrt();
-    
-    // Fisher-Pearson definitions
     let skewness = (n.sqrt() * m3) / m2.powf(1.5);
     let kurtosis = (n * m4) / (m2 * m2) - 3.0;
 

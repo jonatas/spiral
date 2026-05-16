@@ -49,9 +49,12 @@ pub fn get_children(view_name: &str) -> Vec<String> {
 pub fn is_spiral_relation(name: &str) -> bool {
     Spi::connect(|client| {
         let table = client.select(
-            &format!("SELECT 1 FROM spiral.metadata WHERE view_name = '{}'", name.replace("'", "''")),
+            &format!(
+                "SELECT 1 FROM spiral.metadata WHERE view_name = '{}'",
+                name.replace("'", "''")
+            ),
             None,
-            &[]
+            &[],
         )?;
         Ok::<bool, spi::Error>(!table.is_empty())
     })
@@ -67,7 +70,8 @@ pub fn insert_metadata(
     columns_metadata: pgrx::JsonB,
 ) {
     let scope_cols_json = serde_json::to_string(&scope_columns).unwrap_or_else(|_| "[]".to_string());
-    let metadata_json = serde_json::to_string(&columns_metadata.0).unwrap_or_else(|_| "{}".to_string());
+    let metadata_json =
+        serde_json::to_string(&columns_metadata.0).unwrap_or_else(|_| "{}".to_string());
 
     let _ = Spi::connect(|_client| {
         let sql = format!(
