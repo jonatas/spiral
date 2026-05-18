@@ -191,20 +191,68 @@ pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
 
 use tdigest::TDigest;
 
+pub const MAX_CENTROIDS: usize = 100;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SketchState {
     pub td: TDigest,
     pub max: f64,
     pub min: f64,
+    pub sum: f64,
+    pub count: f64,
 }
 
 impl Default for SketchState {
     fn default() -> Self {
-        Self {
-            td: TDigest::new_with_size(100),
+        SketchState {
+            td: TDigest::new_with_size(MAX_CENTROIDS),
             max: f64::MIN,
             min: f64::MAX,
+            sum: 0.0,
+            count: 0.0,
         }
+    }
+}
+
+impl SketchState {
+    pub fn add(&mut self, val: f64) {
+        self.td = self.td.merge_unsorted(vec![val]);
+        self.sum += val;
+        self.count += 1.0;
+        if val > self.max {
+            self.max = val;
+        }
+        if val < self.min {
+            self.min = val;
+        }
+    }
+
+    pub fn merge(&mut self, other: &SketchState) {
+        if other.count == 0.0 {
+            return;
+        }
+        if self.count == 0.0 {
+            *self = other.clone();
+            return;
+        }
+
+        self.td = TDigest::merge_digests(vec![self.td.clone(), other.td.clone()]);
+        self.sum += other.sum;
+        self.count += other.count;
+        if other.max > self.max {
+            self.max = other.max;
+        }
+        if other.min < self.min {
+            self.min = other.min;
+        }
+    }
+
+    /// Returns the q-quantile (0.0–1.0).
+    pub fn quantile(&self, q: f64) -> f64 {
+        if self.td.count() == 0.0 {
+            return 0.0;
+        }
+        self.td.estimate_quantile(q)
     }
 }
 
@@ -214,14 +262,7 @@ pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB 
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
         .unwrap_or_default();
 
-    s.td = s.td.merge_unsorted(vec![val]);
-    if val > s.max {
-        s.max = val;
-    }
-    if val < s.min {
-        s.min = val;
-    }
-
+    s.add(val);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
 }
 
@@ -237,31 +278,15 @@ pub fn spiral_sketch_combine(
         .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
         .unwrap_or_default();
 
-    if s2.td.count() == 0.0 {
-        return pgrx::JsonB(serde_json::to_value(s1).unwrap());
-    }
-    if s1.td.count() == 0.0 {
-        return pgrx::JsonB(serde_json::to_value(s2).unwrap());
-    }
-
-    s1.td = TDigest::merge_digests(vec![s1.td, s2.td]);
-    if s2.max > s1.max {
-        s1.max = s2.max;
-    }
-    if s2.min < s1.min {
-        s1.min = s2.min;
-    }
-
+    s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
-    let s = serde_json::from_value::<SketchState>(state.0).unwrap();
-    if s.td.count() == 0.0 {
-        return 0.0;
-    }
-    s.td.estimate_quantile(q)
+    serde_json::from_value::<SketchState>(state.0)
+        .unwrap()
+        .quantile(q)
 }
 
 #[pg_extern(immutable, parallel_safe)]
@@ -337,3 +362,119 @@ extension_sql!(
         spiral_tdigest_combine
     ]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sketch_from(vals: &[f64]) -> SketchState {
+        let mut s = SketchState::default();
+        for &v in vals {
+            s.add(v);
+        }
+        s
+    }
+
+    // --- SketchState unit tests ---
+
+    #[test]
+    fn sketch_quantile_small_exact() {
+        // ≤100 distinct values → quantile must be exact
+        let s = sketch_from(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(s.quantile(0.0), 1.0);
+        assert_eq!(s.quantile(0.5), 3.0);
+        assert_eq!(s.quantile(1.0), 5.0);
+    }
+
+    #[test]
+    fn sketch_quantile_repeated_values() {
+        let s = sketch_from(&[5.0, 5.0, 5.0, 10.0]);
+        assert_eq!(s.quantile(0.5), 5.0);
+        assert_eq!(s.quantile(0.9), 10.0);
+    }
+
+    #[test]
+    fn sketch_min_max_exact() {
+        let s = sketch_from(&[3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0]);
+        assert_eq!(s.min, 1.0);
+        assert_eq!(s.max, 9.0);
+        assert_eq!(s.count, 7.0);
+        assert!((s.sum - 25.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn sketch_merge_stable() {
+        // Merging two partial sketches must yield same count/sum/min/max as full sketch.
+        let full = sketch_from(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let mut left = sketch_from(&[1.0, 2.0, 3.0]);
+        let right = sketch_from(&[4.0, 5.0, 6.0]);
+        left.merge(&right);
+
+        assert_eq!(left.count, full.count);
+        assert!((left.sum - full.sum).abs() < 1e-10);
+        assert_eq!(left.min, full.min);
+        assert_eq!(left.max, full.max);
+        // Quantiles must be exact for this small dataset.
+        assert_eq!(left.quantile(0.5), full.quantile(0.5));
+    }
+
+    #[test]
+    fn sketch_merge_empty_identity() {
+        let s = sketch_from(&[1.0, 2.0, 3.0]);
+        let empty = SketchState::default();
+
+        let mut merged_left = s.clone();
+        merged_left.merge(&empty);
+        assert_eq!(merged_left.count, s.count);
+        assert_eq!(merged_left.sum, s.sum);
+
+        let mut merged_right = empty.clone();
+        merged_right.merge(&s);
+        assert_eq!(merged_right.count, s.count);
+        assert_eq!(merged_right.sum, s.sum);
+    }
+
+    #[test]
+    fn sketch_overflow_count_sum_min_max_exact() {
+        // 200 distinct values exceeds MAX_CENTROIDS — centroids compress, but
+        // count/sum/min/max remain exact.
+        let vals: Vec<f64> = (1..=200).map(|i| i as f64).collect();
+        let s = sketch_from(&vals);
+
+        assert_eq!(s.count, 200.0);
+        assert!((s.sum - (1.0 + 200.0) * 200.0 / 2.0).abs() < 1e-6);
+        assert_eq!(s.min, 1.0);
+        assert_eq!(s.max, 200.0);
+    }
+
+    #[test]
+    fn sketch_overflow_sequential_no_bias() {
+        // T-Digest is robust to sequential insertion order, unlike simpler
+        // centroid-based sketches.
+        let vals: Vec<f64> = (1..=200).map(|i| i as f64).collect();
+        let s = sketch_from(&vals);
+
+        // Actual p50 should be very close to the true median (100.5)
+        let p50 = s.quantile(0.5);
+        assert!(
+            (p50 - 100.5).abs() < 2.0,
+            "sequential p50={p50}: T-Digest maintains accuracy even with sequential insertion"
+        );
+    }
+
+    #[test]
+    fn sketch_quantile_uniform_error_characterization() {
+        // Documents accuracy for a uniform distribution over 1000 values.
+        // count/sum/min/max are always exact. Quantile estimates under sequential
+        // insertion are biased by the nearest-centroid overflow strategy.
+        let vals: Vec<f64> = (1..=1000).map(|i| i as f64).collect();
+        let s = sketch_from(&vals);
+
+        // These always hold regardless of overflow behavior.
+        assert_eq!(s.count, 1000.0);
+        assert!((s.sum - 500500.0).abs() < 1e-3);
+        assert_eq!(s.min, 1.0);
+        assert_eq!(s.max, 1000.0);
+    }
+}

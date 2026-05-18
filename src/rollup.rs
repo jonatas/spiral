@@ -85,15 +85,6 @@ pub fn derive_child_sql(
             Err(_) => false,
         };
 
-        let mut select_cols = vec![format!("to_timestamp(((spiral(t) / {0}) * {0} + 946684800)::double precision) as t", frame_seconds)];
-        let mut group_by = vec!["(spiral(t) / {0}) * {0}".replace("{0}", &frame_seconds.to_string())];
-        let mut sources = Vec::new();
-
-        for s in scope_columns {
-            select_cols.push(format!("\"{}\"", s));
-            group_by.push(format!("\"{}\"", s));
-        }
-
         let parent_is_view_res = client.select(
             &format!("SELECT frame_seconds FROM spiral.metadata WHERE view_name = '{}'", parent_name.replace("'", "''")),
             Some(1),
@@ -109,6 +100,30 @@ pub fn derive_child_sql(
             },
             Err(_) => false,
         };
+
+        let (anchor_col, _offset_cols) = if !parent_is_view {
+            let metadata_res = client.select(&format!("SELECT columns_metadata FROM spiral.metadata WHERE view_name = '{}'", parent_name.replace("'", "''")), Some(1), &[]);
+            if let Ok(m) = metadata_res {
+                if !m.is_empty() {
+                    let json: pgrx::JsonB = m.first().get(1).unwrap().unwrap();
+                    let anchor = json.0.get("time_column").and_then(|v| v.as_str()).unwrap_or("t").to_string();
+                    let offsets: Vec<String> = json.0.get("offset_columns")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+                        .unwrap_or_default();
+                    (anchor, offsets)
+                } else { ("t".to_string(), Vec::new()) }
+            } else { ("t".to_string(), Vec::new()) }
+        } else { ("t".to_string(), Vec::new()) };
+
+        let mut select_cols = vec![format!("to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision) as t", anchor_col, frame_seconds)];
+        let mut group_by = vec![format!("(spiral(\"{}\") / {1}) * {1}", anchor_col, frame_seconds)];
+        let mut sources = Vec::new();
+
+        for s in scope_columns {
+            select_cols.push(format!("\"{}\"", s));
+            group_by.push(format!("\"{}\"", s));
+        }
 
         let sources_query = format!("SELECT base_column, formula, mat_column, rollup_gsub_strategy FROM spiral.sources WHERE view_name = '{}'", child_name.replace("'", "''"));
         let mut loaded_sources = Vec::new();
@@ -174,6 +189,13 @@ pub fn derive_child_sql(
                         select_cols.push(format!("first(\"{}\", spiral(t)) as \"{}_o\", max(\"{}\") as \"{}_h\", min(\"{}\") as \"{}_l\", last(\"{}\", spiral(t)) as \"{}_c\", sum(\"{}\") as \"{}_v\"", bc, mc, bc, mc, bc, mc, bc, mc, bc, mc));
                     } else {
                         select_cols.push(format!("first(\"{}_o\", spiral(t)) as \"{}_o\", max(\"{}_h\") as \"{}_h\", min(\"{}_l\") as \"{}_l\", last(\"{}_c\", spiral(t)) as \"{}_c\", sum(\"{}_v\") as \"{}_v\"", mc, mc, mc, mc, mc, mc, mc, mc, mc, mc));
+                    }
+                } else if src.formula == "range_merge" {
+                    if !parent_is_view {
+                        let bucket_expr = format!("to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision)", anchor_col, frame_seconds);
+                        select_cols.push(format!("date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"", src.base_column, bucket_expr, src.mat_column));
+                    } else {
+                        select_cols.push(format!("max(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
                     }
                 } else {
                     let bc = if parent_is_view { &src.mat_column } else { &src.base_column };
