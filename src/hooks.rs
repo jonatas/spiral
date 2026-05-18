@@ -1460,7 +1460,7 @@ fn construct_union_sql_hierarchical(
 
     let mut sql = String::from("WITH ");
     sql.push_str(&cte_parts.join(", "));
-    sql.push(' ');
+    sql.push_str(" ");
 
     let union_selects: Vec<String> = tier_names
         .iter()
