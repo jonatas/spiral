@@ -16,11 +16,10 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
         let mut slot = None;
         for i in 0..max_workers {
             let lock_id: i64 = 0x41535049 + i as i64;
-            let got_lock: bool = Spi::get_one::<bool>(
-                &format!("SELECT pg_try_advisory_lock({})", lock_id)
-            )
-            .unwrap_or(Some(false))
-            .unwrap_or(false);
+            let got_lock: bool =
+                Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_lock({})", lock_id))
+                    .unwrap_or(Some(false))
+                    .unwrap_or(false);
 
             if got_lock {
                 slot = Some(i);
@@ -70,11 +69,19 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     if let Ok(Some(view_name)) = row.get::<String>(1) {
                         // Avoid contention: try to acquire a transaction-level advisory lock for this specific view
                         // We use a constant namespace 0x41535050 = 1095983184 and the hashtext of the view name.
-                        let got_view_lock: bool = client.select(
-                            &format!("SELECT pg_try_advisory_xact_lock(1095983184, hashtext('{}'))", view_name.replace("'", "''")),
-                            Some(1),
-                            &[],
-                        )?.first().get_one::<bool>().unwrap_or(Some(false)).unwrap_or(false);
+                        let got_view_lock: bool = client
+                            .select(
+                                &format!(
+                                    "SELECT pg_try_advisory_xact_lock(1095983184, hashtext('{}'))",
+                                    view_name.replace("'", "''")
+                                ),
+                                Some(1),
+                                &[],
+                            )?
+                            .first()
+                            .get_one::<bool>()
+                            .unwrap_or(Some(false))
+                            .unwrap_or(false);
 
                         if !got_view_lock {
                             continue; // Another worker is processing this view
@@ -83,7 +90,10 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         // Only refresh if there are dirty buckets
                         let has_dirty: bool = client
                             .select(
-                                &format!("SELECT 1 FROM spiral.changelog WHERE base_view = '{}' LIMIT 1", view_name.replace("'", "''")),
+                                &format!(
+                                    "SELECT 1 FROM spiral.changelog WHERE base_view = '{}' LIMIT 1",
+                                    view_name.replace("'", "''")
+                                ),
                                 Some(1),
                                 &[],
                             )
@@ -92,9 +102,16 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
 
                         if has_dirty {
                             if debug_logging {
-                                debug2!("Spiral Worker (Slot {}): Auto-refreshing root view '{}'", slot, view_name);
+                                debug2!(
+                                    "Spiral Worker (Slot {}): Auto-refreshing root view '{}'",
+                                    slot,
+                                    view_name
+                                );
                             } else {
-                                info!("Spiral Worker (Slot {}): Auto-refreshing root view '{}'", slot, view_name);
+                                info!(
+                                    "Spiral Worker (Slot {}): Auto-refreshing root view '{}'",
+                                    slot, view_name
+                                );
                             }
                             let _ = Spi::run(&format!("SELECT spiral_refresh('{}')", view_name));
                         }
