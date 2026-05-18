@@ -115,6 +115,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
             let mut extracted_frames = String::new();
             let mut extracted_tenant = String::new();
             let mut extracted_cardinality = String::new();
+            let mut extracted_time_column = String::new();
 
             let mut process_options = |list: *mut pg_sys::List| -> *mut pg_sys::List {
                 let mut new_options: *mut pg_sys::List = std::ptr::null_mut();
@@ -150,6 +151,13 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                                     extracted_cardinality =
                                         CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
                                 }
+                            } else if defname == "time_column" {
+                                let arg = (*cell).arg;
+                                if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_String {
+                                    let s = arg as *mut pg_sys::String;
+                                    extracted_time_column =
+                                        CStr::from_ptr((*s).sval).to_string_lossy().into_owned();
+                                }
                             }
                         }
                     }
@@ -178,6 +186,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
             if !extracted_frames.is_empty()
                 || !extracted_tenant.is_empty()
                 || !extracted_cardinality.is_empty()
+                || !extracted_time_column.is_empty()
             {
                 if tag == pg_sys::NodeTag::T_CreateStmt {
                     let stmt = utility_stmt as *mut pg_sys::CreateStmt;
@@ -209,6 +218,42 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     );
                 }
                 notice!("Spiral: standard_ProcessUtility returned, processing hierarchy...");
+
+                // Detect timestamptz columns and handle Date Anchors
+                let (anchor_col, offset_cols) = Spi::connect(|client| {
+                    let q = format!(
+                        "SELECT attname::text, atttypid 
+                         FROM pg_attribute 
+                         WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped 
+                         ORDER BY attnum",
+                        name.replace("\"", "\"\"")
+                    );
+                    let res = client.select(&q, None, &[])?;
+                    let mut tstz_cols = Vec::new();
+                    for row in res {
+                        let attname = row.get::<String>(1).unwrap().unwrap();
+                        let atttypid = row.get::<pg_sys::Oid>(2).unwrap().unwrap();
+                        if atttypid == pg_sys::TIMESTAMPTZOID {
+                            tstz_cols.push(attname);
+                        }
+                    }
+
+                    let anchor = if !extracted_time_column.is_empty() {
+                        extracted_time_column.clone()
+                    } else if !tstz_cols.is_empty() {
+                        tstz_cols[0].clone()
+                    } else {
+                        "t".to_string() // Fallback
+                    };
+
+                    let offsets: Vec<String> =
+                        tstz_cols.into_iter().filter(|c| c != &anchor).collect();
+                    Ok::<(String, Vec<String>), spi::Error>((anchor, offsets))
+                })
+                .unwrap_or_else(|e| {
+                    warning!("Spiral failed to detect timestamptz columns: {:?}", e);
+                    ("t".to_string(), Vec::new())
+                });
 
                 // 2. Parse frames
                 let frames_str = extracted_frames.clone();
@@ -254,6 +299,19 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                         serde_json::Value::String(extracted_cardinality.clone()),
                     );
                 }
+                base_metadata_map.insert(
+                    "time_column".to_string(),
+                    serde_json::Value::String(anchor_col.clone()),
+                );
+                base_metadata_map.insert(
+                    "offset_columns".to_string(),
+                    serde_json::Value::Array(
+                        offset_cols
+                            .iter()
+                            .map(|c| serde_json::Value::String(c.clone()))
+                            .collect(),
+                    ),
+                );
 
                 catalog::insert_metadata(
                     &name,
@@ -261,8 +319,9 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     0,
                     &name,
                     scope_columns.clone(),
-                    pgrx::JsonB(serde_json::Value::Object(base_metadata_map)),
+                    pgrx::JsonB(serde_json::Value::Object(base_metadata_map.clone())),
                 );
+                create_reconstruction_view(&name);
 
                 for event in &["INSERT", "UPDATE", "DELETE"] {
                     let mut transition = String::new();
@@ -422,7 +481,7 @@ unsafe fn build_time_constraints(
                     && (*right).type_ == pg_sys::NodeTag::T_Const
                 {
                     let var = var_node as *mut pg_sys::Var;
-                    let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32)
+                    let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
                         as *mut pg_sys::RangeTblEntry;
                     let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                     if !varname_ptr.is_null() {
@@ -480,9 +539,9 @@ unsafe fn build_time_constraints(
                 {
                     let v1 = left as *mut pg_sys::Var;
                     let v2 = right as *mut pg_sys::Var;
-                    let rte1 = pg_sys::list_nth(rtable, ((*v1).varno - 1) as i32)
+                    let rte1 = pg_sys::list_nth(rtable, (*v1).varno - 1)
                         as *mut pg_sys::RangeTblEntry;
-                    let rte2 = pg_sys::list_nth(rtable, ((*v2).varno - 1) as i32)
+                    let rte2 = pg_sys::list_nth(rtable, (*v2).varno - 1)
                         as *mut pg_sys::RangeTblEntry;
                     let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
                     let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
@@ -568,10 +627,12 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                         }).unwrap_or_default();
 
                         if !hierarchy.is_empty() {
+                            let offset_cols = catalog::get_offset_columns(&base_table);
+                            let metadata_obj = catalog::get_metadata(&base_table);
+
                             if let Some(qc) = constraint_map.get(&varno) {
                                 if let (Some(ts), Some(te)) = (qc.start, qc.end) {
                                     // Build scope_values JsonB from qc.scopes if they match view's scope_columns
-                                    let metadata_obj = catalog::get_metadata(&base_table);
                                     let scope_values = metadata_obj.as_ref().and_then(|m| {
                                         let mut map = serde_json::Map::new();
                                         for col in &m.scope_columns {
@@ -645,6 +706,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                             &base_table,
                                             &segments,
                                             &cols,
+                                            &offset_cols,
                                         );
                                         let new_query = parse_sql_to_query(&union_sql);
                                         if !new_query.is_null() {
@@ -652,8 +714,59 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                             (*rte).subquery = new_query;
                                             (*rte).relid = pg_sys::InvalidOid;
                                             (*rte).perminfoindex = 0;
+                                            continue; // Accelerated, move to next RTE
                                         }
                                     }
+                                }
+                            }
+
+                            // Fallback reconstruction if not accelerated but has offset columns
+                            let is_rollup_table = metadata_obj
+                                .as_ref()
+                                .map(|m| m.frame_seconds > 0)
+                                .unwrap_or(false);
+
+                            if !offset_cols.is_empty() && is_rollup_table {
+                                let base_cols_query = format!(
+                                    "SELECT attname::text FROM pg_attribute
+                                     WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped
+                                     ORDER BY attnum",
+                                    base_table.replace("\"", "\"\"")
+                                );
+                                let all_cols = Spi::connect(|client| {
+                                    Ok::<Vec<String>, spi::Error>(
+                                        client
+                                            .select(&base_cols_query, None, &[])?
+                                            .map(|r| r.get::<String>(1).unwrap().unwrap())
+                                            .collect(),
+                                    )
+                                })
+                                .unwrap_or_default();
+
+                                let select_list: Vec<String> = all_cols
+                                    .iter()
+                                    .map(|col| {
+                                        if let Some(oc) =
+                                            offset_cols.iter().find(|o| &o.mat_column == col)
+                                        {
+                                            reconstruction_expr(col, &oc.formula, true)
+                                        } else {
+                                            format!("\"{}\"", col)
+                                        }
+                                    })
+                                    .collect();
+
+                                let wrap_sql = format!(
+                                    "SELECT {} FROM \"{}\"",
+                                    select_list.join(", "),
+                                    base_table
+                                );
+                                let inner = parse_sql_to_query(&wrap_sql);
+                                if !inner.is_null() {
+                                    (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
+                                    (*rte).subquery = inner;
+                                    (*rte).relid = pg_sys::InvalidOid;
+                                    (*rte).perminfoindex = 0;
                                 }
                             }
                         }
@@ -775,6 +888,83 @@ fn resolve_segments(
     final_segments
 }
 
+pub fn create_reconstruction_view(rel_name: &str) {
+    let _ = Spi::connect(|client| {
+        let mut metadata_res = client.select(
+            &format!(
+                "SELECT columns_metadata, base_view FROM spiral.metadata WHERE view_name = '{}'",
+                rel_name.replace("'", "''")
+            ),
+            Some(1),
+            &[],
+        )?;
+        if metadata_res.is_empty() {
+            return Ok::<(), spi::Error>(());
+        }
+
+        let row = metadata_res.next().expect("metadata_res is empty");
+        let json: pgrx::JsonB = row.get(1).unwrap().unwrap();
+        let _base_view = row.get::<String>(2).unwrap().unwrap();
+
+        let time_col = json
+            .0
+            .get("time_column")
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .unwrap_or("t");
+        let offset_cols: Vec<String> = json
+            .0
+            .get("offset_columns")
+            .and_then(|v: &serde_json::Value| v.as_array())
+            .map(|arr: &Vec<serde_json::Value>| {
+                arr.iter()
+                    .map(|v: &serde_json::Value| v.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let q = format!(
+            "SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped",
+            rel_name.replace("\"", "\"\"")
+        );
+        let cols_res = client.select(&q, None, &[])?;
+        let mut select_parts = Vec::new();
+
+        for row in cols_res {
+            let col = row.get::<String>(1).unwrap().unwrap();
+            let mut is_tstz = false;
+            let type_res = client.select(&format!("SELECT atttypid FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attname = '{}'", rel_name.replace("\"", "\"\""), col.replace("'", "''")), Some(1), &[]);
+            if let Ok(t) = type_res {
+                if !t.is_empty() {
+                    let oid = t.first().get::<pg_sys::Oid>(1).unwrap().unwrap();
+                    if oid == pg_sys::TIMESTAMPTZOID {
+                        is_tstz = true;
+                    }
+                }
+            }
+
+            if col == "t" {
+                select_parts.push(format!("t AS \"{}\"", time_col));
+            } else if offset_cols.contains(&col) && !is_tstz {
+                select_parts.push(format!(
+                    "t + make_interval(secs => \"{}\"::double precision) AS \"{}\"",
+                    col, col
+                ));
+            } else {
+                select_parts.push(format!("\"{}\"", col));
+            }
+        }
+
+        let view_name = format!("{}_view", rel_name);
+        let create_view_sql = format!(
+            "CREATE OR REPLACE VIEW \"{}\" AS SELECT {} FROM \"{}\"",
+            view_name.replace("\"", "\"\""),
+            select_parts.join(", "),
+            rel_name.replace("\"", "\"\"")
+        );
+        let _ = Spi::run(&create_view_sql);
+        Ok::<(), spi::Error>(())
+    });
+}
 pub fn generate_hierarchy_internal(
     base_name: &str,
     frames_str: &str,
@@ -796,6 +986,41 @@ pub fn generate_hierarchy_internal(
     };
     let mut current_parent = base_name.to_string();
 
+    let (anchor_col, offset_cols) = Spi::connect(|client| {
+        let metadata_res = client.select(
+            &format!(
+                "SELECT columns_metadata FROM spiral.metadata WHERE view_name = '{}'",
+                base_name.replace("'", "''")
+            ),
+            Some(1),
+            &[],
+        );
+        if let Ok(m) = metadata_res {
+            if !m.is_empty() {
+                let json: pgrx::JsonB = m.first().get(1).unwrap().unwrap();
+                let anchor = json
+                    .0
+                    .get("time_column")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("t")
+                    .to_string();
+                let offsets: Vec<String> = json
+                    .0
+                    .get("offset_columns")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|v| v.as_str().unwrap().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok::<(String, Vec<String>), spi::Error>((anchor, offsets));
+            }
+        }
+        Ok::<(String, Vec<String>), spi::Error>(("t".to_string(), Vec::new()))
+    })
+    .unwrap_or(("t".to_string(), Vec::new()));
+
     for (i, frame) in frames.iter().enumerate() {
         let child_name = format!("{}_{}", base_prefix, frame.name);
         if child_name == current_parent {
@@ -804,12 +1029,16 @@ pub fn generate_hierarchy_internal(
 
         let mut sources = Vec::new();
         let mut select_parts = vec![format!(
-            "to_timestamp(((spiral(t) / {0}) * {0} + 946684800)::double precision) as t",
-            frame.seconds
+            "to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision) as t",
+            anchor_col, frame.seconds
         )];
-        let mut group_parts = vec![format!("(spiral(t) / {0}) * {0}", frame.seconds)];
+        let mut group_parts = vec![format!(
+            "(spiral(\"{0}\") / {1}) * {1}",
+            anchor_col, frame.seconds
+        )];
         let mut seen_cols = std::collections::HashSet::new();
         seen_cols.insert("t".to_string());
+        seen_cols.insert(anchor_col.clone());
 
         for s in &scope_columns {
             if seen_cols.insert(s.clone()) {
@@ -858,21 +1087,44 @@ pub fn generate_hierarchy_internal(
                         });
                     }
                 }
+                if formula_lower.contains("max") && seen_cols.insert(col.clone()) {
+                    select_parts.push(format!("max(\"{}\") as \"{}\"", col, col));
+                    sources.push(rollup::SourceDef {
+                        base_column: col.clone(),
+                        formula: "max".to_string(),
+                        mat_column: col.clone(),
+                        rollup_gsub_strategy: None,
+                    });
+                }
             }
-            // Add other columns as sum by default
+            // Add other columns as sum or range_merge by default
             Spi::connect(|client| {
                 let q = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", base_name.replace("\"", "\"\""));
                 let cols = client.select(&q, None, &[]).unwrap();
                 for row in cols {
                     let col = row.get::<String>(1).unwrap().unwrap();
                     if !seen_cols.contains(&col) && col != "t" && seen_cols.insert(col.clone()) {
-                        select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
-                        sources.push(rollup::SourceDef {
-                            base_column: col.clone(),
-                            formula: "sum".to_string(),
-                            mat_column: col.clone(),
-                            rollup_gsub_strategy: None,
-                        });
+                        if offset_cols.contains(&col) {
+                            let bucket_expr = format!("to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision)", anchor_col, frame.seconds);
+                            select_parts.push(format!(
+                                "date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"",
+                                col, bucket_expr, col
+                            ));
+                            sources.push(rollup::SourceDef {
+                                base_column: col.clone(),
+                                formula: "range_merge".to_string(),
+                                mat_column: col.clone(),
+                                rollup_gsub_strategy: None,
+                            });
+                        } else {
+                            select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
+                            sources.push(rollup::SourceDef {
+                                base_column: col.clone(),
+                                formula: "sum".to_string(),
+                                mat_column: col.clone(),
+                                rollup_gsub_strategy: None,
+                            });
+                        }
                     }
                 }
             });
@@ -906,6 +1158,11 @@ pub fn generate_hierarchy_internal(
                 } else if src.formula == "ohlcv" {
                     let c = &src.mat_column;
                     select_parts.push(format!("first(\"{}_o\", spiral(t)) as \"{}_o\", max(\"{}_h\") as \"{}_h\", min(\"{}_l\") as \"{}_l\", last(\"{}_c\", spiral(t)) as \"{}_c\", sum(\"{}_v\") as \"{}_v\"", c, c, c, c, c, c, c, c, c, c));
+                } else if src.formula == "range_merge" {
+                    select_parts.push(format!(
+                        "max(\"{}\") as \"{}\"",
+                        src.mat_column, src.mat_column
+                    ));
                 } else {
                     select_parts.push(format!(
                         "sum(\"{}\") as \"{}\"",
@@ -941,7 +1198,9 @@ pub fn generate_hierarchy_internal(
                     scope_columns.clone(),
                     pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
                 );
-                for src in sources {
+                create_reconstruction_view(&child_name);
+
+                for src in &sources {
                     catalog::insert_source(
                         &child_name,
                         base_name,
@@ -955,7 +1214,11 @@ pub fn generate_hierarchy_internal(
                 }
                 current_parent = child_name;
             }
-            Err(e) => warning!("Spiral failed to create child view {}: {:?}", child_name, e),
+            Err(e) => warning!(
+                "Spiral failed to create child table {}: {:?}",
+                child_name,
+                e
+            ),
         }
     }
 }
@@ -1023,7 +1286,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
         match (*node).type_ {
             pg_sys::NodeTag::T_Var => {
                 let var = node as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32)
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
                     as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
                     return None;
@@ -1074,7 +1337,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 }
 
                 let var = arg_expr as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, ((*var).varno - 1) as i32)
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
                     as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
                     return None;
@@ -1138,10 +1401,25 @@ fn format_epoch(epoch: i64) -> String {
     .unwrap_or_else(|| epoch.to_string())
 }
 
+fn reconstruction_expr(col: &str, formula: &str, is_rollup: bool) -> String {
+    if !is_rollup {
+        // Base table: original timestamptz, pass through
+        return format!("\"{}\"", col);
+    }
+    match formula {
+        "range_merge" => format!(
+            "t + make_interval(secs => \"{}\"::double precision) AS \"{}\"",
+            col, col
+        ),
+        _ => format!("\"{}\"", col),
+    }
+}
+
 fn construct_union_sql_hierarchical(
     base_table: &str,
     segments: &[Segment],
     cols: &[(String, Option<String>)],
+    offset_cols: &[catalog::OffsetColumn],
 ) -> String {
     let mut sources: Vec<String> = segments.iter().map(|s| s.source.clone()).collect();
     sources.sort();
@@ -1183,14 +1461,23 @@ fn construct_union_sql_hierarchical(
                 } else {
                     col.clone()
                 };
-                inner_select.push(format!(
-                    "{} as \"{}\"",
-                    map_agg_inner(agg_fn, &mapped, is_rollup),
-                    col
-                ));
+
+                let col_sql = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
+                    reconstruction_expr(&mapped, &oc.formula, is_rollup)
+                } else {
+                    map_agg_inner(agg_fn, &mapped, is_rollup)
+                };
+
+                inner_select.push(format!("{} as \"{}\"", col_sql, col));
             } else {
                 if col != "t" {
-                    inner_select.push(format!("\"{}\"", col));
+                    let col_sql =
+                        if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
+                            reconstruction_expr(col, &oc.formula, is_rollup)
+                        } else {
+                            format!("\"{}\"", col)
+                        };
+                    inner_select.push(col_sql);
                 }
             }
         }

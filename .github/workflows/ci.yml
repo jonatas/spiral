@@ -36,18 +36,33 @@ jobs:
             pkg-config \
             libclang-dev \
             clang
-      - name: Cache cargo
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+      - name: Cache cargo-pgrx binary
+        id: cache-pgrx-bin
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-pgrx
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: ${{ runner.os }}-cargo-pgrx-bin-0.17.0
       - name: Install cargo-pgrx
+        if: steps.cache-pgrx-bin.outputs.cache-hit != 'true'
         run: cargo install cargo-pgrx --version 0.17.0 --locked
+      - name: Cache pgrx PG installation
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: ${{ runner.os }}-pgrx-0.17.0-pg18
       - name: Initialize pgrx
         run: cargo pgrx init
       - name: Check formatting
@@ -86,19 +101,36 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Cache cargo-pgrx binary
+        id: cache-pgrx-bin
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-pgrx
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: ${{ runner.os }}-cargo-pgrx-bin-0.17.0
+
       - name: Install cargo-pgrx
+        if: steps.cache-pgrx-bin.outputs.cache-hit != 'true'
         run: cargo install cargo-pgrx --version 0.17.0 --locked
+
+      - name: Cache pgrx PG installation
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: ${{ runner.os }}-pgrx-0.17.0-pg18
 
       - name: Initialize pgrx
         run: cargo pgrx init

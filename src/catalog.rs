@@ -49,9 +49,12 @@ pub fn get_children(view_name: &str) -> Vec<String> {
 pub fn is_spiral_relation(name: &str) -> bool {
     Spi::connect(|client| {
         let table = client.select(
-            &format!("SELECT 1 FROM spiral.metadata WHERE view_name = '{}'", name.replace("'", "''")),
+            &format!(
+                "SELECT 1 FROM spiral.metadata WHERE view_name = '{}'",
+                name.replace("'", "''")
+            ),
             None,
-            &[]
+            &[],
         )?;
         Ok::<bool, spi::Error>(!table.is_empty())
     })
@@ -66,8 +69,10 @@ pub fn insert_metadata(
     scope_columns: Vec<String>,
     columns_metadata: pgrx::JsonB,
 ) {
-    let scope_cols_json = serde_json::to_string(&scope_columns).unwrap_or_else(|_| "[]".to_string());
-    let metadata_json = serde_json::to_string(&columns_metadata.0).unwrap_or_else(|_| "{}".to_string());
+    let scope_cols_json =
+        serde_json::to_string(&scope_columns).unwrap_or_else(|_| "[]".to_string());
+    let metadata_json =
+        serde_json::to_string(&columns_metadata.0).unwrap_or_else(|_| "{}".to_string());
 
     let _ = Spi::connect(|_client| {
         let sql = format!(
@@ -205,4 +210,29 @@ pub fn get_tenant_scale(metadata: &Metadata) -> i64 {
         }
     }
     1024
+}
+
+pub struct OffsetColumn {
+    pub mat_column: String,
+    pub formula: String,
+}
+
+pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
+    Spi::connect(|client| {
+        let sql = format!(
+            "SELECT mat_column, formula FROM spiral.sources
+             WHERE view_name = '{}' AND formula IN ('range_merge')",
+            view_name.replace("'", "''")
+        );
+        Ok::<Vec<OffsetColumn>, spi::Error>(
+            client
+                .select(&sql, None, &[])?
+                .map(|r| OffsetColumn {
+                    mat_column: r.get::<String>(1).unwrap().unwrap(),
+                    formula: r.get::<String>(2).unwrap().unwrap(),
+                })
+                .collect(),
+        )
+    })
+    .unwrap_or_default()
 }

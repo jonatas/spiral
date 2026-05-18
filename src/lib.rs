@@ -686,4 +686,56 @@ mod tests {
             }
         }
     }
+
+    #[pg_test]
+    fn test_stats_accuracy_golden() {
+        let values_csv = include_str!("../tests/golden/values.csv");
+        let expected_json = include_str!("../tests/golden/expected.json");
+        let expected: serde_json::Value = serde_json::from_str(expected_json).unwrap();
+
+        let mut state = crate::stats::StatsState::default();
+        for line in values_csv.lines() {
+            if let Ok(v) = line.parse::<f64>() {
+                state.add(v);
+            }
+        }
+
+        let epsilon = 1e-9;
+        assert!((state.mean() - expected["mean"].as_f64().unwrap()).abs() < epsilon);
+        assert!((state.variance() - expected["variance"].as_f64().unwrap()).abs() < epsilon);
+        assert!((state.skewness() - expected["skewness"].as_f64().unwrap()).abs() < epsilon);
+        assert!((state.kurtosis() - expected["kurtosis"].as_f64().unwrap()).abs() < epsilon);
+    }
+
+    #[pg_test]
+    fn test_zorder_correctness() {
+        use crate::spiral_zorder_int_array;
+
+        // Test case 1: 0, 0 -> 0
+        assert_eq!(spiral_zorder_int_array(0, vec![0]), 0);
+
+        // Test case 2: 1, 0 -> 1 (Time bit 0 at position 0)
+        assert_eq!(spiral_zorder_int_array(1, vec![0]), 1);
+
+        // Test case 3: 0, 1 -> 2 (Dimension bit 0 at position 1)
+        assert_eq!(spiral_zorder_int_array(0, vec![1]), 2);
+
+        // Test case 4: 1, 1 -> 3 (Both bits 0 at positions 0 and 1)
+        assert_eq!(spiral_zorder_int_array(1, vec![1]), 3);
+
+        // Test case 5: 2, 0 -> 4 (Time bit 1 at position 2)
+        assert_eq!(spiral_zorder_int_array(2, vec![0]), 4);
+
+        // Test case 6: 0, 2 -> 8 (Dimension bit 1 at position 3)
+        assert_eq!(spiral_zorder_int_array(0, vec![2]), 8);
+    }
+
+    #[pg_test]
+    fn test_hilbert_2d_correctness() {
+        use crate::spiral_hilbert_2d;
+        assert_eq!(spiral_hilbert_2d(0, 0), 0);
+        assert_eq!(spiral_hilbert_2d(1, 0), 1);
+        assert_eq!(spiral_hilbert_2d(0, 1), 2);
+        assert_eq!(spiral_hilbert_2d(1, 1), 3);
+    }
 }
