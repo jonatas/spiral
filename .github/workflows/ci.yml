@@ -40,16 +40,17 @@ jobs:
             pkg-config \
             libclang-dev \
             clang
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-ccache
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-ccache
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          shared-key: "spiral"
       - name: Cache cargo-pgrx binary
         id: cache-pgrx-bin
         uses: actions/cache@v4
@@ -63,16 +64,20 @@ jobs:
         if: steps.cache-pgrx-bin.outputs.cache-hit != 'true'
         run: cargo install cargo-pgrx --version 0.17.0 --locked
       - name: Cache pgrx PG installation
+        id: cache-pgrx-pg
         uses: actions/cache@v4
         with:
           path: ~/.pgrx
-          key: ${{ runner.os }}-pgrx-0.17.0-pg18
+          key: ${{ runner.os }}-pgrx-0.17.0-pg18-v1
       - name: Initialize pgrx
+        if: steps.cache-pgrx-pg.outputs.cache-hit != 'true'
         run: cargo pgrx init --pg18 download
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
-        run: cargo clippy --all-targets --features pg18 -- -D warnings
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          cargo clippy --all-targets --features pg18 -- -D warnings
 
   test:
     name: Test (PG ${{ matrix.pg_version }})
@@ -105,16 +110,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-ccache
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-ccache
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          shared-key: "spiral"
 
       - name: Cache cargo-pgrx binary
         id: cache-pgrx-bin
@@ -131,13 +138,17 @@ jobs:
         run: cargo install cargo-pgrx --version 0.17.0 --locked
 
       - name: Cache pgrx PG installation
+        id: cache-pgrx-pg
         uses: actions/cache@v4
         with:
           path: ~/.pgrx
-          key: ${{ runner.os }}-pgrx-0.17.0-pg18
+          key: ${{ runner.os }}-pgrx-0.17.0-pg18-v1
 
       - name: Initialize pgrx
+        if: steps.cache-pgrx-pg.outputs.cache-hit != 'true'
         run: cargo pgrx init --pg18 download
 
       - name: Run tests
-        run: cargo pgrx test pg${{ matrix.pg_version }} --no-default-features --features pg${{ matrix.pg_version }}
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          cargo pgrx test pg${{ matrix.pg_version }} --no-default-features --features pg${{ matrix.pg_version }}
