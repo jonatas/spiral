@@ -5,8 +5,16 @@ use pgrx::PgRelation;
 const BLOCK_SIZE: usize = 128; // 128 bytes per sensor/block
 const POINTS_PER_BLOCK: i64 = 64;
 pub const BLCKSZ: usize = 8192;
-pub const HEADER_SIZE: usize = 24; // std::mem::size_of::<pg_sys::PageHeaderData>()
-pub const SPECIAL_SIZE: usize = 24; // std::mem::size_of::<SpiralPageOpaque>()
+
+// Use MAXALIGN (usually 8 bytes) for page headers and special space
+macro_rules! maxalign {
+    ($len:expr) => {
+        (($len) + 7) & !7
+    };
+}
+
+pub const HEADER_SIZE: usize = maxalign!(std::mem::size_of::<pg_sys::PageHeaderData>());
+pub const SPECIAL_SIZE: usize = maxalign!(std::mem::size_of::<SpiralPageOpaque>());
 pub const DATA_PER_PAGE: usize = (BLCKSZ - HEADER_SIZE - SPECIAL_SIZE) / 8;
 
 #[derive(Clone, Copy)]
@@ -465,11 +473,8 @@ pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id:
 }
 
 #[pg_extern]
-pub fn spiral_scan_zero(
-    main_rel_oid: i32,
-) -> TableIterator<'static, (name!(t, i64), name!(tenant_id, i32), name!(value, f64))> {
+pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
     let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
-    let mut results = Vec::new();
 
     unsafe {
         let pg_rel = PgRelation::with_lock(
@@ -477,32 +482,51 @@ pub fn spiral_scan_zero(
             pg_sys::AccessShareLock as i32,
         );
         let rel = pg_rel.as_ptr();
-
         let nblocks = get_block_count(rel);
 
-        for blkno in 0..nblocks {
-            let buffer = pg_sys::ReadBuffer(rel, blkno);
-            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
-            let page = pg_sys::BufferGetPage(buffer);
+        // Calculate theoretical heap size for comparison
+        // Standard heap is ~48 bytes per row (header + t + tenant + val + padding)
+        let rows_per_page = DATA_PER_PAGE as i64;
+        let total_rows = nblocks as i64 * rows_per_page;
+        let heap_size_bytes = total_rows * 48;
+        let spiral_size_bytes = nblocks as i64 * BLCKSZ as i64;
 
-            let mut offset = HEADER_SIZE;
-            while offset + 8 <= (BLCKSZ - SPECIAL_SIZE) {
-                let ptr = (page as *const u8).add(offset);
-                let val = *(ptr as *const f64);
-                if val != 0.0 {
-                    let items_before = (offset - HEADER_SIZE) / 8;
-                    let idx = (blkno as i64 * DATA_PER_PAGE as i64) + items_before as i64;
-                    let t = idx / tenant_scale;
-                    let tenant_id = (idx % tenant_scale) as i32;
-                    results.push((t, tenant_id, val));
-                }
-                offset += 8;
-            }
+        let compression_ratio = if spiral_size_bytes > 0 {
+            heap_size_bytes as f64 / spiral_size_bytes as f64
+        } else {
+            0.0
+        };
 
-            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
-            pg_sys::ReleaseBuffer(buffer);
-        }
+        let stats = serde_json::json!({
+            "total_pages": nblocks,
+            "total_rows_capacity": total_rows,
+            "tenant_scale": tenant_scale,
+            "spiral_size_kb": spiral_size_bytes / 1024,
+            "projected_heap_size_kb": heap_size_bytes / 1024,
+            "compression_ratio": compression_ratio,
+            "page_size": BLCKSZ,
+            "data_per_page": DATA_PER_PAGE
+        });
+
+        pgrx::JsonB(stats)
     }
+}
 
-    TableIterator::new(results)
+#[pg_extern]
+pub fn spiral_blkno_to_tenant_range(main_rel_oid: i32, blkno: i32) -> pgrx::JsonB {
+    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+    let start_idx = blkno as i64 * DATA_PER_PAGE as i64;
+    let end_idx = (blkno + 1) as i64 * DATA_PER_PAGE as i64 - 1;
+
+    let t_start = start_idx / tenant_scale;
+    let tenant_start = (start_idx % tenant_scale) as i32;
+
+    let t_end = end_idx / tenant_scale;
+    let tenant_end = (end_idx % tenant_scale) as i32;
+
+    pgrx::JsonB(serde_json::json!({
+        "blkno": blkno,
+        "t_range": [t_start, t_end],
+        "tenant_range": [tenant_start, tenant_end]
+    }))
 }

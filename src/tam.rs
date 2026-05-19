@@ -171,40 +171,43 @@ struct SpiralScanDescData {
 pub unsafe extern "C-unwind" fn spiral_scan_begin(
     rel: pg_sys::Relation,
     snapshot: pg_sys::Snapshot,
-    _nkeys: i32,
-    _key: *mut pg_sys::ScanKeyData,
-    _pscan: pg_sys::ParallelTableScanDesc,
-    _flags: u32,
+    nkeys: i32,
+    key: *mut pg_sys::ScanKeyData,
+    pscan: pg_sys::ParallelTableScanDesc,
+    flags: u32,
 ) -> pg_sys::TableScanDesc {
     let spiral_scan =
-        pgrx::pg_sys::palloc0(std::mem::size_of::<SpiralScanDescData>()) as *mut SpiralScanDescData;
-    let scan = spiral_scan as pg_sys::TableScanDesc;
-    if !scan.is_null() {
-        (*scan).rs_rd = rel;
-        (*scan).rs_snapshot = snapshot;
+        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc0_struct::<SpiralScanDescData>();
 
-        let oid = (*rel).rd_id;
-        let mut tenant_scale = 1024;
-        let relname_ptr = pg_sys::get_rel_name(oid);
-        if !relname_ptr.is_null() {
-            let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
-            pg_sys::pfree(relname_ptr as *mut std::ffi::c_void);
-            if let Some(m) = crate::catalog::get_metadata(&name) {
-                tenant_scale = crate::catalog::get_tenant_scale(&m);
-            }
+    let scan = &mut (*spiral_scan).base;
+    scan.rs_rd = rel;
+    scan.rs_snapshot = snapshot;
+    scan.rs_nkeys = nkeys;
+    scan.rs_key = key;
+    scan.rs_parallel = pscan;
+    scan.rs_flags = flags;
+
+    let oid = (*rel).rd_id;
+    let mut tenant_scale = 1024;
+    let relname_ptr = pg_sys::get_rel_name(oid);
+    if !relname_ptr.is_null() {
+        let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
+        pg_sys::pfree(relname_ptr as *mut std::ffi::c_void);
+        if let Some(m) = crate::catalog::get_metadata(&name) {
+            tenant_scale = crate::catalog::get_tenant_scale(&m);
         }
-
-        let total_blks =
-            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
-        let state = Box::new(SpiralScanState {
-            tenant_scale,
-            current_blkno: 0,
-            total_blks,
-            current_offset_in_page: crate::storage::HEADER_SIZE as u32,
-        });
-        (*spiral_scan).state = Box::into_raw(state);
     }
-    scan
+
+    let total_blks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+    let state = Box::new(SpiralScanState {
+        tenant_scale,
+        current_blkno: 0,
+        total_blks,
+        current_offset_in_page: crate::storage::HEADER_SIZE as u32,
+    });
+    (*spiral_scan).state = Box::into_raw(state);
+
+    &mut (*spiral_scan).base as pg_sys::TableScanDesc
 }
 
 #[pg_guard]
@@ -213,7 +216,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
     _direction: i32,
     slot: *mut pg_sys::TupleTableSlot,
 ) -> bool {
-    if scan.is_null() {
+    if scan.is_null() || slot.is_null() {
         return false;
     }
 
@@ -227,6 +230,12 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
 
     while state.current_blkno < state.total_blks {
         let buffer = pg_sys::ReadBuffer(rel, state.current_blkno);
+        if buffer == 0 {
+            // InvalidBuffer is 0
+            state.current_blkno += 1;
+            continue;
+        }
+
         pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
 
         let page = pg_sys::BufferGetPage(buffer);
@@ -247,17 +256,20 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
                 pg_sys::ExecClearTuple(slot);
+
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
-                *values.add(0) = t.into_datum().unwrap();
-                *isnull.add(0) = false;
-                *values.add(1) = tenant_id.into_datum().unwrap();
-                *isnull.add(1) = false;
-                *values.add(2) = val.into_datum().unwrap();
-                *isnull.add(2) = false;
+                if !values.is_null() && !isnull.is_null() {
+                    *values.add(0) = t.into_datum().unwrap();
+                    *isnull.add(0) = false;
+                    *values.add(1) = tenant_id.into_datum().unwrap();
+                    *isnull.add(1) = false;
+                    *values.add(2) = val.into_datum().unwrap();
+                    *isnull.add(2) = false;
 
-                pg_sys::ExecStoreVirtualTuple(slot);
+                    pg_sys::ExecStoreVirtualTuple(slot);
+                }
 
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                 pg_sys::ReleaseBuffer(buffer);
