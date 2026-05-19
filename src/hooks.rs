@@ -481,8 +481,8 @@ unsafe fn build_time_constraints(
                     && (*right).type_ == pg_sys::NodeTag::T_Const
                 {
                     let var = var_node as *mut pg_sys::Var;
-                    let rte =
-                        pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
+                    let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
+                        as *mut pg_sys::RangeTblEntry;
                     let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                     if !varname_ptr.is_null() {
                         let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
@@ -539,10 +539,10 @@ unsafe fn build_time_constraints(
                 {
                     let v1 = left as *mut pg_sys::Var;
                     let v2 = right as *mut pg_sys::Var;
-                    let rte1 =
-                        pg_sys::list_nth(rtable, (*v1).varno - 1) as *mut pg_sys::RangeTblEntry;
-                    let rte2 =
-                        pg_sys::list_nth(rtable, (*v2).varno - 1) as *mut pg_sys::RangeTblEntry;
+                    let rte1 = pg_sys::list_nth(rtable, (*v1).varno - 1)
+                        as *mut pg_sys::RangeTblEntry;
+                    let rte2 = pg_sys::list_nth(rtable, (*v2).varno - 1)
+                        as *mut pg_sys::RangeTblEntry;
                     let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
                     let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
                     if !n1.is_null()
@@ -1284,7 +1284,8 @@ unsafe fn extract_query_columns_simple(
         match (*node).type_ {
             pg_sys::NodeTag::T_Var => {
                 let var = node as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
+                    as *mut pg_sys::RangeTblEntry;
                 let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                 if !varname.is_null() {
                     cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None));
@@ -1459,7 +1460,7 @@ fn construct_union_sql_hierarchical(
 
     let mut sql = String::from("WITH ");
     sql.push_str(&cte_parts.join(", "));
-    sql.push_str(" ");
+    sql.push(' ');
 
     let union_selects: Vec<String> = tier_names
         .iter()
