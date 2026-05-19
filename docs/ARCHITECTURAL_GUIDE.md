@@ -23,6 +23,9 @@ Arbitrary filters on non-scope columns are a complex research area. Currently, t
 ### 3. Subquery & CTE Handling
 The planner hook currently inspects the top-level Range Table. Deep recursion for CTE acceleration is an area for future exploration.
 
+### 4. Custom Table Access Method (TAM)
+Spiral includes a prototype Table Access Method for experimental storage. For a detailed audit of supported callbacks and semantics, see [TAM_AUDIT.md](./TAM_AUDIT.md).
+
 ## Timezone-Aware Slicing (Experimental)
 
 Spiral explores ways to handle non-UTC queries by shifting slicing boundaries based on session offsets.
