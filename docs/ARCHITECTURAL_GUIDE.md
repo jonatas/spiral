@@ -14,8 +14,8 @@ Spiral tests ideas for transparent hierarchical query acceleration. It is curren
 ## Current Limitations & Research Areas
 
 ### 1. Supported Aggregates
-Currently testing: `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, and `TDIGEST`.
-- **Note:** Unmapped aggregates trigger a fallback to the raw table to maintain accuracy.
+Current exact planner rewrite support is limited to plain `SUM` over columns that have `sum`-materialized rollup state.
+- `COUNT`, `MIN`, `MAX`, `AVG`, `TDIGEST`, and other unmapped aggregates currently trigger a fallback to raw-table planning to maintain accuracy.
 
 ### 2. Filter Push-down
 Arbitrary filters on non-scope columns are a complex research area. Currently, these filters trigger a safe fallback to standard PostgreSQL execution.

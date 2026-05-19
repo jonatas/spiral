@@ -670,8 +670,13 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                     {
                                         notice!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
 
-                                        let query_cols =
-                                            extract_query_columns_simple(query, rtable);
+                                        let Some(query_cols) = extract_supported_query_columns(
+                                            query,
+                                            rtable,
+                                            &base_table,
+                                        ) else {
+                                            continue;
+                                        };
                                         let mut cols = Vec::new();
                                         let base_cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum", base_table.replace("\"", "\"\""));
                                         let base_table_columns = Spi::connect(|client| {
@@ -1218,7 +1223,7 @@ pub fn generate_hierarchy_internal(
     }
 }
 
-unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
+pub(crate) unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
     let query_string = std::ffi::CString::new(sql).unwrap();
     let raw_parsetree_list = pg_sys::raw_parser(
         query_string.as_ptr(),
@@ -1241,8 +1246,134 @@ unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
     pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query
 }
 
+fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
+    agg_fn.eq_ignore_ascii_case("sum")
+}
+
+pub(crate) unsafe fn extract_supported_query_columns(
+    query: *mut pg_sys::Query,
+    rtable: *mut pg_sys::List,
+    base_table: &str,
+) -> Option<Vec<(String, Option<String>)>> {
+    if !(*query).hasAggs {
+        return None;
+    }
+
+    if !(*query).havingQual.is_null()
+        || !(*query).distinctClause.is_null()
+        || !(*query).windowClause.is_null()
+    {
+        return None;
+    }
+
+    let target_list = (*query).targetList;
+    if target_list.is_null() {
+        return None;
+    }
+
+    let mut cols = Vec::new();
+    for i in 0..(*target_list).length {
+        let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+        if (*tle).resjunk {
+            continue;
+        }
+
+        let node = (*tle).expr as *mut pg_sys::Node;
+        if node.is_null() {
+            return None;
+        }
+
+        match (*node).type_ {
+            pg_sys::NodeTag::T_Var => {
+                let var = node as *mut pg_sys::Var;
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
+                    as *mut pg_sys::RangeTblEntry;
+                if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
+                    return None;
+                }
+
+                let relname = pg_sys::get_rel_name((*rte).relid);
+                if relname.is_null()
+                    || CStr::from_ptr(relname).to_string_lossy().as_ref() != base_table
+                {
+                    return None;
+                }
+
+                let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                if varname.is_null() {
+                    return None;
+                }
+
+                cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None));
+            }
+            pg_sys::NodeTag::T_Aggref => {
+                let agg = node as *mut pg_sys::Aggref;
+                if !(*agg).aggdistinct.is_null()
+                    || !(*agg).aggorder.is_null()
+                    || !(*agg).aggfilter.is_null()
+                    || (*agg).aggstar
+                {
+                    return None;
+                }
+
+                let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
+                if agg_fn.is_null() {
+                    return None;
+                }
+                let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
+                if !is_supported_rollup_aggregate(&fn_name) {
+                    return None;
+                }
+
+                let args = (*agg).args;
+                if args.is_null() || (*args).length != 1 {
+                    return None;
+                }
+
+                let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
+                let arg_expr = (*arg).expr as *mut pg_sys::Node;
+                if arg_expr.is_null() || (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
+                    return None;
+                }
+
+                let var = arg_expr as *mut pg_sys::Var;
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
+                    as *mut pg_sys::RangeTblEntry;
+                if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
+                    return None;
+                }
+
+                let relname = pg_sys::get_rel_name((*rte).relid);
+                if relname.is_null()
+                    || CStr::from_ptr(relname).to_string_lossy().as_ref() != base_table
+                {
+                    return None;
+                }
+
+                let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                if varname.is_null() {
+                    return None;
+                }
+
+                cols.push((
+                    CStr::from_ptr(varname).to_string_lossy().into_owned(),
+                    Some(fn_name),
+                ));
+            }
+            _ => return None,
+        }
+    }
+
+    Some(cols)
+}
+
 /// Maps an aggregate function name to its corresponding column projection,
 /// adjusting for whether it's querying a rollup view or the base table.
+///
+/// Planner support is intentionally narrow for correctness:
+/// - `SUM(col)` can read directly from a rollup's materialized `sum` column.
+/// - `COUNT`, `MIN`, `MAX`, `AVG`, `DISTINCT`, ordered aggregates, and filtered
+///   aggregates currently fall back to standard PostgreSQL planning.
 ///
 /// # Examples
 /// ```rust
@@ -1255,70 +1386,10 @@ unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
 /// assert_eq!(map_agg_inner("SUM", "col_a", true), "\"col_a\"");
 /// ```
 pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool) -> String {
-    let lower = agg_fn.to_lowercase();
     if !is_rollup {
         return format!("{}(\"{}\")", agg_fn, mapped_col);
     }
-    match lower.as_str() {
-        "sum" | "count" | "min" | "max" | "tdigest" => format!("\"{}\"", mapped_col),
-        "avg" => format!("\"{}\"", mapped_col),
-        _ => format!("\"{}\"", mapped_col),
-    }
-}
-
-unsafe fn extract_query_columns_simple(
-    query: *mut pg_sys::Query,
-    rtable: *mut pg_sys::List,
-) -> Vec<(String, Option<String>)> {
-    let mut cols = Vec::new();
-    let target_list = (*query).targetList;
-    if target_list.is_null() {
-        return cols;
-    }
-    for i in 0..(*target_list).length {
-        let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
-        let node = (*tle).expr as *mut pg_sys::Node;
-        if node.is_null() {
-            continue;
-        }
-        match (*node).type_ {
-            pg_sys::NodeTag::T_Var => {
-                let var = node as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
-                    as *mut pg_sys::RangeTblEntry;
-                let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                if !varname.is_null() {
-                    cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None));
-                }
-            }
-            pg_sys::NodeTag::T_Aggref => {
-                let agg = node as *mut pg_sys::Aggref;
-                let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
-                if !agg_fn.is_null() {
-                    let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
-                    let args = (*agg).args;
-                    if !args.is_null() && (*args).length > 0 {
-                        let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
-                        let arg_expr = (*arg).expr as *mut pg_sys::Node;
-                        if !arg_expr.is_null() && (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
-                            let var = arg_expr as *mut pg_sys::Var;
-                            let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
-                                as *mut pg_sys::RangeTblEntry;
-                            let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                            if !varname.is_null() {
-                                cols.push((
-                                    CStr::from_ptr(varname).to_string_lossy().into_owned(),
-                                    Some(fn_name),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    cols
+    format!("\"{}\"", mapped_col)
 }
 
 fn format_epoch(epoch: i64) -> String {

@@ -584,7 +584,7 @@ pub mod pg_test {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    use crate::catalog;
+    use crate::{catalog, hooks};
     use pgrx::prelude::*;
 
     #[pg_test]
@@ -638,8 +638,92 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_planner_supports_plain_sum_target_lists() {
+        Spi::run(
+            "CREATE TABLE planner_support (t timestamptz, tenant_id int, val double precision)",
+        )
+        .unwrap();
+
+        unsafe {
+            let query = hooks::parse_sql_to_query("SELECT sum(val) FROM planner_support");
+            assert!(!query.is_null());
+
+            let cols =
+                hooks::extract_supported_query_columns(query, (*query).rtable, "planner_support");
+            assert_eq!(
+                cols,
+                Some(vec![("val".to_string(), Some("sum".to_string()))])
+            );
+        }
+    }
+
+    #[pg_test]
+    fn test_planner_rejects_grouped_sum_target_lists_for_now() {
+        Spi::run(
+            "CREATE TABLE planner_grouped (t timestamptz, tenant_id int, val double precision)",
+        )
+        .unwrap();
+
+        unsafe {
+            let query = hooks::parse_sql_to_query(
+                "SELECT sum(val), tenant_id FROM planner_grouped GROUP BY tenant_id",
+            );
+            assert!(!query.is_null());
+
+            let cols =
+                hooks::extract_supported_query_columns(query, (*query).rtable, "planner_grouped");
+            assert!(cols.is_none());
+        }
+    }
+
+    #[pg_test]
+    fn test_planner_rejects_unsupported_aggregate_target_lists() {
+        Spi::run(
+            "CREATE TABLE planner_fallback (t timestamptz, tenant_id int, val double precision)",
+        )
+        .unwrap();
+
+        for sql in [
+            "SELECT avg(val) FROM planner_fallback",
+            "SELECT count(*) FROM planner_fallback",
+            "SELECT min(val), max(val) FROM planner_fallback",
+            "SELECT sum(val), avg(val) FROM planner_fallback",
+            "SELECT sum(val + 1) FROM planner_fallback",
+            "SELECT DISTINCT sum(val) FROM planner_fallback",
+            "SELECT sum(val) FILTER (WHERE val > 0) FROM planner_fallback",
+            "SELECT sum(val) FROM planner_fallback HAVING count(*) > 0",
+        ] {
+            unsafe {
+                let query = hooks::parse_sql_to_query(sql);
+                assert!(!query.is_null(), "expected parser output for {sql}");
+                let cols = hooks::extract_supported_query_columns(
+                    query,
+                    (*query).rtable,
+                    "planner_fallback",
+                );
+                assert!(cols.is_none(), "expected fallback for {sql}, got {cols:?}");
+            }
+        }
+    }
+
+    #[pg_test]
     fn test_stats_accuracy_golden() {
-        // ... (existing code)
+        let values_csv = include_str!("../tests/golden/values.csv");
+        let expected_json = include_str!("../tests/golden/expected.json");
+        let expected: serde_json::Value = serde_json::from_str(expected_json).unwrap();
+
+        let mut state = crate::stats::StatsState::default();
+        for line in values_csv.lines() {
+            if let Ok(v) = line.parse::<f64>() {
+                state.add(v);
+            }
+        }
+
+        let epsilon = 1e-9;
+        assert!((state.mean() - expected["mean"].as_f64().unwrap()).abs() < epsilon);
+        assert!((state.variance() - expected["variance"].as_f64().unwrap()).abs() < epsilon);
+        assert!((state.skewness() - expected["skewness"].as_f64().unwrap()).abs() < epsilon);
+        assert!((state.kurtosis() - expected["kurtosis"].as_f64().unwrap()).abs() < epsilon);
     }
 
     #[pg_test]
