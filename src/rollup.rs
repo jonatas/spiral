@@ -116,7 +116,10 @@ pub fn derive_child_sql(
             } else { ("t".to_string(), Vec::new()) }
         } else { ("t".to_string(), Vec::new()) };
 
-        let mut select_cols = vec![format!("to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision) as t", anchor_col, frame_seconds)];
+        let mut select_cols = vec![format!(
+            "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision) as t",
+            anchor_col, frame_seconds
+        )];
         let mut group_by = vec![format!("(spiral(\"{}\") / {1}) * {1}", anchor_col, frame_seconds)];
         let mut sources = Vec::new();
 
@@ -192,8 +195,14 @@ pub fn derive_child_sql(
                     }
                 } else if src.formula == "range_merge" {
                     if !parent_is_view {
-                        let bucket_expr = format!("to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision)", anchor_col, frame_seconds);
-                        select_cols.push(format!("date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"", src.base_column, bucket_expr, src.mat_column));
+                        let bucket_expr = format!(
+                            "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision)",
+                            anchor_col, frame_seconds
+                        );
+                        select_cols.push(format!(
+                            "date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"",
+                            src.base_column, bucket_expr, src.mat_column
+                        ));
                     } else {
                         select_cols.push(format!("max(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
                     }

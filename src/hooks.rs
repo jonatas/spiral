@@ -294,7 +294,9 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     // Support multiple formulas separated by comma, and 'as alias' syntax
                     for part in formula_part.split(',') {
                         let part = part.trim();
-                        if part.is_empty() { continue; }
+                        if part.is_empty() {
+                            continue;
+                        }
 
                         let (formula, alias) = if let Some((f, a)) = part.split_once(" as ") {
                             (f.trim().to_string(), Some(a.trim().to_string()))
@@ -497,8 +499,8 @@ unsafe fn build_time_constraints(
                     && (*right).type_ == pg_sys::NodeTag::T_Const
                 {
                     let var = var_node as *mut pg_sys::Var;
-                    let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
-                        as *mut pg_sys::RangeTblEntry;
+                    let rte =
+                        pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                     let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                     if !varname_ptr.is_null() {
                         let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
@@ -555,10 +557,10 @@ unsafe fn build_time_constraints(
                 {
                     let v1 = left as *mut pg_sys::Var;
                     let v2 = right as *mut pg_sys::Var;
-                    let rte1 = pg_sys::list_nth(rtable, (*v1).varno - 1)
-                        as *mut pg_sys::RangeTblEntry;
-                    let rte2 = pg_sys::list_nth(rtable, (*v2).varno - 1)
-                        as *mut pg_sys::RangeTblEntry;
+                    let rte1 =
+                        pg_sys::list_nth(rtable, (*v1).varno - 1) as *mut pg_sys::RangeTblEntry;
+                    let rte2 =
+                        pg_sys::list_nth(rtable, (*v2).varno - 1) as *mut pg_sys::RangeTblEntry;
                     let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
                     let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
                     if !n1.is_null()
@@ -1045,7 +1047,7 @@ pub fn generate_hierarchy_internal(
 
         let mut sources = Vec::new();
         let mut select_parts = vec![format!(
-            "to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision) as t",
+            "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision) as t",
             anchor_col, frame.seconds
         )];
         let mut group_parts = vec![format!(
@@ -1146,7 +1148,10 @@ pub fn generate_hierarchy_internal(
                     let col = row.get::<String>(1).unwrap().unwrap();
                     if !seen_cols.contains(&col) && col != "t" && seen_cols.insert(col.clone()) {
                         if offset_cols.contains(&col) {
-                            let bucket_expr = format!("to_timestamp(((spiral(\"{0}\") / {1}) * {1} + 946684800)::double precision)", anchor_col, frame.seconds);
+                            let bucket_expr = format!(
+                                "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision)",
+                                anchor_col, frame.seconds
+                            );
                             select_parts.push(format!(
                                 "date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"",
                                 col, bucket_expr, col
@@ -1332,8 +1337,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
         match (*node).type_ {
             pg_sys::NodeTag::T_Var => {
                 let var = node as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
-                    as *mut pg_sys::RangeTblEntry;
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
                     return None;
                 }
@@ -1383,8 +1387,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 }
 
                 let var = arg_expr as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, (*var).varno - 1)
-                    as *mut pg_sys::RangeTblEntry;
+                let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
                     return None;
                 }
@@ -1597,7 +1600,7 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     let metadata = catalog::get_metadata(base_name);
     let is_root = metadata
         .as_ref()
-        .map(|m| m.parent_view == m.base_view)
+        .map(|m| m.parent_view == m.base_view || m.parent_view == "BASE")
         .unwrap_or(false);
     let real_base = metadata
         .as_ref()

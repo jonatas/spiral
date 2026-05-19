@@ -9,6 +9,7 @@ pub mod rollup;
 pub mod stats;
 pub mod storage;
 pub mod tam;
+pub mod validate;
 
 pgrx::pg_module_magic!();
 
@@ -90,16 +91,16 @@ pub fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
 
     // Spread 32 bits of each input into the even/odd bit positions of a 64-bit result.
     x = (x | (x << 16)) & 0x0000FFFF0000FFFF_u64;
-    x = (x | (x << 8))  & 0x00FF00FF00FF00FF_u64;
-    x = (x | (x << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
-    x = (x | (x << 2))  & 0x3333333333333333_u64;
-    x = (x | (x << 1))  & 0x5555555555555555_u64;
+    x = (x | (x << 8)) & 0x00FF00FF00FF00FF_u64;
+    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F_u64;
+    x = (x | (x << 2)) & 0x3333333333333333_u64;
+    x = (x | (x << 1)) & 0x5555555555555555_u64;
 
     y = (y | (y << 16)) & 0x0000FFFF0000FFFF_u64;
-    y = (y | (y << 8))  & 0x00FF00FF00FF00FF_u64;
-    y = (y | (y << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
-    y = (y | (y << 2))  & 0x3333333333333333_u64;
-    y = (y | (y << 1))  & 0x5555555555555555_u64;
+    y = (y | (y << 8)) & 0x00FF00FF00FF00FF_u64;
+    y = (y | (y << 4)) & 0x0F0F0F0F0F0F0F0F_u64;
+    y = (y | (y << 2)) & 0x3333333333333333_u64;
+    y = (y | (y << 1)) & 0x5555555555555555_u64;
 
     (x | (y << 1)) as i64
 }
@@ -131,16 +132,16 @@ pub fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> i64 {
 
     // Spread 32 bits of each input into the even/odd bit positions of a 64-bit result.
     x = (x | (x << 16)) & 0x0000FFFF0000FFFF_u64;
-    x = (x | (x << 8))  & 0x00FF00FF00FF00FF_u64;
-    x = (x | (x << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
-    x = (x | (x << 2))  & 0x3333333333333333_u64;
-    x = (x | (x << 1))  & 0x5555555555555555_u64;
+    x = (x | (x << 8)) & 0x00FF00FF00FF00FF_u64;
+    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F_u64;
+    x = (x | (x << 2)) & 0x3333333333333333_u64;
+    x = (x | (x << 1)) & 0x5555555555555555_u64;
 
     y = (y | (y << 16)) & 0x0000FFFF0000FFFF_u64;
-    y = (y | (y << 8))  & 0x00FF00FF00FF00FF_u64;
-    y = (y | (y << 4))  & 0x0F0F0F0F0F0F0F0F_u64;
-    y = (y | (y << 2))  & 0x3333333333333333_u64;
-    y = (y | (y << 1))  & 0x5555555555555555_u64;
+    y = (y | (y << 8)) & 0x00FF00FF00FF00FF_u64;
+    y = (y | (y << 4)) & 0x0F0F0F0F0F0F0F0F_u64;
+    y = (y | (y << 2)) & 0x3333333333333333_u64;
+    y = (y | (y << 1)) & 0x5555555555555555_u64;
 
     (x | (y << 1)) as i64
 }
@@ -394,7 +395,9 @@ fn refresh_incremental(
 
     let children = catalog::get_children(view_name);
     for child in children {
-        let _ = refresh_incremental(&child, extra_where.clone(), depth + 1);
+        if child != view_name {
+            let _ = refresh_incremental(&child, extra_where.clone(), depth + 1);
+        }
     }
     true
 }
@@ -496,9 +499,12 @@ fn spiral_register_view(
     let (sql, sources) =
         rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
 
+    notice!("Spiral: derive_child_sql produced SQL: '{}'", sql);
+
     if !table_exists && !sql.is_empty() {
-        let select_part = if let Some(part) = sql.split_once(" AS ").map(|x| x.1) {
-            part.split(';').next().unwrap_or("")
+        let select_part = if let Some(part) = sql.split_once(" AS").map(|x| x.1) {
+            let trimmed = part.trim();
+            trimmed.split(';').next().unwrap_or("")
         } else {
             ""
         };
@@ -533,7 +539,7 @@ fn spiral_register_view(
             pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
         );
     }
-    if parent_view == "BASE" {
+    if parent_view == "BASE" || parent_view == base_view {
         for event in &["INSERT", "UPDATE", "DELETE"] {
             let mut transition = String::new();
             if *event == "UPDATE" {
@@ -784,7 +790,10 @@ mod zorder_tests {
         // t is masked to 32 bits before spreading; values ≥ 2^32 cycle back.
         // t=0 and t=2^32 both have low 32 bits = 0, so they produce the same result.
         let t_over_u32 = u32::MAX as i64 + 1; // 2^32
-        assert_eq!(spiral_zorder_int_array(t_over_u32, vec![0]), spiral_zorder_int_array(0, vec![0]));
+        assert_eq!(
+            spiral_zorder_int_array(t_over_u32, vec![0]),
+            spiral_zorder_int_array(0, vec![0])
+        );
     }
 
     #[test]
@@ -801,7 +810,9 @@ mod zorder_tests {
     #[test]
     fn test_zorder_ordering_preserved() {
         // Increasing t with same dimension must yield strictly increasing z-order.
-        let results: Vec<i64> = (0..4).map(|t| spiral_zorder_int_array(t, vec![0])).collect();
+        let results: Vec<i64> = (0..4)
+            .map(|t| spiral_zorder_int_array(t, vec![0]))
+            .collect();
         for w in results.windows(2) {
             assert!(w[0] < w[1], "z-order not monotone: {} >= {}", w[0], w[1]);
         }
@@ -814,7 +825,12 @@ mod zorder_tests {
         let at_max = u32::MAX as i64;
         let r1 = spiral_zorder_int_array(near_max, vec![0]);
         let r2 = spiral_zorder_int_array(at_max, vec![0]);
-        assert!(r1 < r2, "z-order not monotone near u32::MAX: {} >= {}", r1, r2);
+        assert!(
+            r1 < r2,
+            "z-order not monotone near u32::MAX: {} >= {}",
+            r1,
+            r2
+        );
     }
 
     #[test]
@@ -827,8 +843,14 @@ mod zorder_tests {
 
     #[test]
     fn test_zorder_deterministic() {
-        let r1 = spiral_zorder(12345, vec![Some("sensor_a".to_string()), Some("region_eu".to_string())]);
-        let r2 = spiral_zorder(12345, vec![Some("sensor_a".to_string()), Some("region_eu".to_string())]);
+        let r1 = spiral_zorder(
+            12345,
+            vec![Some("sensor_a".to_string()), Some("region_eu".to_string())],
+        );
+        let r2 = spiral_zorder(
+            12345,
+            vec![Some("sensor_a".to_string()), Some("region_eu".to_string())],
+        );
         assert_eq!(r1, r2);
     }
 }
