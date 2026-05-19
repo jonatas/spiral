@@ -189,77 +189,34 @@ pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
         .kurtosis()
 }
 
-/// Compact centroid-based sketch for approximate quantile estimation.
-///
-/// # Algorithm
-///
-/// Maintains at most `MAX_CENTROIDS` (100) centroids, each storing a mean value and weight.
-/// On accumulation:
-/// - Exact match (within 1e-9): increment centroid weight.
-/// - Capacity available: add new centroid.
-/// - At capacity: merge into the nearest centroid by absolute distance, updating its
-///   weighted mean.
-///
-/// `min`, `max`, `count`, and `sum` are tracked exactly.
-///
-/// # Accuracy
-///
-/// This is **not** a t-digest. Differences from t-digest:
-/// - Fixed centroid budget (no compression scaling).
-/// - No size-biased merging: t-digest keeps small centroids near extremes for tail accuracy;
-///   this algorithm does not.
-/// - Tail quantiles (p<0.01, p>0.99) can have substantial error when cardinality exceeds
-///   `MAX_CENTROIDS`.
-///
-/// **Exact** when the dataset has ≤100 distinct values.
-/// **Approximate** otherwise — error is distribution-dependent. For a uniform distribution
-/// over N >> 100 values, expected absolute quantile error ≈ range / 100.
-///
-/// Merging two sketches that have both hit capacity is also lossy.
+use tdigest::TDigest;
+
 pub const MAX_CENTROIDS: usize = 100;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SketchState {
-    pub centroids: Vec<(f64, f64)>,
-    pub sum: f64,
-    pub count: f64,
+    pub td: TDigest,
     pub max: f64,
     pub min: f64,
+    pub sum: f64,
+    pub count: f64,
 }
 
 impl Default for SketchState {
     fn default() -> Self {
         SketchState {
-            centroids: Vec::new(),
-            sum: 0.0,
-            count: 0.0,
+            td: TDigest::new_with_size(MAX_CENTROIDS),
             max: f64::MIN,
             min: f64::MAX,
+            sum: 0.0,
+            count: 0.0,
         }
     }
 }
 
 impl SketchState {
     pub fn add(&mut self, val: f64) {
-        if let Some(c) = self.centroids.iter_mut().find(|c| (c.0 - val).abs() < 1e-9) {
-            c.1 += 1.0;
-        } else if self.centroids.len() < MAX_CENTROIDS {
-            self.centroids.push((val, 1.0));
-        } else {
-            // Nearest-centroid merge — lossy once at capacity.
-            let nearest_idx = self
-                .centroids
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| (a.0 - val).abs().partial_cmp(&(b.0 - val).abs()).unwrap())
-                .map(|(i, _)| i)
-                .unwrap();
-            let c = &mut self.centroids[nearest_idx];
-            let new_weight = c.1 + 1.0;
-            c.0 = (c.0 * c.1 + val) / new_weight;
-            c.1 = new_weight;
-        }
-
+        self.td = self.td.merge_unsorted(vec![val]);
         self.sum += val;
         self.count += 1.0;
         if val > self.max {
@@ -279,28 +236,7 @@ impl SketchState {
             return;
         }
 
-        for &(val, weight) in &other.centroids {
-            if let Some(c) = self.centroids.iter_mut().find(|c| (c.0 - val).abs() < 1e-9) {
-                c.1 += weight;
-            } else if self.centroids.len() < MAX_CENTROIDS {
-                self.centroids.push((val, weight));
-            } else {
-                let nearest_idx = self
-                    .centroids
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        (a.0 - val).abs().partial_cmp(&(b.0 - val).abs()).unwrap()
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap();
-                let c = &mut self.centroids[nearest_idx];
-                let new_weight = c.1 + weight;
-                c.0 = (c.0 * c.1 + val * weight) / new_weight;
-                c.1 = new_weight;
-            }
-        }
-
+        self.td = TDigest::merge_digests(vec![self.td.clone(), other.td.clone()]);
         self.sum += other.sum;
         self.count += other.count;
         if other.max > self.max {
@@ -311,23 +247,12 @@ impl SketchState {
         }
     }
 
-    /// Returns the q-quantile (0.0–1.0). Exact when ≤100 distinct values were accumulated.
+    /// Returns the q-quantile (0.0–1.0).
     pub fn quantile(&self, q: f64) -> f64 {
-        if self.count == 0.0 {
+        if self.td.count() == 0.0 {
             return 0.0;
         }
-        let mut sorted = self.centroids.clone();
-        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-        let target = q * self.count;
-        let mut cum = 0.0;
-        for (val, weight) in &sorted {
-            cum += weight;
-            if cum >= target {
-                return *val;
-            }
-        }
-        self.max
+        self.td.estimate_quantile(q)
     }
 }
 
@@ -362,6 +287,19 @@ pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
     serde_json::from_value::<SketchState>(state.0)
         .unwrap()
         .quantile(q)
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_tdigest_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
+    spiral_sketch_accum(state, val)
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_tdigest_combine(
+    state1: Option<pgrx::JsonB>,
+    state2: Option<pgrx::JsonB>,
+) -> pgrx::JsonB {
+    spiral_sketch_combine(state1, state2)
 }
 
 extension_sql!(
@@ -399,13 +337,29 @@ extension_sql!(
         COMBINEFUNC = spiral_sketch_combine,
         PARALLEL = SAFE
     );
+
+    CREATE AGGREGATE spiral_tdigest(double precision) (
+        SFUNC = spiral_tdigest_accum,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_tdigest_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_tdigest_merge(jsonb) (
+        SFUNC = spiral_tdigest_combine,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_tdigest_combine,
+        PARALLEL = SAFE
+    );
     "#,
     name = "create_spiral_stats_aggregates",
     requires = [
         spiral_stats_accum,
         spiral_stats_combine,
         spiral_sketch_accum,
-        spiral_sketch_combine
+        spiral_sketch_combine,
+        spiral_tdigest_accum,
+        spiral_tdigest_combine
     ]
 );
 
@@ -495,24 +449,17 @@ mod tests {
     }
 
     #[test]
-    fn sketch_overflow_sequential_bias() {
-        // Documents known limitation: sequential insertion order causes severe quantile bias.
-        //
-        // With values 1..=200 inserted in order, the first 100 fill centroid slots, then
-        // every subsequent value merges into the last centroid (nearest by distance).
-        // This produces a single heavy centroid near the upper half of the range, so the
-        // reported p50 reflects the majority weight there rather than the true median.
-        //
-        // Users who need accurate quantiles over high-cardinality sequential data must
-        // pre-aggregate or accept this systematic error.
+    fn sketch_overflow_sequential_no_bias() {
+        // T-Digest is robust to sequential insertion order, unlike simpler
+        // centroid-based sketches.
         let vals: Vec<f64> = (1..=200).map(|i| i as f64).collect();
         let s = sketch_from(&vals);
 
-        // Actual p50 is ~150 (upper-half bias from sequential insertion), not ~100.
+        // Actual p50 should be very close to the true median (100.5)
         let p50 = s.quantile(0.5);
         assert!(
-            (p50 - 150.0).abs() < 5.0,
-            "sequential p50={p50}: bias toward upper half is the known algorithm behavior"
+            (p50 - 100.5).abs() < 2.0,
+            "sequential p50={p50}: T-Digest maintains accuracy even with sequential insertion"
         );
     }
 

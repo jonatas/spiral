@@ -176,6 +176,12 @@ pub fn derive_child_sql(
                     } else {
                         select_cols.push(format!("spiral_sketch_merge(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
                     }
+                } else if src.formula == "tdigest" {
+                    if !parent_is_view {
+                        select_cols.push(format!("spiral_tdigest(\"{}\") as \"{}\"", src.base_column, src.mat_column));
+                    } else {
+                        select_cols.push(format!("spiral_tdigest_merge(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
+                    }
                 } else if src.formula == "ohlcv" {
                     let bc = &src.base_column;
                     let mc = &src.mat_column;

@@ -288,7 +288,23 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     regex::Regex::new(r"(\w+)\s+[\w\(\) ]+,?\s*--\s*Spiral:\s*([^\n\r]+)").unwrap();
                 let mut captured_cols = Vec::new();
                 for cap in re_col.captures_iter(&query_str) {
-                    captured_cols.push((cap[1].to_string(), cap[2].to_string()));
+                    let col_name = cap[1].to_string();
+                    let formula_part = cap[2].trim().to_string();
+
+                    // Support multiple formulas separated by comma, and 'as alias' syntax
+                    for part in formula_part.split(',') {
+                        let part = part.trim();
+                        if part.is_empty() { continue; }
+
+                        let (formula, alias) = if let Some((f, a)) = part.split_once(" as ") {
+                            (f.trim().to_string(), Some(a.trim().to_string()))
+                        } else if let Some((f, a)) = part.split_once(" AS ") {
+                            (f.trim().to_string(), Some(a.trim().to_string()))
+                        } else {
+                            (part.to_string(), None)
+                        };
+                        captured_cols.push((col_name.clone(), formula, alias));
+                    }
                 }
 
                 // 4. Register the BASE table metadata
@@ -969,7 +985,7 @@ pub fn generate_hierarchy_internal(
     base_name: &str,
     frames_str: &str,
     scope_columns: Vec<String>,
-    custom_cols: Vec<(String, String)>,
+    custom_cols: Vec<(String, String, Option<String>)>,
 ) {
     notice!(
         "Spiral: Entering generate_hierarchy_internal for '{}', frames='{}'",
@@ -1049,10 +1065,10 @@ pub fn generate_hierarchy_internal(
 
         if i == 0 {
             // First level: Use custom magic comments
-            for (col, formula) in &custom_cols {
+            for (col, formula, alias) in &custom_cols {
                 let formula_lower = formula.to_lowercase();
                 if formula_lower.contains("stats") {
-                    let mat = format!("{}_stats", col);
+                    let mat = alias.clone().unwrap_or_else(|| format!("{}_stats", col));
                     if seen_cols.insert(mat.clone()) {
                         select_parts.push(format!("spiral_stats(\"{}\") as \"{}\"", col, mat));
                         sources.push(rollup::SourceDef {
@@ -1062,9 +1078,8 @@ pub fn generate_hierarchy_internal(
                             rollup_gsub_strategy: None,
                         });
                     }
-                }
-                if formula_lower.contains("ohlc") {
-                    let mat = format!("{}_ohlcv", col);
+                } else if formula_lower.contains("ohlc") {
+                    let mat = alias.clone().unwrap_or_else(|| format!("{}_ohlcv", col));
                     if seen_cols.insert(mat.clone()) {
                         select_parts.push(format!("first(\"{}\", spiral(t)) as \"{}_o\", max(\"{}\") as \"{}_h\", min(\"{}\") as \"{}_l\", last(\"{}\", spiral(t)) as \"{}_c\", sum(\"{}\") as \"{}_v\"", col, mat, col, mat, col, mat, col, mat, col, mat));
                         sources.push(rollup::SourceDef {
@@ -1074,14 +1089,40 @@ pub fn generate_hierarchy_internal(
                             rollup_gsub_strategy: None,
                         });
                     }
-                }
-                if formula_lower.contains("sketch") || formula_lower.contains("quantile") {
-                    let mat = format!("{}_sketch", col);
+                } else if formula_lower.contains("sketch")
+                    || formula_lower.contains("tdigest")
+                    || formula_lower.contains("quantile")
+                {
+                    let mat = alias.clone().unwrap_or_else(|| format!("{}_tdigest", col));
+                    let formula_name = if formula_lower.contains("tdigest")
+                        || formula_lower.contains("quantile")
+                    {
+                        "tdigest"
+                    } else {
+                        "sketch"
+                    };
                     if seen_cols.insert(mat.clone()) {
-                        select_parts.push(format!("spiral_sketch(\"{}\") as \"{}\"", col, mat));
+                        let agg_fn = if formula_name == "tdigest" {
+                            "spiral_tdigest"
+                        } else {
+                            "spiral_sketch"
+                        };
+                        select_parts.push(format!("{}(\"{}\") as \"{}\"", agg_fn, col, mat));
                         sources.push(rollup::SourceDef {
                             base_column: col.clone(),
-                            formula: "sketch".to_string(),
+                            formula: formula_name.to_string(),
+                            mat_column: mat,
+                            rollup_gsub_strategy: None,
+                        });
+                    }
+                } else {
+                    // Custom aggregate or default sum
+                    let mat = alias.clone().unwrap_or_else(|| col.clone());
+                    if seen_cols.insert(mat.clone()) {
+                        select_parts.push(format!("{}(\"{}\") as \"{}\"", formula, col, mat));
+                        sources.push(rollup::SourceDef {
+                            base_column: col.clone(),
+                            formula: formula_lower.clone(),
                             mat_column: mat,
                             rollup_gsub_strategy: None,
                         });
@@ -1153,6 +1194,11 @@ pub fn generate_hierarchy_internal(
                 } else if src.formula == "sketch" {
                     select_parts.push(format!(
                         "spiral_sketch_merge(\"{}\") as \"{}\"",
+                        src.mat_column, src.mat_column
+                    ));
+                } else if src.formula == "tdigest" {
+                    select_parts.push(format!(
+                        "spiral_tdigest_merge(\"{}\") as \"{}\"",
                         src.mat_column, src.mat_column
                     ));
                 } else if src.formula == "ohlcv" {
