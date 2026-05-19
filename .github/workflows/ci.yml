@@ -64,7 +64,7 @@ jobs:
           path: ~/.pgrx
           key: ${{ runner.os }}-pgrx-0.17.0-pg18
       - name: Initialize pgrx
-        run: cargo pgrx init
+        run: cargo pgrx init --pg18 download
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -133,7 +133,7 @@ jobs:
           key: ${{ runner.os }}-pgrx-0.17.0-pg18
 
       - name: Initialize pgrx
-        run: cargo pgrx init
+        run: cargo pgrx init --pg18 download
 
       - name: Run tests
         run: cargo pgrx test pg${{ matrix.pg_version }} --no-default-features --features pg${{ matrix.pg_version }}
