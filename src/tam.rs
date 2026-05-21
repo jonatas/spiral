@@ -196,6 +196,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     pscan: pg_sys::ParallelTableScanDesc,
     flags: u32,
 ) -> pg_sys::TableScanDesc {
+    notice!("Spiral TAM: scan_begin for OID {}", (*rel).rd_id);
     let spiral_scan =
         pg_sys::palloc0(std::mem::size_of::<SpiralScanDescData>()) as *mut SpiralScanDescData;
 
@@ -218,6 +219,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
         }
     }
 
+    notice!("Spiral TAM: initializing state");
     unsafe {
         pg_sys::RelationGetSmgr(rel);
     }
@@ -234,6 +236,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
 
     (*spiral_scan).state = state;
 
+    notice!("Spiral TAM: scan_begin complete");
     &mut (*spiral_scan).base as pg_sys::TableScanDesc
 }
 
@@ -256,6 +259,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
     let rel = (*scan).rs_rd;
 
     while state.current_blkno < state.total_blks {
+        notice!("Spiral TAM: scanning block {}", state.current_blkno);
         let buffer = pg_sys::ReadBuffer(rel, state.current_blkno);
         if buffer == 0 {
             // InvalidBuffer is 0
