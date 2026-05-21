@@ -1,11 +1,16 @@
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
-#[no_mangle]
-pub unsafe extern "C-unwind" fn spiral_tam_handler_internal(
-    _fcinfo: pg_sys::FunctionCallInfo,
-) -> pg_sys::Datum {
-    let routine = pgrx::PgMemoryContexts::TopMemoryContext.palloc0_struct::<pg_sys::TableAmRoutine>();
+// Table Access Method (TAM) Handler for Spiral
+#[pg_extern(sql = "
+        CREATE FUNCTION spiral_tam_handler(internal) RETURNS table_am_handler LANGUAGE c AS 'MODULE_PATHNAME', 'spiral_tam_handler_wrapper';
+        CREATE ACCESS METHOD spiral TYPE TABLE HANDLER spiral_tam_handler;
+    ")]
+/// # Safety
+/// This function is unsafe because it interacts with PostgreSQL C internals.
+pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
+    let routine =
+        pgrx::PgMemoryContexts::TopMemoryContext.palloc0_struct::<pg_sys::TableAmRoutine>();
 
     (*routine).type_ = pg_sys::NodeTag::T_TableAmRoutine;
 
@@ -28,16 +33,7 @@ pub unsafe extern "C-unwind" fn spiral_tam_handler_internal(
     (*routine).tuple_satisfies_snapshot = Some(spiral_tuple_satisfies_snapshot);
     (*routine).relation_needs_toast_table = Some(spiral_relation_needs_toast_table);
 
-    pg_sys::Datum::from(routine as usize)
-}
-
-// Table Access Method (TAM) Handler for Spiral
-#[pg_extern(sql = "
-        CREATE FUNCTION spiral_tam_handler(internal) RETURNS table_am_handler LANGUAGE c AS 'MODULE_PATHNAME', 'spiral_tam_handler_internal';
-        CREATE ACCESS METHOD spiral TYPE TABLE HANDLER spiral_tam_handler;
-    ")]
-pub unsafe fn spiral_tam_handler(fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
-    pgrx::datum::Internal::from(Some(spiral_tam_handler_internal(fcinfo)))
+    pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)))
 }
 
 #[pg_guard]
@@ -100,8 +96,12 @@ pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
     _multi_xid: *mut pg_sys::MultiXactId,
 ) {
     unsafe {
-        *_freeze_xid = pg_sys::TransactionId::from(0);
-        *_multi_xid = pg_sys::MultiXactId::from(0);
+        if !_freeze_xid.is_null() {
+            *_freeze_xid = pg_sys::InvalidTransactionId;
+        }
+        if !_multi_xid.is_null() {
+            *_multi_xid = pg_sys::InvalidMultiXactId;
+        }
         pg_sys::RelationCreateStorage(*_newrlocator, _persistence, true);
     }
 }
