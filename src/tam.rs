@@ -9,6 +9,7 @@ use pgrx::prelude::*;
 /// # Safety
 /// This function is unsafe because it interacts with PostgreSQL C internals.
 pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
+    notice!("Spiral TAM: handler starting");
     let routine =
         pgrx::PgMemoryContexts::TopMemoryContext.palloc0_struct::<pg_sys::TableAmRoutine>();
 
