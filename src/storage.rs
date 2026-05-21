@@ -40,8 +40,14 @@ pub fn logical_to_physical_offset(logical_offset: i64) -> (u32, u32) {
 }
 
 unsafe fn get_block_count(rel: pg_sys::Relation) -> u32 {
+    if rel.is_null() {
+        return 0;
+    }
     pg_sys::RelationGetSmgr(rel);
-    pg_sys::smgrnblocks((*rel).rd_smgr, 0)
+    if (*rel).rd_smgr.is_null() {
+        return 0;
+    }
+    pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM)
 }
 
 fn get_tenant_scale_for_oid(rel_oid: i32) -> i64 {
