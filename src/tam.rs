@@ -194,7 +194,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     pscan: pg_sys::ParallelTableScanDesc,
     flags: u32,
 ) -> pg_sys::TableScanDesc {
-    let spiral_scan = pg_sys::palloc0(std::mem::size_of::<SpiralScanDescData>()) as *mut SpiralScanDescData;
+    let spiral_scan =
+        pg_sys::palloc0(std::mem::size_of::<SpiralScanDescData>()) as *mut SpiralScanDescData;
 
     let scan = &mut (*spiral_scan).base;
     scan.rs_rd = rel;
@@ -218,7 +219,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     unsafe {
         pg_sys::RelationGetSmgr(rel);
     }
-    let total_blks = unsafe { pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    let total_blks =
+        unsafe { pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
     let state = Box::new(SpiralScanState {
         tenant_scale,
         current_blkno: 0,
