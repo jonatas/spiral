@@ -160,16 +160,12 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_slot_insert(
-    rel: pg_sys::Relation,
+    _rel: pg_sys::Relation,
     _slot: *mut pg_sys::TupleTableSlot,
     _cid: pg_sys::CommandId,
     _options: i32,
     _state: *mut pg_sys::BulkInsertStateData,
 ) {
-    info!(
-        "Spiral TAM: Routing insert to Delta Store for relation OID {}",
-        (*rel).rd_id
-    );
 }
 
 use std::ffi::CStr;
