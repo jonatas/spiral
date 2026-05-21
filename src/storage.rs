@@ -531,7 +531,7 @@ pub fn spiral_blkno_to_tenant_range(main_rel_oid: i32, blkno: i32) -> pgrx::Json
     let tenant_end = (end_idx % tenant_scale) as i32;
 
     let is_boundary = t_start != t_end;
-    let drift = (tenant_scale as i64 - DATA_PER_PAGE as i64).abs();
+    let drift = (tenant_scale - DATA_PER_PAGE as i64).abs();
 
     pgrx::JsonB(serde_json::json!({
         "blkno": blkno,
