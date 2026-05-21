@@ -114,10 +114,16 @@ pub unsafe extern "C-unwind" fn spiral_relation_size(
     rel: pg_sys::Relation,
     _fork_number: pg_sys::ForkNumber::Type,
 ) -> u64 {
+    if rel.is_null() {
+        return 0;
+    }
     unsafe {
         pg_sys::RelationGetSmgr(rel);
+        if (*rel).rd_smgr.is_null() {
+            return 0;
+        }
         let nblocks = pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
-        (nblocks as u64) * 8192
+        (nblocks as u64) * pg_sys::BLCKSZ as u64
     }
 }
 
@@ -125,16 +131,28 @@ pub unsafe extern "C-unwind" fn spiral_relation_size(
 pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
     rel: pg_sys::Relation,
     _attr_widths: *mut i32,
-    _pages: *mut pg_sys::BlockNumber,
-    _tuples: *mut f64,
-    _allvisfrac: *mut f64,
+    pages: *mut pg_sys::BlockNumber,
+    tuples: *mut f64,
+    allvisfrac: *mut f64,
 ) {
+    if rel.is_null() {
+        return;
+    }
     unsafe {
         pg_sys::RelationGetSmgr(rel);
+        if (*rel).rd_smgr.is_null() {
+            return;
+        }
         let nblocks = pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
-        *_pages = nblocks;
-        *_tuples = (nblocks as f64) * 1024.0;
-        *_allvisfrac = 1.0;
+        if !pages.is_null() {
+            *pages = nblocks;
+        }
+        if !tuples.is_null() {
+            *tuples = (nblocks as f64) * (crate::storage::DATA_PER_PAGE as f64);
+        }
+        if !allvisfrac.is_null() {
+            *allvisfrac = 1.0;
+        }
     }
 }
 
@@ -176,8 +194,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     pscan: pg_sys::ParallelTableScanDesc,
     flags: u32,
 ) -> pg_sys::TableScanDesc {
-    let spiral_scan =
-        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc0_struct::<SpiralScanDescData>();
+    let spiral_scan = pg_sys::palloc0(std::mem::size_of::<SpiralScanDescData>()) as *mut SpiralScanDescData;
 
     let scan = &mut (*spiral_scan).base;
     scan.rs_rd = rel;
@@ -198,7 +215,10 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
         }
     }
 
-    let total_blks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+    unsafe {
+        pg_sys::RelationGetSmgr(rel);
+    }
+    let total_blks = unsafe { pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
     let state = Box::new(SpiralScanState {
         tenant_scale,
         current_blkno: 0,
