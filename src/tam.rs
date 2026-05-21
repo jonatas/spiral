@@ -118,7 +118,11 @@ pub unsafe extern "C-unwind" fn spiral_relation_size(
         return 0;
     }
     unsafe {
-        let nblocks = pg_sys::RelationGetNumberOfBlocks(rel);
+        pg_sys::RelationGetSmgr(rel);
+        if (*rel).rd_smgr.is_null() {
+            return 0;
+        }
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
         (nblocks as u64) * pg_sys::BLCKSZ as u64
     }
 }
@@ -135,7 +139,11 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
         return;
     }
     unsafe {
-        let nblocks = pg_sys::RelationGetNumberOfBlocks(rel);
+        pg_sys::RelationGetSmgr(rel);
+        if (*rel).rd_smgr.is_null() {
+            return;
+        }
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
         if !pages.is_null() {
             *pages = nblocks;
         }
@@ -208,7 +216,14 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
         }
     }
 
-    let total_blks = unsafe { pg_sys::RelationGetNumberOfBlocks(rel) };
+    unsafe {
+        pg_sys::RelationGetSmgr(rel);
+    }
+    let total_blks = if !unsafe { (*rel).rd_smgr.is_null() } {
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) }
+    } else {
+        0
+    };
     let state = pg_sys::palloc0(std::mem::size_of::<SpiralScanState>()) as *mut SpiralScanState;
     (*state).tenant_scale = tenant_scale;
     (*state).current_blkno = 0;
