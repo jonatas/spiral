@@ -221,13 +221,13 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     }
     let total_blks =
         unsafe { pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
-    let state = Box::new(SpiralScanState {
-        tenant_scale,
-        current_blkno: 0,
-        total_blks,
-        current_offset_in_page: crate::storage::HEADER_SIZE as u32,
-    });
-    (*spiral_scan).state = Box::into_raw(state);
+    let state = pg_sys::palloc0(std::mem::size_of::<SpiralScanState>()) as *mut SpiralScanState;
+    (*state).tenant_scale = tenant_scale;
+    (*state).current_blkno = 0;
+    (*state).total_blks = total_blks;
+    (*state).current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+
+    (*spiral_scan).state = state;
 
     &mut (*spiral_scan).base as pg_sys::TableScanDesc
 }
@@ -313,7 +313,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_end(scan: pg_sys::TableScanDesc) {
     if !scan.is_null() {
         let spiral_scan = scan as *mut SpiralScanDescData;
         if !(*spiral_scan).state.is_null() {
-            let _ = Box::from_raw((*spiral_scan).state);
+            pg_sys::pfree((*spiral_scan).state as *mut std::ffi::c_void);
             (*spiral_scan).state = std::ptr::null_mut();
         }
         pg_sys::pfree(scan as *mut std::ffi::c_void);
