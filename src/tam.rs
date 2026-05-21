@@ -9,41 +9,33 @@ use pgrx::prelude::*;
 /// # Safety
 /// This function is unsafe because it interacts with PostgreSQL C internals.
 pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
-    notice!("Spiral TAM: handler started");
-    let routine = pg_sys::palloc0(std::mem::size_of::<pg_sys::TableAmRoutine>())
-        as *mut pg_sys::TableAmRoutine;
-    notice!("Spiral TAM: routine allocated at {:p}", routine);
+    let routine = pg_sys::MemoryContextAllocZero(
+        pg_sys::TopMemoryContext,
+        std::mem::size_of::<pg_sys::TableAmRoutine>(),
+    ) as *mut pg_sys::TableAmRoutine;
 
     (*routine).type_ = pg_sys::NodeTag::T_TableAmRoutine;
-    notice!("Spiral TAM: type set");
 
     // Wire up the O(1) logic callbacks
     (*routine).slot_callbacks = Some(spiral_slot_callbacks);
     (*routine).tuple_insert = Some(spiral_slot_insert);
-    notice!("Spiral TAM: O(1) callbacks set");
 
     (*routine).scan_begin = Some(spiral_scan_begin);
     (*routine).scan_getnextslot = Some(spiral_scan_getnextslot);
     (*routine).scan_end = Some(spiral_scan_end);
     (*routine).scan_rescan = Some(spiral_scan_rescan);
-    notice!("Spiral TAM: scan callbacks set");
 
     (*routine).relation_size = Some(spiral_relation_size);
     (*routine).relation_estimate_size = Some(spiral_relation_estimate_size);
     (*routine).relation_set_new_filelocator = Some(spiral_relation_set_new_filelocator);
     (*routine).relation_nontransactional_truncate = Some(spiral_relation_nontransactional_truncate);
     (*routine).relation_copy_for_cluster = Some(spiral_relation_copy_for_cluster);
-    notice!("Spiral TAM: relation callbacks set");
-
     (*routine).tuple_fetch_row_version = Some(spiral_tuple_fetch_row_version);
     (*routine).tuple_tid_valid = Some(spiral_tuple_tid_valid);
     (*routine).tuple_satisfies_snapshot = Some(spiral_tuple_satisfies_snapshot);
     (*routine).relation_needs_toast_table = Some(spiral_relation_needs_toast_table);
-    notice!("Spiral TAM: tuple callbacks set");
 
-    let result = pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)));
-    notice!("Spiral TAM: handler returning");
-    result
+    pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)))
 }
 
 #[pg_guard]
@@ -105,7 +97,6 @@ pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
     _freeze_xid: *mut pg_sys::TransactionId,
     _multi_xid: *mut pg_sys::MultiXactId,
 ) {
-    notice!("Spiral TAM: set_new_filelocator starting");
     unsafe {
         if !_freeze_xid.is_null() {
             *_freeze_xid = pg_sys::TransactionId::from(0);
@@ -113,9 +104,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
         if !_multi_xid.is_null() {
             *_multi_xid = pg_sys::MultiXactId::from(0);
         }
-        notice!("Spiral TAM: creating storage");
         pg_sys::RelationCreateStorage(*_newrlocator, _persistence, true);
-        notice!("Spiral TAM: creating storage complete");
     }
 }
 
