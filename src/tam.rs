@@ -9,10 +9,13 @@ use pgrx::prelude::*;
 /// # Safety
 /// This function is unsafe because it interacts with PostgreSQL C internals.
 pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
+    notice!("Spiral TAM: handler started");
     let routine =
         pg_sys::palloc0(std::mem::size_of::<pg_sys::TableAmRoutine>()) as *mut pg_sys::TableAmRoutine;
+    notice!("Spiral TAM: routine allocated");
 
     (*routine).type_ = pg_sys::NodeTag::T_TableAmRoutine;
+    notice!("Spiral TAM: type set");
 
     // Wire up the O(1) logic callbacks
     (*routine).slot_callbacks = Some(spiral_slot_callbacks);
@@ -32,6 +35,8 @@ pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::dat
     (*routine).tuple_tid_valid = Some(spiral_tuple_tid_valid);
     (*routine).tuple_satisfies_snapshot = Some(spiral_tuple_satisfies_snapshot);
     (*routine).relation_needs_toast_table = Some(spiral_relation_needs_toast_table);
+    
+    notice!("Spiral TAM: all callbacks set");
 
     pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)))
 }
