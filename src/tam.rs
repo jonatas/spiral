@@ -122,7 +122,8 @@ pub unsafe extern "C-unwind" fn spiral_relation_size(
         if (*rel).rd_smgr.is_null() {
             return 0;
         }
-        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+        let nblocks =
+            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
         (nblocks as u64) * pg_sys::BLCKSZ as u64
     }
 }
@@ -143,7 +144,8 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
         if (*rel).rd_smgr.is_null() {
             return;
         }
-        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+        let nblocks =
+            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
         if !pages.is_null() {
             *pages = nblocks;
         }
