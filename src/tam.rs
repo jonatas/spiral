@@ -95,6 +95,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
     _freeze_xid: *mut pg_sys::TransactionId,
     _multi_xid: *mut pg_sys::MultiXactId,
 ) {
+    notice!("Spiral TAM: set_new_filelocator starting");
     unsafe {
         if !_freeze_xid.is_null() {
             *_freeze_xid = pg_sys::TransactionId::from(0);
@@ -102,7 +103,9 @@ pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
         if !_multi_xid.is_null() {
             *_multi_xid = pg_sys::MultiXactId::from(0);
         }
+        notice!("Spiral TAM: creating storage");
         pg_sys::RelationCreateStorage(*_newrlocator, _persistence, true);
+        notice!("Spiral TAM: creating storage complete");
     }
 }
 
