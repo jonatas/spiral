@@ -481,6 +481,7 @@ pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id:
 #[pg_extern]
 pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
     let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+    let kickoff = crate::get_kickoff_epoch();
 
     unsafe {
         let pg_rel = PgRelation::with_lock(
@@ -490,8 +491,6 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
         let rel = pg_rel.as_ptr();
         let nblocks = get_block_count(rel);
 
-        // Calculate theoretical heap size for comparison
-        // Standard heap is ~48 bytes per row (header + t + tenant + val + padding)
         let rows_per_page = DATA_PER_PAGE as i64;
         let total_rows = nblocks as i64 * rows_per_page;
         let heap_size_bytes = total_rows * 48;
@@ -511,7 +510,8 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
             "projected_heap_size_kb": heap_size_bytes / 1024,
             "compression_ratio": compression_ratio,
             "page_size": BLCKSZ,
-            "data_per_page": DATA_PER_PAGE
+            "data_per_page": DATA_PER_PAGE,
+            "kickoff_epoch": kickoff
         });
 
         pgrx::JsonB(stats)
@@ -533,6 +533,8 @@ pub fn spiral_blkno_to_tenant_range(main_rel_oid: i32, blkno: i32) -> pgrx::Json
     pgrx::JsonB(serde_json::json!({
         "blkno": blkno,
         "t_range": [t_start, t_end],
-        "tenant_range": [tenant_start, tenant_end]
+        "tenant_range": [tenant_start, tenant_end],
+        "tuple_count": DATA_PER_PAGE,
+        "is_boundary": t_start != t_end
     }))
 }

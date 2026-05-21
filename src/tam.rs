@@ -33,7 +33,7 @@ pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::dat
     (*routine).tuple_satisfies_snapshot = Some(spiral_tuple_satisfies_snapshot);
     (*routine).relation_needs_toast_table = Some(spiral_relation_needs_toast_table);
 
-    pgrx::datum::Internal::from(Some(routine as usize as pg_sys::Datum))
+    pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)))
 }
 
 #[pg_guard]
