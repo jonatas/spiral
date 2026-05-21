@@ -43,11 +43,7 @@ unsafe fn get_block_count(rel: pg_sys::Relation) -> u32 {
     if rel.is_null() {
         return 0;
     }
-    pg_sys::RelationGetSmgr(rel);
-    if (*rel).rd_smgr.is_null() {
-        return 0;
-    }
-    pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM)
+    pg_sys::RelationGetNumberOfBlocks(rel)
 }
 
 fn get_tenant_scale_for_oid(rel_oid: i32) -> i64 {
