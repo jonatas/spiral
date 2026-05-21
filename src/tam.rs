@@ -9,13 +9,10 @@ use pgrx::prelude::*;
 /// # Safety
 /// This function is unsafe because it interacts with PostgreSQL C internals.
 pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::datum::Internal {
-    notice!("Spiral TAM: handler started");
     let routine =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::TableAmRoutine>()) as *mut pg_sys::TableAmRoutine;
-    notice!("Spiral TAM: routine allocated");
+        pgrx::PgMemoryContexts::TopMemoryContext.palloc0_struct::<pg_sys::TableAmRoutine>();
 
     (*routine).type_ = pg_sys::NodeTag::T_TableAmRoutine;
-    notice!("Spiral TAM: type set");
 
     // Wire up the O(1) logic callbacks
     (*routine).slot_callbacks = Some(spiral_slot_callbacks);
@@ -35,10 +32,8 @@ pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::dat
     (*routine).tuple_tid_valid = Some(spiral_tuple_tid_valid);
     (*routine).tuple_satisfies_snapshot = Some(spiral_tuple_satisfies_snapshot);
     (*routine).relation_needs_toast_table = Some(spiral_relation_needs_toast_table);
-    
-    notice!("Spiral TAM: all callbacks set");
 
-    pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)))
+    pgrx::datum::Internal::from(Some(routine as pg_sys::Datum))
 }
 
 #[pg_guard]
@@ -390,13 +385,6 @@ mod tests {
             assert_eq!(row2.get::<i64>(1).unwrap().unwrap(), 2);
             assert_eq!(row2.get::<i32>(2).unwrap().unwrap(), 2);
             assert_eq!(row2.get::<f64>(3).unwrap().unwrap(), 84.0);
-
-            // NOTE: UPDATE/DELETE are currently UNSUPPORTED and will fail with
-            // "failed to fetch tuple being updated" because tuple_fetch_row_version returns false.
-            /*
-            client.update("UPDATE tam_scan_test SET value = 99.0 WHERE t = 1", None, &[])?;
-            client.update("DELETE FROM tam_scan_test WHERE t = 2", None, &[])?;
-            */
 
             Ok::<(), spi::Error>(())
         }).unwrap();
