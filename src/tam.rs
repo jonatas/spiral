@@ -97,10 +97,10 @@ pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
 ) {
     unsafe {
         if !_freeze_xid.is_null() {
-            *_freeze_xid = pg_sys::InvalidTransactionId;
+            *_freeze_xid = pg_sys::TransactionId::from(0);
         }
         if !_multi_xid.is_null() {
-            *_multi_xid = pg_sys::InvalidMultiXactId;
+            *_multi_xid = pg_sys::MultiXactId::from(0);
         }
         pg_sys::RelationCreateStorage(*_newrlocator, _persistence, true);
     }
