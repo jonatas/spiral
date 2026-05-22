@@ -516,9 +516,7 @@ fn spiral_register_view(
                 .collect::<Vec<_>>()
                 .join(", ");
             let index_sql = if scope_columns.is_empty() {
-                format!(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{view_name} ON {view_name}(t)"
-                )
+                format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{view_name} ON {view_name}(t)")
             } else {
                 format!(
                     "CREATE INDEX IF NOT EXISTS idx_z_{view_name} ON {view_name} \
@@ -712,18 +710,16 @@ mod tests {
             );
             assert!(!query.is_null());
 
-            let cols = hooks::extract_supported_query_columns(
-                query,
-                (*query).rtable,
-                "planner_datetrunc",
-            );
+            let cols =
+                hooks::extract_supported_query_columns(query, (*query).rtable, "planner_datetrunc");
             assert!(
                 cols.is_some(),
                 "date_trunc in target list should not block acceleration"
             );
             let cols = cols.unwrap();
             assert!(
-                cols.iter().any(|(name, agg)| name == "val" && agg.as_deref() == Some("sum")),
+                cols.iter()
+                    .any(|(name, agg)| name == "val" && agg.as_deref() == Some("sum")),
                 "sum(val) should be in cols: {:?}",
                 cols
             );

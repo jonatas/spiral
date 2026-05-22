@@ -214,7 +214,9 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 }
                 notice!("Spiral: standard_ProcessUtility returned, processing hierarchy...");
                 // Make new table visible to subsequent catalog queries
-                unsafe { pg_sys::CommandCounterIncrement(); }
+                unsafe {
+                    pg_sys::CommandCounterIncrement();
+                }
 
                 // Detect timestamptz columns and handle Date Anchors
                 let (anchor_col, offset_cols) = Spi::connect(|client| {
@@ -366,7 +368,14 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
                 // 5. Generate the entire hierarchy automatically
                 notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
-                generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols, anchor_col, offset_cols);
+                generate_hierarchy_internal(
+                    &name,
+                    &frames_str,
+                    scope_columns,
+                    captured_cols,
+                    anchor_col,
+                    offset_cols,
+                );
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
 
@@ -1116,7 +1125,8 @@ pub fn generate_hierarchy_internal(
             }
             // Add other columns as sum or range_merge by default (uses pre-fetched list)
             for col in &base_all_cols {
-                if !seen_cols.contains(col.as_str()) && col != "t" && seen_cols.insert(col.clone()) {
+                if !seen_cols.contains(col.as_str()) && col != "t" && seen_cols.insert(col.clone())
+                {
                     if offset_cols.contains(col) {
                         let bucket_expr = format!(
                             "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision)",
