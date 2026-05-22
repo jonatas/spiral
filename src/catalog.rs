@@ -124,7 +124,14 @@ pub fn insert_source(
 }
 
 pub fn unify_changelog(base_view: &str) {
-    let _ = Spi::run(&format!("CREATE TEMP TABLE temp_unified AS
+    // Snapshot existing rows with their ctids first. Any concurrent inserts that
+    // arrive after this point will have new ctids and won't be touched by the
+    // subsequent DELETE, preserving them for the next refresh cycle.
+    let _ = Spi::run(&format!(
+        "CREATE TEMP TABLE changelog_snapshot AS SELECT ctid AS old_ctid, * FROM spiral.changelog WHERE base_view = '{}'",
+        base_view.replace("'", "''")
+    ));
+    let _ = Spi::run("CREATE TEMP TABLE temp_unified AS
          SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
          FROM (
             SELECT *,
@@ -132,16 +139,14 @@ pub fn unify_changelog(base_view: &str) {
             FROM (
                 SELECT *,
                     MAX(t_end) OVER (PARTITION BY base_view, scope_values ORDER BY t_start ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
-                FROM spiral.changelog
-                WHERE base_view = '{}'
+                FROM changelog_snapshot
             ) s1
          ) s2
-         GROUP BY base_view, scope_values, grp", base_view.replace("'", "''")));
-    let _ = Spi::run(&format!(
-        "DELETE FROM spiral.changelog WHERE base_view = '{}'",
-        base_view.replace("'", "''")
-    ));
+         GROUP BY base_view, scope_values, grp");
+    // Only delete the rows we snapshotted; concurrent inserts survive.
+    let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM changelog_snapshot)");
     let _ = Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified");
+    let _ = Spi::run("DROP TABLE changelog_snapshot");
     let _ = Spi::run("DROP TABLE temp_unified");
 }
 
