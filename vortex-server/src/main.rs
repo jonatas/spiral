@@ -1,16 +1,17 @@
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, Pool, Postgres, Row};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -30,18 +31,22 @@ struct Metadata {
 #[derive(Serialize, Deserialize, Debug, FromRow, Clone)]
 struct SourceInfo {
     view_name: String,
+    base_view: String,
+    frame_seconds: i32,
     base_column: String,
     formula: String,
     mat_column: String,
+    rollup_gsub_strategy: Option<String>,
+    metadata: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, FromRow, Clone)]
 struct ChangelogEntry {
+    event_id: i64,
     base_view: String,
     scope_values: serde_json::Value,
     t_start: i64,
     t_end: i64,
-    processed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -57,6 +62,10 @@ struct BlockInfo {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct StorageStats {
+    #[serde(default)]
+    base_view: String,
+    #[serde(default)]
+    view_name: String,
     total_pages: i64,
     total_rows_capacity: i64,
     tenant_scale: i64,
@@ -66,12 +75,25 @@ struct StorageStats {
     kickoff_epoch: i64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AggregationLevel {
+    frame_seconds: i32,
+    view_name: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-struct SystemConfig {
-    aggregation_levels: Vec<i32>,
+struct HierarchyConfig {
+    base_view: String,
+    raw_view_name: String,
+    aggregation_levels: Vec<AggregationLevel>,
     tenant_scale: i64,
     sources: Vec<SourceInfo>,
     kickoff_epoch: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct SystemConfig {
+    hierarchies: Vec<HierarchyConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -97,14 +119,18 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/postgres".into());
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/postgres".into());
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await
         .expect("Failed to connect to Postgres");
+
+    ensure_changelog_event_ids(&pool)
+        .await
+        .expect("Failed to prepare changelog schema");
 
     let (tx, _rx) = broadcast::channel(100);
 
@@ -116,25 +142,32 @@ async fn main() {
     // Start background polling task
     let polling_state = Arc::clone(&state);
     tokio::spawn(async move {
-        let mut last_processed_t = 0i64;
-        let mut last_metadata_count = 0;
-        
+        let mut last_processed_event_id = 0i64;
+        let mut last_config_signature: Option<String> = None;
+
         tracing::info!("Starting background polling loop");
         loop {
             // 1. Poll for new changelog entries
             let result = sqlx::query_as::<_, ChangelogEntry>(
-                "SELECT base_view, scope_values, t_start, t_end, processed FROM spiral.changelog WHERE t_start > $1 ORDER BY t_start ASC"
+                "SELECT event_id, base_view, scope_values, t_start, t_end
+                 FROM spiral.changelog
+                 WHERE event_id > $1
+                 ORDER BY event_id ASC",
             )
-            .bind(last_processed_t)
+            .bind(last_processed_event_id)
             .fetch_all(&polling_state.pool)
             .await;
 
             match result {
                 Ok(entries) => {
                     if !entries.is_empty() {
-                        tracing::info!("Found {} new changelog entries since {}", entries.len(), last_processed_t);
+                        tracing::info!(
+                            "Found {} new changelog entries since event_id={}",
+                            entries.len(),
+                            last_processed_event_id
+                        );
                         for entry in entries {
-                            last_processed_t = last_processed_t.max(entry.t_start);
+                            last_processed_event_id = last_processed_event_id.max(entry.event_id);
                             let _ = polling_state.tx.send(VortexEvent::ChangelogUpdate(entry));
                         }
                     }
@@ -143,69 +176,39 @@ async fn main() {
             }
 
             // 2. Poll for storage stats and metadata
-            let metadata_result = sqlx::query_as::<_, Metadata>(
-                "SELECT view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata ORDER BY frame_seconds ASC"
-            )
-            .fetch_all(&polling_state.pool)
-            .await;
+            match load_system_config(&polling_state.pool).await {
+                Ok(config) => {
+                    let signature = serde_json::to_string(&config).unwrap_or_default();
+                    if last_config_signature.as_deref() != Some(signature.as_str()) {
+                        last_config_signature = Some(signature);
+                        let _ = polling_state
+                            .tx
+                            .send(VortexEvent::SystemConfig(config.clone()));
+                    }
 
-            if let Ok(views) = metadata_result {
-                // If metadata changed, broadcast new system config
-                if views.len() != last_metadata_count {
-                    last_metadata_count = views.len();
-                    let levels: Vec<i32> = views.iter().map(|v| v.frame_seconds).collect();
-                    
-                    let sources = sqlx::query_as::<_, SourceInfo>(
-                        "SELECT view_name, base_column, formula, mat_column FROM spiral.sources"
-                    )
-                    .fetch_all(&polling_state.pool)
-                    .await
-                    .unwrap_or_default();
-
-                    let mut tenant_scale = 1024;
-                    let mut kickoff_epoch = 0;
-                    if let Some(first) = views.first() {
-                        let scale_query = sqlx::query(
-                            "SELECT (spiral_get_storage_stats(oid::int)->>'tenant_scale')::bigint as scale, (spiral_get_storage_stats(oid::int)->>'kickoff_epoch')::bigint as kickoff FROM pg_class WHERE relname = $1"
+                    for hierarchy in &config.hierarchies {
+                        match load_storage_stats(
+                            &polling_state.pool,
+                            &hierarchy.base_view,
+                            &hierarchy.raw_view_name,
                         )
-                        .bind(&first.view_name)
-                        .fetch_optional(&polling_state.pool)
-                        .await;
-                        
-                        if let Ok(Some(row)) = scale_query {
-                            tenant_scale = row.get("scale");
-                            kickoff_epoch = row.get("kickoff");
-                        }
-                    }
-
-                    let _ = polling_state.tx.send(VortexEvent::SystemConfig(SystemConfig {
-                        aggregation_levels: levels,
-                        tenant_scale,
-                        sources,
-                        kickoff_epoch,
-                    }));
-                }
-
-                for view in views {
-                    let stats_result = sqlx::query(
-                        "SELECT spiral_get_storage_stats(oid::int) as stats FROM pg_class WHERE relname = $1"
-                    )
-                    .bind(&view.view_name)
-                    .fetch_optional(&polling_state.pool)
-                    .await;
-
-                    match stats_result {
-                        Ok(Some(row)) => {
-                            let stats_val: Option<serde_json::Value> = row.get("stats");
-                            if let Some(stats) = stats_val {
-                                if let Ok(storage_stats) = serde_json::from_value::<StorageStats>(stats) {
-                                    let _ = polling_state.tx.send(VortexEvent::StorageStats(storage_stats));
-                                }
+                        .await
+                        {
+                            Ok(Some(storage_stats)) => {
+                                let _ = polling_state
+                                    .tx
+                                    .send(VortexEvent::StorageStats(storage_stats));
                             }
+                            Ok(None) => {}
+                            Err(e) => tracing::error!(
+                                "Storage stats polling error for {}: {}",
+                                hierarchy.base_view,
+                                e
+                            ),
                         }
-                        _ => {}
                     }
                 }
+                Err(e) => tracing::error!("Metadata polling error: {}", e),
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -247,7 +250,10 @@ async fn get_block_info(
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         Ok(Json(block_info))
     } else {
-        Err((axum::http::StatusCode::NOT_FOUND, "Block info not available".into()))
+        Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Block info not available".into(),
+        ))
     }
 }
 
@@ -284,7 +290,10 @@ async fn get_changelog(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ChangelogEntry>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query_as::<_, ChangelogEntry>(
-        "SELECT base_view, scope_values, t_start, t_end, processed FROM spiral.changelog ORDER BY t_start DESC LIMIT 100"
+        "SELECT event_id, base_view, scope_values, t_start, t_end
+         FROM spiral.changelog
+         ORDER BY event_id DESC
+         LIMIT 100",
     )
     .fetch_all(&state.pool)
     .await
@@ -293,60 +302,31 @@ async fn get_changelog(
     Ok(Json(rows))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     tracing::info!("New WebSocket connection request");
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     tracing::info!("WebSocket upgraded");
-    
-    // Send initial config if available
-    let views = sqlx::query_as::<_, Metadata>(
-        "SELECT view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata ORDER BY frame_seconds ASC"
-    )
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let sources = sqlx::query_as::<_, SourceInfo>(
-        "SELECT view_name, base_column, formula, mat_column FROM spiral.sources"
-    )
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let mut tenant_scale = 1024;
-    let mut kickoff_epoch = 0;
-    if let Some(first) = views.first() {
-        let scale_query = sqlx::query(
-            "SELECT (spiral_get_storage_stats(oid::int)->>'tenant_scale')::bigint as scale, (spiral_get_storage_stats(oid::int)->>'kickoff_epoch')::bigint as kickoff FROM pg_class WHERE relname = $1"
-        )
-        .bind(&first.view_name)
-        .fetch_optional(&state.pool)
-        .await;
-        
-        if let Ok(Some(row)) = scale_query {
-            tenant_scale = row.get("scale");
-            kickoff_epoch = row.get("kickoff");
-        }
-    }
-
-    let levels: Vec<i32> = views.iter().map(|v| v.frame_seconds).collect();
-    let event = VortexEvent::SystemConfig(SystemConfig {
-        aggregation_levels: levels,
-        tenant_scale,
-        sources,
-        kickoff_epoch,
-    });
 
     let (mut sender, mut _receiver) = socket.split();
 
-    if let Ok(msg) = serde_json::to_string(&event) {
-        let _ = sender.send(Message::Text(msg.into())).await;
+    if let Ok(config) = load_system_config(&state.pool).await {
+        if let Ok(msg) = serde_json::to_string(&VortexEvent::SystemConfig(config.clone())) {
+            let _ = sender.send(Message::Text(msg.into())).await;
+        }
+
+        for hierarchy in &config.hierarchies {
+            if let Ok(Some(storage_stats)) =
+                load_storage_stats(&state.pool, &hierarchy.base_view, &hierarchy.raw_view_name)
+                    .await
+            {
+                if let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats)) {
+                    let _ = sender.send(Message::Text(msg.into())).await;
+                }
+            }
+        }
     }
 
     let mut rx = state.tx.subscribe();
@@ -358,4 +338,153 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
+}
+
+async fn ensure_changelog_event_ids(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
+    sqlx::query("CREATE SEQUENCE IF NOT EXISTS spiral.changelog_event_id_seq")
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER TABLE spiral.changelog ADD COLUMN IF NOT EXISTS event_id BIGINT")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE spiral.changelog
+         ALTER COLUMN event_id SET DEFAULT nextval('spiral.changelog_event_id_seq')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE spiral.changelog
+         SET event_id = nextval('spiral.changelog_event_id_seq')
+         WHERE event_id IS NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_spiral_changelog_event_id
+         ON spiral.changelog (event_id)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn load_metadata(pool: &Pool<Postgres>) -> Result<Vec<Metadata>, sqlx::Error> {
+    sqlx::query_as::<_, Metadata>(
+        "SELECT view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata
+         FROM spiral.metadata
+         ORDER BY base_view ASC, frame_seconds ASC, view_name ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+async fn load_sources(pool: &Pool<Postgres>) -> Result<Vec<SourceInfo>, sqlx::Error> {
+    sqlx::query_as::<_, SourceInfo>(
+        "SELECT view_name, base_view, frame_seconds, base_column, formula, mat_column,
+                rollup_gsub_strategy, metadata
+         FROM spiral.sources
+         ORDER BY base_view ASC, frame_seconds ASC, view_name ASC, base_column ASC, formula ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+async fn load_storage_stats(
+    pool: &Pool<Postgres>,
+    base_view: &str,
+    raw_view_name: &str,
+) -> Result<Option<StorageStats>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT spiral_get_storage_stats(oid::int) as stats
+         FROM pg_class
+         WHERE relname = $1",
+    )
+    .bind(raw_view_name)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let stats_val: Option<serde_json::Value> = row.get("stats");
+    let Some(stats) = stats_val else {
+        return Ok(None);
+    };
+
+    let mut storage_stats = match serde_json::from_value::<StorageStats>(stats) {
+        Ok(storage_stats) => storage_stats,
+        Err(_) => return Ok(None),
+    };
+
+    storage_stats.base_view = base_view.to_string();
+    storage_stats.view_name = raw_view_name.to_string();
+    Ok(Some(storage_stats))
+}
+
+async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx::Error> {
+    let metadata = load_metadata(pool).await?;
+    let sources = load_sources(pool).await?;
+
+    let mut metadata_by_base: BTreeMap<String, Vec<Metadata>> = BTreeMap::new();
+    for view in metadata {
+        metadata_by_base
+            .entry(view.base_view.clone())
+            .or_default()
+            .push(view);
+    }
+
+    let mut sources_by_base: BTreeMap<String, Vec<SourceInfo>> = BTreeMap::new();
+    for source in sources {
+        sources_by_base
+            .entry(source.base_view.clone())
+            .or_default()
+            .push(source);
+    }
+
+    let mut hierarchies = Vec::new();
+    for (base_view, mut views) in metadata_by_base {
+        views.sort_by(|a, b| {
+            a.frame_seconds
+                .cmp(&b.frame_seconds)
+                .then_with(|| a.view_name.cmp(&b.view_name))
+        });
+
+        let raw_view_name = views
+            .iter()
+            .find(|view| view.view_name == base_view || view.frame_seconds == 0)
+            .map(|view| view.view_name.clone())
+            .or_else(|| views.first().map(|view| view.view_name.clone()))
+            .unwrap_or_else(|| base_view.clone());
+
+        let storage_stats = load_storage_stats(pool, &base_view, &raw_view_name).await?;
+        let tenant_scale = storage_stats
+            .as_ref()
+            .map(|stats| stats.tenant_scale)
+            .unwrap_or(1024);
+        let kickoff_epoch = storage_stats
+            .as_ref()
+            .map(|stats| stats.kickoff_epoch)
+            .unwrap_or(0);
+
+        let aggregation_levels = views
+            .iter()
+            .map(|view| AggregationLevel {
+                frame_seconds: view.frame_seconds,
+                view_name: view.view_name.clone(),
+            })
+            .collect();
+
+        hierarchies.push(HierarchyConfig {
+            base_view: base_view.clone(),
+            raw_view_name,
+            aggregation_levels,
+            tenant_scale,
+            sources: sources_by_base.remove(&base_view).unwrap_or_default(),
+            kickoff_epoch,
+        });
+    }
+
+    Ok(SystemConfig { hierarchies })
 }
