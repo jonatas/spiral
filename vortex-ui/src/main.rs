@@ -537,29 +537,28 @@ fn App() -> impl IntoView {
                 <span class="badge">"V2.0-VORTEX"</span>
                 <h1>"Spiral Monitor" {move || is_paused.get().then(|| " [PAUSED]")}</h1>
 
-                {move || {
-                    let current_config = config.get();
-                    (current_config.hierarchies.len() > 1).then(|| {
-                        view! {
-                            <div class="stat-item" style="margin-bottom: 12px;">
-                                <span class="stat-label">"HIERARCHY"</span>
-                                <select
-                                    prop:value=move || selected_base_view.get()
-                                    on:change=move |ev| {
-                                        selected_base_view.set(event_target_value(&ev));
-                                        selected_block.set(None);
-                                    }
-                                    style="background: rgba(255,255,255,0.08); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 6px; padding: 4px 6px;"
-                                >
-                                    {current_config.hierarchies.into_iter().map(|hierarchy| {
-                                        let base_view = hierarchy.base_view.clone();
-                                        view! { <option value=base_view.clone()>{base_view.clone()}</option> }
-                                    }).collect_view()}
-                                </select>
-                            </div>
+                <div class="table-switcher">
+                    {move || {
+                        let current_config = config.get();
+                        if current_config.hierarchies.is_empty() {
+                            leptos::either::Either::Left(view! { <div style="font-size: 0.6rem; color: var(--gray-color);">"NO TABLES FOUND"</div> })
+                        } else {
+                            leptos::either::Either::Right(current_config.hierarchies.into_iter().map(|hierarchy| {
+                                let t = hierarchy.base_view.clone();
+                                let is_active = selected_base_view.get() == t;
+                                view! {
+                                    <button
+                                        class=move || if is_active { "switcher-btn active" } else { "switcher-btn" }
+                                        on:click=move |_| {
+                                            selected_base_view.set(t.clone());
+                                            selected_block.set(None);
+                                        }
+                                    >{hierarchy.base_view.to_uppercase()}</button>
+                                }
+                            }).collect_view())
                         }
-                    })
-                }}
+                    }}
+                </div>
 
                 <div class="stats-container">
                     <div class="stat-item">

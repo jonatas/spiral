@@ -272,6 +272,11 @@ pub fn get_dirty_ranges(
 
 pub fn get_tenant_scale(metadata: &Metadata) -> i64 {
     if let serde_json::Value::Object(map) = &metadata.columns_metadata {
+        if let Some(val) = map.get("tenant_scale") {
+            if let Some(n) = val.as_i64() {
+                return n;
+            }
+        }
         if let Some(serde_json::Value::String(s)) = map.get("cardinality") {
             return match s.as_str() {
                 "d" => 10,

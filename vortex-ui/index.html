@@ -208,6 +208,39 @@
                 font-weight: bold;
                 letter-spacing: 1px;
             }
+
+            .table-switcher {
+                display: flex;
+                gap: 8px;
+                margin-bottom: 1.5rem;
+                border-bottom: 1px solid var(--border-color);
+                padding-bottom: 0.75rem;
+            }
+
+            .switcher-btn {
+                background: transparent;
+                border: 1px solid var(--border-color);
+                color: var(--gray-color);
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 0.65rem;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+
+            .switcher-btn:hover {
+                background: rgba(255, 255, 255, 0.05);
+                color: white;
+            }
+
+            .switcher-btn.active {
+                background: var(--primary-color);
+                border-color: var(--primary-color);
+                color: white;
+                font-weight: bold;
+                box-shadow: 0 0 10px rgba(92, 158, 255, 0.3);
+            }
         </style>
     </head>
     <body>
