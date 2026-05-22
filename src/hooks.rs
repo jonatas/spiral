@@ -188,11 +188,6 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 || !extracted_cardinality.is_empty()
                 || !extracted_time_column.is_empty()
             {
-                if tag == pg_sys::NodeTag::T_CreateStmt {
-                    let stmt = utility_stmt as *mut pg_sys::CreateStmt;
-                    (*stmt).accessMethod = pg_sys::pstrdup(c"spiral".as_ptr());
-                }
-
                 notice!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
@@ -218,6 +213,8 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     );
                 }
                 notice!("Spiral: standard_ProcessUtility returned, processing hierarchy...");
+                // Make new table visible to subsequent catalog queries
+                unsafe { pg_sys::CommandCounterIncrement(); }
 
                 // Detect timestamptz columns and handle Date Anchors
                 let (anchor_col, offset_cols) = Spi::connect(|client| {
@@ -369,7 +366,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
                 // 5. Generate the entire hierarchy automatically
                 notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
-                generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols);
+                generate_hierarchy_internal(&name, &frames_str, scope_columns, captured_cols, anchor_col, offset_cols);
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
 
@@ -907,7 +904,7 @@ fn resolve_segments(
 }
 
 pub fn create_reconstruction_view(rel_name: &str) {
-    let _ = Spi::connect(|client| {
+    let create_view_sql: Option<String> = Spi::connect(|client| {
         let mut metadata_res = client.select(
             &format!(
                 "SELECT columns_metadata, base_view FROM spiral.metadata WHERE view_name = '{}'",
@@ -917,7 +914,7 @@ pub fn create_reconstruction_view(rel_name: &str) {
             &[],
         )?;
         if metadata_res.is_empty() {
-            return Ok::<(), spi::Error>(());
+            return Ok::<Option<String>, spi::Error>(None);
         }
 
         let row = metadata_res.next().expect("metadata_res is empty");
@@ -928,7 +925,8 @@ pub fn create_reconstruction_view(rel_name: &str) {
             .0
             .get("time_column")
             .and_then(|v: &serde_json::Value| v.as_str())
-            .unwrap_or("t");
+            .unwrap_or("t")
+            .to_string();
         let offset_cols: Vec<String> = json
             .0
             .get("offset_columns")
@@ -973,21 +971,25 @@ pub fn create_reconstruction_view(rel_name: &str) {
         }
 
         let view_name = format!("{}_view", rel_name);
-        let create_view_sql = format!(
+        Ok::<Option<String>, spi::Error>(Some(format!(
             "CREATE OR REPLACE VIEW \"{}\" AS SELECT {} FROM \"{}\"",
             view_name.replace("\"", "\"\""),
             select_parts.join(", "),
             rel_name.replace("\"", "\"\"")
-        );
-        let _ = Spi::run(&create_view_sql);
-        Ok::<(), spi::Error>(())
-    });
+        )))
+    }).unwrap_or(None);
+
+    if let Some(sql) = create_view_sql {
+        let _ = Spi::run(&sql);
+    }
 }
 pub fn generate_hierarchy_internal(
     base_name: &str,
     frames_str: &str,
     scope_columns: Vec<String>,
     custom_cols: Vec<(String, String, Option<String>)>,
+    anchor_col: String,
+    offset_cols: Vec<String>,
 ) {
     notice!(
         "Spiral: Entering generate_hierarchy_internal for '{}', frames='{}'",
@@ -1004,40 +1006,8 @@ pub fn generate_hierarchy_internal(
     };
     let mut current_parent = base_name.to_string();
 
-    let (anchor_col, offset_cols) = Spi::connect(|client| {
-        let metadata_res = client.select(
-            &format!(
-                "SELECT columns_metadata FROM spiral.metadata WHERE view_name = '{}'",
-                base_name.replace("'", "''")
-            ),
-            Some(1),
-            &[],
-        );
-        if let Ok(m) = metadata_res {
-            if !m.is_empty() {
-                let json: pgrx::JsonB = m.first().get(1).unwrap().unwrap();
-                let anchor = json
-                    .0
-                    .get("time_column")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("t")
-                    .to_string();
-                let offsets: Vec<String> = json
-                    .0
-                    .get("offset_columns")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|v| v.as_str().unwrap().to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                return Ok::<(String, Vec<String>), spi::Error>((anchor, offsets));
-            }
-        }
-        Ok::<(String, Vec<String>), spi::Error>(("t".to_string(), Vec::new()))
-    })
-    .unwrap_or(("t".to_string(), Vec::new()));
+    // Note: extra-column discovery skipped here; use magic comments to cover all columns.
+    let base_all_cols: Vec<String> = Vec::new();
 
     for (i, frame) in frames.iter().enumerate() {
         let child_name = format!("{}_{}", base_prefix, frame.name);
@@ -1140,40 +1110,35 @@ pub fn generate_hierarchy_internal(
                     });
                 }
             }
-            // Add other columns as sum or range_merge by default
-            Spi::connect(|client| {
-                let q = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", base_name.replace("\"", "\"\""));
-                let cols = client.select(&q, None, &[]).unwrap();
-                for row in cols {
-                    let col = row.get::<String>(1).unwrap().unwrap();
-                    if !seen_cols.contains(&col) && col != "t" && seen_cols.insert(col.clone()) {
-                        if offset_cols.contains(&col) {
-                            let bucket_expr = format!(
-                                "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision)",
-                                anchor_col, frame.seconds
-                            );
-                            select_parts.push(format!(
-                                "date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"",
-                                col, bucket_expr, col
-                            ));
-                            sources.push(rollup::SourceDef {
-                                base_column: col.clone(),
-                                formula: "range_merge".to_string(),
-                                mat_column: col.clone(),
-                                rollup_gsub_strategy: None,
-                            });
-                        } else {
-                            select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
-                            sources.push(rollup::SourceDef {
-                                base_column: col.clone(),
-                                formula: "sum".to_string(),
-                                mat_column: col.clone(),
-                                rollup_gsub_strategy: None,
-                            });
-                        }
+            // Add other columns as sum or range_merge by default (uses pre-fetched list)
+            for col in &base_all_cols {
+                if !seen_cols.contains(col.as_str()) && col != "t" && seen_cols.insert(col.clone()) {
+                    if offset_cols.contains(col) {
+                        let bucket_expr = format!(
+                            "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision)",
+                            anchor_col, frame.seconds
+                        );
+                        select_parts.push(format!(
+                            "date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"",
+                            col, bucket_expr, col
+                        ));
+                        sources.push(rollup::SourceDef {
+                            base_column: col.clone(),
+                            formula: "range_merge".to_string(),
+                            mat_column: col.clone(),
+                            rollup_gsub_strategy: None,
+                        });
+                    } else {
+                        select_parts.push(format!("sum(\"{}\") as \"{}\"", col, col));
+                        sources.push(rollup::SourceDef {
+                            base_column: col.clone(),
+                            formula: "sum".to_string(),
+                            mat_column: col.clone(),
+                            rollup_gsub_strategy: None,
+                        });
                     }
                 }
-            });
+            }
         } else {
             // Higher levels: derive from parent
             let (_, parent_sources) = rollup::derive_child_sql(

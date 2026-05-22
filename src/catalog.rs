@@ -74,20 +74,18 @@ pub fn insert_metadata(
     let metadata_json =
         serde_json::to_string(&columns_metadata.0).unwrap_or_else(|_| "{}".to_string());
 
-    let _ = Spi::connect(|_client| {
-        let sql = format!(
-            "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
-             VALUES ('{}', '{}', {}, '{}', '{}'::text[], '{}'::jsonb)
-             ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
-            view_name.replace("'", "''"),
-            parent_view.replace("'", "''"),
-            frame_seconds,
-            base_view.replace("'", "''"),
-            scope_cols_json.replace("[", "{").replace("]", "}"), // Simple array format
-            metadata_json.replace("'", "''")
-        );
-        Spi::run(&sql)
-    });
+    let sql = format!(
+        "INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns, columns_metadata)
+         VALUES ('{}', '{}', {}, '{}', '{}'::text[], '{}'::jsonb)
+         ON CONFLICT (view_name) DO UPDATE SET parent_view = EXCLUDED.parent_view, frame_seconds = EXCLUDED.frame_seconds, base_view = EXCLUDED.base_view, scope_columns = EXCLUDED.scope_columns, columns_metadata = EXCLUDED.columns_metadata",
+        view_name.replace("'", "''"),
+        parent_view.replace("'", "''"),
+        frame_seconds,
+        base_view.replace("'", "''"),
+        scope_cols_json.replace("[", "{").replace("]", "}"), // Simple array format
+        metadata_json.replace("'", "''")
+    );
+    let _ = Spi::run(&sql);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,33 +120,29 @@ pub fn insert_source(
         metadata_json.replace("'", "''")
     );
 
-    let _ = Spi::connect(|_client| Spi::run(&sql));
+    let _ = Spi::run(&sql);
 }
 
 pub fn unify_changelog(base_view: &str) {
-    let _ = Spi::connect(|_client| {
-        let _ = Spi::run(&format!("CREATE TEMP TABLE temp_unified AS
-             SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
-             FROM (
+    let _ = Spi::run(&format!("CREATE TEMP TABLE temp_unified AS
+         SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
+         FROM (
+            SELECT *,
+                COUNT(*) FILTER (WHERE prev_end < t_start OR prev_end IS NULL) OVER (PARTITION BY base_view, scope_values ORDER BY t_start) as grp
+            FROM (
                 SELECT *,
-                    COUNT(*) FILTER (WHERE prev_end < t_start OR prev_end IS NULL) OVER (PARTITION BY base_view, scope_values ORDER BY t_start) as grp
-                FROM (
-                    SELECT *,
-                        MAX(t_end) OVER (PARTITION BY base_view, scope_values ORDER BY t_start ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
-                    FROM spiral.changelog
-                    WHERE base_view = '{}'
-                ) s1
-             ) s2
-             GROUP BY base_view, scope_values, grp", base_view.replace("'", "''")));
-
-        let _ = Spi::run(&format!(
-            "DELETE FROM spiral.changelog WHERE base_view = '{}'",
-            base_view.replace("'", "''")
-        ));
-        let _ = Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified");
-        let _ = Spi::run("DROP TABLE temp_unified");
-        Ok::<(), spi::Error>(())
-    });
+                    MAX(t_end) OVER (PARTITION BY base_view, scope_values ORDER BY t_start ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
+                FROM spiral.changelog
+                WHERE base_view = '{}'
+            ) s1
+         ) s2
+         GROUP BY base_view, scope_values, grp", base_view.replace("'", "''")));
+    let _ = Spi::run(&format!(
+        "DELETE FROM spiral.changelog WHERE base_view = '{}'",
+        base_view.replace("'", "''")
+    ));
+    let _ = Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified");
+    let _ = Spi::run("DROP TABLE temp_unified");
 }
 
 pub fn get_dirty_ranges(
