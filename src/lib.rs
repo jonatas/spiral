@@ -699,6 +699,38 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_planner_supports_date_trunc_group_by() {
+        Spi::run(
+            "CREATE TABLE planner_datetrunc (t timestamptz, user_id int, val double precision)",
+        )
+        .unwrap();
+
+        unsafe {
+            // date_trunc in target list should not block acceleration — T_FuncExpr is passthrough
+            let query = hooks::parse_sql_to_query(
+                "SELECT date_trunc('day', t), sum(val) FROM planner_datetrunc GROUP BY 1",
+            );
+            assert!(!query.is_null());
+
+            let cols = hooks::extract_supported_query_columns(
+                query,
+                (*query).rtable,
+                "planner_datetrunc",
+            );
+            assert!(
+                cols.is_some(),
+                "date_trunc in target list should not block acceleration"
+            );
+            let cols = cols.unwrap();
+            assert!(
+                cols.iter().any(|(name, agg)| name == "val" && agg.as_deref() == Some("sum")),
+                "sum(val) should be in cols: {:?}",
+                cols
+            );
+        }
+    }
+
+    #[pg_test]
     fn test_planner_rejects_unsupported_aggregate_target_lists() {
         Spi::run(
             "CREATE TABLE planner_fallback (t timestamptz, tenant_id int, val double precision)",

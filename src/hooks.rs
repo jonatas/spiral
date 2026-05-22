@@ -615,6 +615,10 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
         };
     }
     IN_HOOK.with(|h| h.set(true));
+    // Ensure background worker is running for this database. The WORKER_STARTED
+    // thread-local guard makes this a cheap no-op after the first query per session,
+    // which lets the worker recover after a server restart without a new CREATE TABLE.
+    crate::bgworker::maybe_start_worker();
     let query = &mut *parse;
     if query.commandType == pg_sys::CmdType::CMD_SELECT {
         let rtable = query.rtable;
@@ -1320,6 +1324,11 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 }
 
                 cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None));
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                // date_trunc / date_part / extract applied to the time column — passthrough.
+                // The outer query retains the function expression; the subquery just exposes `t`.
+                // Do not add to cols and do not reject; the acceleration is still valid.
             }
             pg_sys::NodeTag::T_Aggref => {
                 let agg = node as *mut pg_sys::Aggref;
