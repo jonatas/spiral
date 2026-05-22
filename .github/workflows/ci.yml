@@ -14,8 +14,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      extension: ${{ steps.filter.outputs.extension }}
+      vortex_server: ${{ steps.filter.outputs.vortex_server }}
+      vortex_ui: ${{ steps.filter.outputs.vortex_ui }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            extension:
+              - '.github/workflows/ci.yml'
+              - 'Cargo.toml'
+              - 'spiral.control'
+              - 'src/**'
+              - 'sql/**'
+              - 'tests/**'
+            vortex_server:
+              - '.github/workflows/ci.yml'
+              - 'vortex-server/**'
+            vortex_ui:
+              - '.github/workflows/ci.yml'
+              - 'vortex-ui/**'
+
   lint:
     name: Lint
+    needs: changes
+    if: needs.changes.outputs.extension == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,6 +110,8 @@ jobs:
 
   test:
     name: Test (PG ${{ matrix.pg_version }})
+    needs: changes
+    if: needs.changes.outputs.extension == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -152,3 +183,43 @@ jobs:
         run: |
           export PATH="/usr/lib/ccache:$PATH"
           cargo pgrx test pg${{ matrix.pg_version }} --no-default-features --features pg${{ matrix.pg_version }}
+
+  vortex-server-build:
+    name: Build Vortex Server
+    needs: changes
+    if: needs.changes.outputs.vortex_server == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          shared-key: "spiral-vortex-server"
+          workspaces: |
+            vortex-server
+      - name: Build vortex-server
+        working-directory: vortex-server
+        run: cargo check
+
+  vortex-ui-build:
+    name: Build Vortex UI
+    needs: changes
+    if: needs.changes.outputs.vortex_ui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          shared-key: "spiral-vortex-ui"
+          workspaces: |
+            vortex-ui
+      - name: Build vortex-ui
+        working-directory: vortex-ui
+        run: cargo check --target wasm32-unknown-unknown
