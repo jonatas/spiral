@@ -510,11 +510,27 @@ fn spiral_register_view(
         };
 
         if !select_part.is_empty() {
-            let create_sql = format!(
+            let scope_cols_str = scope_columns
+                .iter()
+                .map(|s| format!("\"{}\"", s.trim()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let index_sql = if scope_columns.is_empty() {
+                format!(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{view_name} ON {view_name}(t)"
+                )
+            } else {
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_z_{view_name} ON {view_name} \
+                     (spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[]))"
+                )
+            };
+            let create_table_sql = format!(
                 "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0",
                 view_name, select_part
             );
-            let _ = Spi::run(&create_sql);
+            let _ = Spi::run(&create_table_sql);
+            let _ = Spi::run(&index_sql);
         }
     }
 
@@ -551,7 +567,7 @@ fn spiral_register_view(
             }
 
             let trigger_sql = format!(
-                "CREATE TRIGGER spiral_track_{base_view}_{event_lower}
+                "CREATE OR REPLACE TRIGGER spiral_track_{base_view}_{event_lower}
                  AFTER {event} ON \"{base_view}\"
                  {transition}
                  FOR EACH STATEMENT EXECUTE FUNCTION spiral.track_changes_stmt('{base_view}')",
