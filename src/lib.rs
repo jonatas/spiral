@@ -532,6 +532,18 @@ fn spiral_register_view(
         }
     }
 
+    // Ensure base table has a frame_seconds=0 metadata row so track_changes_stmt
+    // can look up scope_columns via "WHERE view_name = base_view".
+    if view_name != base_view {
+        catalog::insert_metadata(
+            base_view,
+            "BASE",
+            0,
+            base_view,
+            scope_columns.clone(),
+            pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
+        );
+    }
     catalog::insert_metadata(
         view_name,
         parent_view,
