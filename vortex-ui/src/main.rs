@@ -508,7 +508,9 @@ fn App() -> impl IntoView {
                     let end_t = kickoff + info.t_range[1];
                     let duration_sec = (end_t - start_t).abs();
                     
-                    let duration_fmt = if duration_sec < 3600 {
+                    let duration_fmt = if duration_sec < 60 {
+                        format!("{}s", duration_sec)
+                    } else if duration_sec < 3600 {
                         format!("{:.1}m", duration_sec as f64 / 60.0)
                     } else if duration_sec < 86400 {
                         format!("{:.1}h", duration_sec as f64 / 3600.0)
