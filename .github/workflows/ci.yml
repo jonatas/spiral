@@ -21,6 +21,8 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     outputs:
       extension: ${{ steps.filter.outputs.extension }}
       vortex_server: ${{ steps.filter.outputs.vortex_server }}
