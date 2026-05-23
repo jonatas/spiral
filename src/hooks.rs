@@ -1705,8 +1705,12 @@ fn construct_union_sql_hierarchical(
 
                 let col_expr = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
                     reconstruction_expr(&mapped, &oc.formula, is_rollup)
+                } else if is_rollup {
+                    // Rollup: expose pre-aggregated column directly; outer query re-sums.
+                    map_agg_inner(agg_fn, &mapped, true)
                 } else {
-                    map_agg_inner(agg_fn, &mapped, is_rollup)
+                    // Base table: expose raw column; outer query handles aggregation.
+                    format!("\"{}\"", mapped)
                 };
 
                 // Cast to original type so outer Var nodes resolve without mismatch
@@ -1751,27 +1755,11 @@ fn construct_union_sql_hierarchical(
 
         let multirange_lit = format!("'{{ {} }}'::tstzmultirange", range_strs.join(", "));
 
-        let group_by_str = if !is_rollup {
-            let group_by = cols
-                .iter()
-                .filter(|(c, agg)| agg.is_none() && c != "t")
-                .map(|(col, _)| format!("\"{}\"", col))
-                .collect::<Vec<_>>();
-            if group_by.is_empty() {
-                String::new()
-            } else {
-                format!(" GROUP BY {}", group_by.join(", "))
-            }
-        } else {
-            String::new()
-        };
-
         select_parts.push(format!(
-            "SELECT {} FROM {} WHERE t <@ {}{}",
+            "SELECT {} FROM {} WHERE t <@ {}",
             inner_select.join(", "),
             src,
-            multirange_lit,
-            group_by_str
+            multirange_lit
         ));
     }
 
