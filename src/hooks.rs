@@ -691,6 +691,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         te,
                                         scope_values,
                                     );
+                                    let max_frame_secs = extract_group_granularity_secs(query);
                                     let segments = resolve_segments(
                                         &base_table,
                                         ts,
@@ -698,6 +699,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         &hierarchy,
                                         &dirty_ranges,
                                         tz_offset,
+                                        max_frame_secs,
                                     );
 
                                     if !segments.is_empty()
@@ -856,6 +858,7 @@ fn resolve_segments(
     hierarchy: &[String],
     dirty: &[(i64, i64)],
     offset_seconds: i64,
+    max_frame_secs: Option<i64>,
 ) -> Vec<Segment> {
     let mut segments = Vec::new();
 
@@ -863,6 +866,9 @@ fn resolve_segments(
         .iter()
         .filter_map(|h| catalog::get_metadata(h).map(|m| (h.clone(), m.frame_seconds)))
         .filter(|h| h.1 > 0)
+        // Never use a rollup coarser than the query's grouping granularity —
+        // that would collapse finer time buckets into a single coarse row.
+        .filter(|h| max_frame_secs.map_or(true, |max| h.1 as i64 <= max))
         .collect();
     sorted_hierarchy.sort_by_key(|h| -h.1);
 
@@ -1436,6 +1442,112 @@ pub(crate) unsafe fn extract_supported_query_columns(
     Some(cols)
 }
 
+/// Returns the granularity in seconds implied by a `date_trunc` GROUP BY expression.
+/// Inspects the query's groupClause and target list for `date_trunc('field', t)`.
+/// In PG17+, GROUP BY targets are Vars pointing to an RTE_GROUP entry; this
+/// function dereferences through RTE_GROUP.groupexprs to find the actual FuncExpr.
+/// Returns `None` if no date_trunc is found or the field is unrecognised.
+pub(crate) unsafe fn extract_group_granularity_secs(
+    query: *mut pg_sys::Query,
+) -> Option<i64> {
+    let group_clause = (*query).groupClause;
+    if group_clause.is_null() {
+        return None;
+    }
+    let target_list = (*query).targetList;
+    if target_list.is_null() {
+        return None;
+    }
+    let rtable = (*query).rtable;
+
+    for i in 0..(*group_clause).length {
+        let sgc = pg_sys::list_nth(group_clause, i) as *mut pg_sys::SortGroupClause;
+        if sgc.is_null() {
+            continue;
+        }
+        let ref_id = (*sgc).tleSortGroupRef;
+
+        // Find the TargetEntry whose ressortgroupref matches
+        let mut tle_expr: *mut pg_sys::Node = std::ptr::null_mut();
+        for j in 0..(*target_list).length {
+            let tle = pg_sys::list_nth(target_list, j) as *mut pg_sys::TargetEntry;
+            if !tle.is_null() && (*tle).ressortgroupref == ref_id {
+                tle_expr = (*tle).expr as *mut pg_sys::Node;
+                break;
+            }
+        }
+        if tle_expr.is_null() {
+            continue;
+        }
+
+        // PG17+: GROUP BY targets are Vars pointing to RTE_GROUP.
+        // Dereference through groupexprs to get the actual expression.
+        let resolved_expr: *mut pg_sys::Node = if (*tle_expr).type_ == pg_sys::NodeTag::T_Var
+            && !rtable.is_null()
+        {
+            let var = tle_expr as *mut pg_sys::Var;
+            let varno = (*var).varno as i32;
+            let varattno = (*var).varattno as usize;
+            if varno >= 1 && varno <= (*rtable).length {
+                let rte = pg_sys::list_nth(rtable, varno - 1) as *mut pg_sys::RangeTblEntry;
+                if !rte.is_null()
+                    && (*rte).rtekind == pg_sys::RTEKind::RTE_GROUP
+                    && !(*rte).groupexprs.is_null()
+                    && varattno >= 1
+                    && varattno <= (*(*rte).groupexprs).length as usize
+                {
+                    pg_sys::list_nth((*rte).groupexprs, (varattno - 1) as i32)
+                        as *mut pg_sys::Node
+                } else {
+                    tle_expr
+                }
+            } else {
+                tle_expr
+            }
+        } else {
+            tle_expr
+        };
+
+        if resolved_expr.is_null() || (*resolved_expr).type_ != pg_sys::NodeTag::T_FuncExpr {
+            continue;
+        }
+        let fe = resolved_expr as *mut pg_sys::FuncExpr;
+        let fn_name_ptr = pg_sys::get_func_name((*fe).funcid);
+        if fn_name_ptr.is_null() {
+            continue;
+        }
+        let fn_name = CStr::from_ptr(fn_name_ptr).to_string_lossy();
+        if fn_name != "date_trunc" {
+            continue;
+        }
+        // First arg of date_trunc is the field string constant
+        let args = (*fe).args;
+        if args.is_null() || (*args).length < 1 {
+            continue;
+        }
+        let first_arg = pg_sys::list_nth(args, 0) as *mut pg_sys::Node;
+        if first_arg.is_null() || (*first_arg).type_ != pg_sys::NodeTag::T_Const {
+            continue;
+        }
+        let cst = first_arg as *mut pg_sys::Const;
+        let field_text: Option<String> = String::from_datum((*cst).constvalue, (*cst).constisnull);
+
+        let secs = match field_text.as_deref() {
+            Some("microseconds") | Some("milliseconds") | Some("second") | Some("seconds") => 1,
+            Some("minute") | Some("minutes") => 60,
+            Some("hour") | Some("hours") => 3600,
+            Some("day") | Some("days") => 86400,
+            Some("week") | Some("weeks") => 604800,
+            Some("month") | Some("months") => 2_592_000,
+            Some("quarter") | Some("quarters") => 7_776_000,
+            Some("year") | Some("years") | Some("decade") | Some("century") | Some("millennium") => i64::MAX / 2,
+            _ => continue,
+        };
+        return Some(secs);
+    }
+    None
+}
+
 /// Maps an aggregate function name to its corresponding column projection,
 /// adjusting for whether it's querying a rollup view or the base table.
 ///
@@ -1764,7 +1876,7 @@ pub fn spiral_explain(query_sql: &str) -> String {
                     let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, None);
 
                     let segments =
-                        resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset);
+                        resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset, None);
 
                     report.push_str(&format!(
                         "--- Spiral Slicing Plan for '{}' ---\n",
