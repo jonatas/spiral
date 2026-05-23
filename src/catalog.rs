@@ -222,7 +222,7 @@ pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
     Spi::connect(|client| {
         let sql = format!(
             "SELECT mat_column, formula FROM spiral.sources
-             WHERE view_name = '{}' AND formula IN ('range_merge')",
+             WHERE view_name = '{}' AND formula IN ('range_max_end', 'range_merge')",
             view_name.replace("'", "''")
         );
         Ok::<Vec<OffsetColumn>, spi::Error>(

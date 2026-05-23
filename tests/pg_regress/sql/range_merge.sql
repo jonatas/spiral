@@ -1,10 +1,13 @@
--- Test Transparent timestamptz reconstruction
+-- Test range_max_end (span semantics): stores max(ends_at) - bucket_start as int4 offset.
+-- "range_merge" accepted as backward-compat alias.
+-- NOTE: span semantics ≠ union semantics. Disjoint sessions in the same bucket report
+-- the span from bucket_start to max(ends_at), NOT the sum of covered intervals.
 CREATE EXTENSION IF NOT EXISTS spiral;
 DROP TABLE IF EXISTS sessions CASCADE;
 
 CREATE TABLE sessions (
     t        timestamptz NOT NULL,
-    ends_at  timestamptz,           -- Spiral: range_merge
+    ends_at  timestamptz,           -- Spiral: range_max_end
     user_id  int,
     duration int                    -- Spiral: sum
 ) WITH (spiral.frames = '10m,1h', spiral.tenant = 'user_id');
@@ -31,19 +34,33 @@ SELECT spiral_refresh('sessions');
 SELECT pg_typeof(ends_at) FROM sessions_10m LIMIT 1;
 -- expect: timestamp with time zone
 
--- Actual value reconstructed correctly
--- Note: we use 10m frame, so 10:00 to 10:10 bucket. 
--- Max of (10:08-10:00)=480s and (10:12-10:03)=540s is 540s.
--- Wait, actually they are in the same 10m bucket starting at 10:00.
--- ends_at for first row is 10:08 (offset 480 from 10:00)
--- ends_at for second row is 10:12 (offset 720 from 10:00)
--- Wait, 10:12 is offset 720 from 10:00.
--- So max(480, 720) = 720. 10:00 + 720s = 10:12.
+-- Span semantics: max(ends_at) across both rows is 10:12 (offset 720s from 10:00).
+-- Both rows land in the same 10m bucket starting at 10:00.
 SELECT t, ends_at, duration FROM sessions_10m WHERE user_id = 1;
 
 -- Acceleration + reconstruction: both active when time filter given
 SELECT t, ends_at FROM sessions_10m
 WHERE t >= '2026-01-01 10:00:00+00' AND t < '2026-01-01 11:00:00+00'
   AND user_id = 1;
+
+-- Disjoint session test: span ≠ union.
+-- Session A: 10:00-10:05 (300s), Session B: 10:07-10:09 (120s).
+-- True union = 420s. Span = max(10:09) - 10:00 = 540s.
+-- range_max_end reports SPAN (540s), not union (420s).
+DROP TABLE sessions CASCADE;
+CREATE TABLE sessions (
+    t        timestamptz NOT NULL,
+    ends_at  timestamptz,           -- Spiral: range_max_end
+    user_id  int
+) WITH (spiral.frames = '10m', spiral.tenant = 'user_id');
+
+INSERT INTO sessions VALUES
+    ('2026-01-01 10:00:00+00', '2026-01-01 10:05:00+00', 1),
+    ('2026-01-01 10:07:00+00', '2026-01-01 10:09:00+00', 1);
+
+SELECT spiral_refresh('sessions');
+
+-- ends_at reconstructed = 10:00 + 540s = 10:09:00 (span, not 10:07:00 union end)
+SELECT t, ends_at FROM sessions_10m WHERE user_id = 1;
 
 DROP TABLE sessions CASCADE;

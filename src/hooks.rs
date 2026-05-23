@@ -1169,6 +1169,26 @@ pub fn generate_hierarchy_internal(
                             rollup_gsub_strategy: None,
                         });
                     }
+                } else if formula_lower == "range_merge" || formula_lower == "range_max_end" {
+                    // Span semantics: store max(col) - bucket_start as int4 seconds offset.
+                    // "range_merge" accepted as backward-compat alias for "range_max_end".
+                    let mat = alias.clone().unwrap_or_else(|| col.clone());
+                    if seen_cols.insert(mat.clone()) {
+                        let bucket_expr = format!(
+                            "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision)",
+                            anchor_col, frame.seconds
+                        );
+                        select_parts.push(format!(
+                            "date_part('epoch', max(\"{}\") - {})::int4 as \"{}\"",
+                            col, bucket_expr, mat
+                        ));
+                        sources.push(rollup::SourceDef {
+                            base_column: col.clone(),
+                            formula: "range_max_end".to_string(),
+                            mat_column: mat,
+                            rollup_gsub_strategy: None,
+                        });
+                    }
                 } else {
                     // Custom aggregate or default sum
                     let mat = alias.clone().unwrap_or_else(|| col.clone());
@@ -1192,7 +1212,7 @@ pub fn generate_hierarchy_internal(
                     });
                 }
             }
-            // Add other columns as sum or range_merge by default (uses pre-fetched list)
+            // Add other columns as sum or range_max_end by default (uses pre-fetched list)
             for col in &base_all_cols {
                 if !seen_cols.contains(col.as_str()) && col != "t" && seen_cols.insert(col.clone())
                 {
@@ -1207,7 +1227,7 @@ pub fn generate_hierarchy_internal(
                         ));
                         sources.push(rollup::SourceDef {
                             base_column: col.clone(),
-                            formula: "range_merge".to_string(),
+                            formula: "range_max_end".to_string(),
                             mat_column: col.clone(),
                             rollup_gsub_strategy: None,
                         });
@@ -1258,7 +1278,7 @@ pub fn generate_hierarchy_internal(
                 } else if src.formula == "ohlcv" {
                     let c = &src.mat_column;
                     select_parts.push(format!("first(\"{}_o\", spiral(t)) as \"{}_o\", max(\"{}_h\") as \"{}_h\", min(\"{}_l\") as \"{}_l\", last(\"{}_c\", spiral(t)) as \"{}_c\", sum(\"{}_v\") as \"{}_v\"", c, c, c, c, c, c, c, c, c, c));
-                } else if src.formula == "range_merge" {
+                } else if src.formula == "range_max_end" || src.formula == "range_merge" {
                     select_parts.push(format!(
                         "max(\"{}\") as \"{}\"",
                         src.mat_column, src.mat_column
@@ -1620,7 +1640,7 @@ fn reconstruction_expr(col: &str, formula: &str, is_rollup: bool) -> String {
         return format!("\"{}\"", col);
     }
     match formula {
-        "range_merge" => format!(
+        "range_max_end" | "range_merge" => format!(
             "t + make_interval(secs => \"{}\"::double precision) AS \"{}\"",
             col, col
         ),

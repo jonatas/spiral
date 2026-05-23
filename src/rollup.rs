@@ -299,7 +299,7 @@ pub fn derive_child_sql(
                     } else {
                         select_cols.push(format!("first(\"{}_o\", spiral(t)) as \"{}_o\", max(\"{}_h\") as \"{}_h\", min(\"{}_l\") as \"{}_l\", last(\"{}_c\", spiral(t)) as \"{}_c\", sum(\"{}_v\") as \"{}_v\"", mc, mc, mc, mc, mc, mc, mc, mc, mc, mc));
                     }
-                } else if src.formula == "range_merge" {
+                } else if src.formula == "range_max_end" || src.formula == "range_merge" {
                     if !parent_is_view {
                         let bucket_expr = format!(
                             "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision)",
