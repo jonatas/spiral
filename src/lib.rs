@@ -1293,4 +1293,27 @@ mod zorder_tests {
         let zb = spiral_zorder(0, vec![Some("tenant_b".to_string())]);
         assert_ne!(za, zb, "different tenant strings must not collide");
     }
+
+    #[test]
+    fn test_zorder_monotone_for_fixed_string_dimension() {
+        // For a fixed tenant string, z-order must be monotonically increasing with t.
+        // This is the key property that makes z-order BETWEEN usable as an index predicate:
+        //   WHERE spiral_zorder(spiral(t), ARRAY['42']) BETWEEN lo AND hi
+        // covers all rows in [t_lo, t_hi] for tenant '42' with no false negatives.
+        let tenant = Some("42".to_string());
+        let timestamps: Vec<i64> = vec![0, 1, 100, 1000, 86400, 2_000_000, i32::MAX as i64];
+        let zorders: Vec<i64> = timestamps
+            .iter()
+            .map(|&t| spiral_zorder(t, vec![tenant.clone()]))
+            .collect();
+        for w in zorders.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "z-order not monotone for fixed tenant: {} >= {} (t values: {:?})",
+                w[0],
+                w[1],
+                timestamps
+            );
+        }
+    }
 }
