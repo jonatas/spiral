@@ -910,6 +910,67 @@ mod tests {
             "write B (price 222) must be present after second refresh"
         );
     }
+
+    #[pg_test]
+    fn test_refresh_noop_when_changelog_empty_and_rollup_populated() {
+        // After a successful refresh clears the changelog, a second spiral_refresh
+        // with no new inserts should be a no-op — it must NOT re-bootstrap with a
+        // full-range entry and re-aggregate the entire history.
+        Spi::run("CREATE TABLE ticks2 (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('ticks2', 'BASE', 0, 'ticks2', '{}')").unwrap();
+        Spi::run("SELECT spiral_register_view('ticks2_1h', 'ticks2', 3600, 'ticks2', '{}')")
+            .unwrap();
+
+        Spi::run(
+            "INSERT INTO ticks2 (t, val)
+             SELECT now() - interval '3 hours' + (i * interval '10 minutes'), 42.0
+             FROM generate_series(0, 5) i",
+        )
+        .unwrap();
+
+        // Initial refresh: populates rollup and clears changelog.
+        Spi::run("SELECT spiral_refresh('ticks2')").unwrap();
+
+        let after_first: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'ticks2'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(
+            after_first, 0,
+            "changelog must be empty after initial refresh"
+        );
+
+        let rollup_rows: i64 = Spi::get_one("SELECT COUNT(*)::bigint FROM ticks2_1h")
+            .unwrap()
+            .unwrap_or(0);
+        assert!(
+            rollup_rows > 0,
+            "rollup must have rows after initial refresh"
+        );
+
+        // Second refresh with no new data: changelog is empty, rollup is populated.
+        // Must return immediately without re-bootstrapping.
+        Spi::run("SELECT spiral_refresh('ticks2')").unwrap();
+
+        let after_second: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'ticks2'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(
+            after_second, 0,
+            "changelog must remain empty after no-op refresh (no bootstrap re-trigger)"
+        );
+
+        let rollup_rows_after: i64 = Spi::get_one("SELECT COUNT(*)::bigint FROM ticks2_1h")
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(
+            rollup_rows_after, rollup_rows,
+            "rollup row count must be unchanged by no-op refresh"
+        );
+    }
 }
 
 #[cfg(test)]

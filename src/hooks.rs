@@ -1800,7 +1800,10 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
         .unwrap_or_else(|| base_name.to_string());
 
     if is_root {
-        // Bootstrap: If changelog is empty for this base table, insert a full range to force initial materialization
+        // Bootstrap: if changelog is empty, only force a full rebuild when the
+        // rollup tier is also empty (first-time init).  An empty changelog with
+        // an already-populated rollup means nothing is dirty — return early so
+        // we don't re-aggregate the entire history unnecessarily.
         let count: i64 = Spi::get_one(&format!(
             "SELECT count(*) FROM spiral.changelog WHERE base_view = '{}'",
             real_base.replace("'", "''")
@@ -1808,8 +1811,33 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
         .unwrap()
         .unwrap();
         if count == 0 {
-            let bootstrap_sql = format!("INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"));
-            let _ = Spi::run(&bootstrap_sql);
+            let first_tier: Option<String> = Spi::get_one(&format!(
+                "SELECT view_name FROM spiral.metadata \
+                 WHERE base_view = '{}' AND frame_seconds > 0 \
+                 ORDER BY frame_seconds LIMIT 1",
+                real_base.replace("'", "''")
+            ))
+            .unwrap_or(None);
+
+            let rollup_is_empty = first_tier
+                .as_deref()
+                .map(|tier| {
+                    Spi::get_one::<i64>(&format!(
+                        "SELECT count(*) FROM (SELECT 1 FROM \"{}\" LIMIT 1) t",
+                        tier.replace("\"", "\"\"")
+                    ))
+                    .unwrap_or(Some(0))
+                    .unwrap_or(0)
+                        == 0
+                })
+                .unwrap_or(true);
+
+            if rollup_is_empty {
+                let bootstrap_sql = format!("INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"));
+                let _ = Spi::run(&bootstrap_sql);
+            } else {
+                return true;
+            }
         }
         catalog::unify_changelog(&real_base);
 
