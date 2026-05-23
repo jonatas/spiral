@@ -4,14 +4,24 @@ use pgrx::prelude::*;
 pub struct Frame {
     pub name: String,
     pub seconds: i32,
+    /// Non-None for calendar-aligned tiers (month, quarter, year).
+    /// Holds the `date_trunc` field name (e.g. "month", "quarter", "year").
+    /// When set, rollup SQL uses `date_trunc(field, t)` instead of epoch
+    /// arithmetic so bucket boundaries align with calendar boundaries.
+    pub calendar_field: Option<String>,
 }
 
 pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 
 /// Parses a comma-separated string of time frames into a vector of `Frame` structs.
 ///
-/// This function understands suffixes like `s` (seconds), `m` (minutes), `h` (hours),
-/// `d` (days), `w` (weeks), and `M` (months of 30 days).
+/// Understands suffixes: `s` (seconds), `m` (minutes), `h` (hours), `d` (days),
+/// `w` (weeks), `M` (calendar month), `Q` (calendar quarter), `Y` (calendar year).
+/// Also accepts word suffixes: `mon`/`month`, `quarter`, `year`.
+///
+/// Calendar frames (`M`, `Q`, `Y`) use `date_trunc` for bucket alignment so that
+/// boundaries fall on the first of the month / quarter / year rather than on
+/// fixed 30-day epoch multiples.
 ///
 /// # Examples
 ///
@@ -23,7 +33,13 @@ pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 /// assert_eq!(frames.len(), 3);
 /// assert_eq!(frames[0].seconds, 60); // 1 minute
 /// assert_eq!(frames[1].seconds, 3600); // 1 hour
-/// assert_eq!(frames[2].seconds, 2592000); // 30 days
+/// assert_eq!(frames[2].seconds, 2592000); // approx 30 days (calendar-aligned)
+/// assert!(frames[2].calendar_field.is_some());
+///
+/// // Word aliases work too
+/// let frames2 = parse_frames("1h,1d,1mon");
+/// assert_eq!(frames2.len(), 3);
+/// assert!(frames2[2].calendar_field.is_some());
 ///
 /// // Invalid or zero cases are ignored
 /// let invalid = parse_frames("0s, -1m, abc");
@@ -32,31 +48,97 @@ pub const DEFAULT_FRAMES: &str = "1m,1d,1M";
 pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
     frames_str
         .split(',')
-        .map(|s| {
+        .filter_map(|s| {
             let s = s.trim();
-            let seconds = if let Some(stripped) = s.strip_suffix('s') {
-                stripped.parse::<i32>().unwrap_or(0)
+
+            // Calendar word suffixes (check before single-char suffixes)
+            if s.ends_with("month") || s.ends_with("mon") {
+                let n: i32 = s
+                    .trim_end_matches("month")
+                    .trim_end_matches("mon")
+                    .parse()
+                    .unwrap_or(0);
+                if n <= 0 {
+                    return None;
+                }
+                return Some(Frame {
+                    name: format!("{}mon", n),
+                    seconds: n * 2_592_000,
+                    calendar_field: Some("month".to_string()),
+                });
+            }
+            if s.ends_with("quarter") {
+                let n: i32 = s.trim_end_matches("quarter").parse().unwrap_or(0);
+                if n <= 0 {
+                    return None;
+                }
+                return Some(Frame {
+                    name: format!("{}quarter", n),
+                    seconds: n * 7_776_000,
+                    calendar_field: Some("quarter".to_string()),
+                });
+            }
+            if s.ends_with("year") || s.ends_with('Y') {
+                let n: i32 = s
+                    .trim_end_matches("year")
+                    .trim_end_matches('Y')
+                    .parse()
+                    .unwrap_or(0);
+                if n <= 0 {
+                    return None;
+                }
+                return Some(Frame {
+                    name: format!("{}year", n),
+                    seconds: n * 31_536_000,
+                    calendar_field: Some("year".to_string()),
+                });
+            }
+
+            // Single-char and numeric suffixes
+            let (seconds, name, cal) = if let Some(stripped) = s.strip_suffix('M') {
+                let n = stripped.parse::<i32>().unwrap_or(0);
+                (
+                    n * 2_592_000,
+                    format!("{}mon", n),
+                    Some("month".to_string()),
+                )
+            } else if let Some(stripped) = s.strip_suffix('Q') {
+                let n = stripped.parse::<i32>().unwrap_or(0);
+                (
+                    n * 7_776_000,
+                    format!("{}quarter", n),
+                    Some("quarter".to_string()),
+                )
+            } else if let Some(stripped) = s.strip_suffix('s') {
+                let n = stripped.parse::<i32>().unwrap_or(0);
+                (n, s.to_string(), None)
             } else if let Some(stripped) = s.strip_suffix('m') {
-                stripped.parse::<i32>().unwrap_or(0) * 60
+                let n = stripped.parse::<i32>().unwrap_or(0);
+                (n * 60, s.to_string(), None)
             } else if let Some(stripped) = s.strip_suffix('h') {
-                stripped.parse::<i32>().unwrap_or(0) * 3600
+                let n = stripped.parse::<i32>().unwrap_or(0);
+                (n * 3600, s.to_string(), None)
             } else if let Some(stripped) = s.strip_suffix('d') {
-                stripped.parse::<i32>().unwrap_or(0) * 86400
+                let n = stripped.parse::<i32>().unwrap_or(0);
+                (n * 86400, s.to_string(), None)
             } else if let Some(stripped) = s.strip_suffix('w') {
-                stripped.parse::<i32>().unwrap_or(0) * 604800
-            } else if let Some(stripped) = s.strip_suffix('M') {
-                stripped.parse::<i32>().unwrap_or(0) * 2592000 // 30 days
+                let n = stripped.parse::<i32>().unwrap_or(0);
+                (n * 604_800, s.to_string(), None)
             } else {
-                s.parse::<i32>().unwrap_or(0)
+                let n = s.parse::<i32>().unwrap_or(0);
+                (n, s.to_string(), None)
             };
-            let name = if let Some(stripped) = s.strip_suffix('M') {
-                format!("{}mon", stripped)
+
+            if seconds <= 0 {
+                None
             } else {
-                s.to_string()
-            };
-            Frame { name, seconds }
+                Some(Frame {
+                    name,
+                    seconds,
+                    calendar_field: cal,
+                })
+            }
         })
-        .filter(|f| f.seconds > 0)
         .collect()
 }
 
@@ -68,11 +150,23 @@ pub struct SourceDef {
     pub rollup_gsub_strategy: Option<String>,
 }
 
+/// Returns the `date_trunc` field for a frame given its size in seconds,
+/// or `None` for fixed-second frames that don't need calendar alignment.
+pub fn calendar_field_for_seconds(frame_seconds: i32) -> Option<&'static str> {
+    match frame_seconds {
+        2_592_000 => Some("month"),
+        7_776_000 => Some("quarter"),
+        31_536_000 => Some("year"),
+        _ => None,
+    }
+}
+
 pub fn derive_child_sql(
     child_name: &str,
     parent_name: &str,
     frame_seconds: i32,
     scope_columns: &[String],
+    calendar_field: Option<&str>,
 ) -> (String, Vec<SourceDef>) {
     Spi::connect(|client| {
         let exists_res = client.select(
@@ -116,11 +210,23 @@ pub fn derive_child_sql(
             } else { ("t".to_string(), Vec::new()) }
         } else { ("t".to_string(), Vec::new()) };
 
-        let mut select_cols = vec![format!(
-            "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision) as t",
-            anchor_col, frame_seconds
-        )];
-        let mut group_by = vec![format!("(spiral(\"{}\") / {1}) * {1}", anchor_col, frame_seconds)];
+        let (time_select, time_group) = if let Some(field) = calendar_field {
+            // Calendar-aligned tier: snap to month/quarter/year boundaries.
+            (
+                format!("date_trunc('{}', \"{}\") as t", field, anchor_col),
+                format!("date_trunc('{}', \"{}\")", field, anchor_col),
+            )
+        } else {
+            (
+                format!(
+                    "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision) as t",
+                    anchor_col, frame_seconds
+                ),
+                format!("(spiral(\"{}\") / {1}) * {1}", anchor_col, frame_seconds),
+            )
+        };
+        let mut select_cols = vec![time_select];
+        let mut group_by = vec![time_group];
         let mut sources = Vec::new();
 
         for s in scope_columns {
@@ -263,4 +369,65 @@ pub fn derive_child_sql(
     }).unwrap_or_else(|e| {
         error!("Spiral failed to derive child SQL for {}: {:?}", parent_name, e);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_frames_basic() {
+        let frames = parse_frames("1m,1h,1d");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].seconds, 60);
+        assert_eq!(frames[1].seconds, 3600);
+        assert_eq!(frames[2].seconds, 86400);
+        assert!(frames.iter().all(|f| f.calendar_field.is_none()));
+    }
+
+    #[test]
+    fn test_parse_frames_capital_m_month() {
+        let frames = parse_frames("1h,1d,1M");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].seconds, 2_592_000);
+        assert_eq!(frames[2].name, "1mon");
+        assert_eq!(frames[2].calendar_field.as_deref(), Some("month"));
+    }
+
+    #[test]
+    fn test_parse_frames_word_suffixes() {
+        let frames = parse_frames("1h,1d,1mon");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].seconds, 2_592_000);
+        assert_eq!(frames[2].calendar_field.as_deref(), Some("month"));
+
+        let frames2 = parse_frames("1h,1d,1month");
+        assert_eq!(frames2.len(), 3);
+        assert_eq!(frames2[2].calendar_field.as_deref(), Some("month"));
+    }
+
+    #[test]
+    fn test_parse_frames_quarter_and_year() {
+        let frames = parse_frames("1h,1Q,1Y");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[1].seconds, 7_776_000);
+        assert_eq!(frames[1].calendar_field.as_deref(), Some("quarter"));
+        assert_eq!(frames[2].seconds, 31_536_000);
+        assert_eq!(frames[2].calendar_field.as_deref(), Some("year"));
+    }
+
+    #[test]
+    fn test_parse_frames_invalid_ignored() {
+        let frames = parse_frames("0s,-1m,abc");
+        assert_eq!(frames.len(), 0);
+    }
+
+    #[test]
+    fn test_calendar_field_for_seconds() {
+        assert_eq!(calendar_field_for_seconds(2_592_000), Some("month"));
+        assert_eq!(calendar_field_for_seconds(7_776_000), Some("quarter"));
+        assert_eq!(calendar_field_for_seconds(31_536_000), Some("year"));
+        assert_eq!(calendar_field_for_seconds(3600), None);
+        assert_eq!(calendar_field_for_seconds(86400), None);
+    }
 }

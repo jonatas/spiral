@@ -296,8 +296,13 @@ fn refresh_incremental(
         .collect();
 
     if frame_seconds > 0 {
-        let (sql_child, _) =
-            rollup::derive_child_sql(view_name, &source_table, frame_seconds, &scope_cols_raw);
+        let (sql_child, _) = rollup::derive_child_sql(
+            view_name,
+            &source_table,
+            frame_seconds,
+            &scope_cols_raw,
+            rollup::calendar_field_for_seconds(frame_seconds),
+        );
         if sql_child.is_empty() {
             return false;
         }
@@ -496,8 +501,13 @@ fn spiral_register_view(
     } else {
         parent_view
     };
-    let (sql, sources) =
-        rollup::derive_child_sql(view_name, source_table, frame_seconds, &scope_columns);
+    let (sql, sources) = rollup::derive_child_sql(
+        view_name,
+        source_table,
+        frame_seconds,
+        &scope_columns,
+        rollup::calendar_field_for_seconds(frame_seconds),
+    );
 
     notice!("Spiral: derive_child_sql produced SQL: '{}'", sql);
 
@@ -739,6 +749,64 @@ mod tests {
                 cols
             );
         }
+    }
+
+    #[pg_test]
+    fn test_monthly_rollup_calendar_alignment() {
+        // Verify: 1M frame creates calendar-aligned month buckets (first-of-month),
+        // not fixed 30-day epoch buckets.
+        Spi::run("CREATE TABLE monthly_ticks (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('monthly_ticks', 'BASE', 0, 'monthly_ticks', '{}')").unwrap();
+        // Register the monthly rollup view (frame_seconds = 2592000 = 30 days)
+        Spi::run("SELECT spiral_register_view('monthly_ticks_1mon', 'monthly_ticks', 2592000, 'monthly_ticks', '{}')")
+            .unwrap();
+
+        // Use mid-month timestamps to avoid timezone-boundary ambiguity:
+        // date_trunc('month', t) uses the server TZ; timestamps near midnight UTC
+        // at month-start can appear in the prior month in negative-offset zones.
+        Spi::run(
+            "INSERT INTO monthly_ticks (t, val)
+             VALUES
+               ('2024-01-15 12:00:00+00'::timestamptz, 100),
+               ('2024-02-10 08:00:00+00'::timestamptz, 200),
+               ('2024-02-15 12:00:00+00'::timestamptz, 300),
+               ('2024-03-15 12:00:00+00'::timestamptz, 400)",
+        )
+        .unwrap();
+
+        Spi::run("SELECT spiral_refresh('monthly_ticks')").unwrap();
+
+        // Rollup should have exactly 3 rows (Jan, Feb, Mar)
+        let row_count: i64 = Spi::get_one("SELECT COUNT(*)::bigint FROM monthly_ticks_1mon")
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(row_count, 3, "expected 3 monthly buckets (Jan, Feb, Mar)");
+
+        // Each bucket t must be the first-of-month at the server's local timezone.
+        // Use date_trunc('month', ...) to produce the expected value regardless of TZ.
+        let jan_t: bool = Spi::get_one(
+            "SELECT EXISTS(
+               SELECT 1 FROM monthly_ticks_1mon
+               WHERE t = date_trunc('month', '2024-01-15 12:00:00+00'::timestamptz)
+             )",
+        )
+        .unwrap()
+        .unwrap_or(false);
+        assert!(jan_t, "January bucket must be at first-of-month boundary");
+
+        let feb_sum: Option<pgrx::AnyNumeric> = Spi::get_one(
+            "SELECT val FROM monthly_ticks_1mon
+             WHERE t = date_trunc('month', '2024-02-15 12:00:00+00'::timestamptz)",
+        )
+        .unwrap();
+        assert!(feb_sum.is_some(), "February bucket must exist");
+
+        let mar_sum: Option<pgrx::AnyNumeric> = Spi::get_one(
+            "SELECT val FROM monthly_ticks_1mon
+             WHERE t = date_trunc('month', '2024-03-15 12:00:00+00'::timestamptz)",
+        )
+        .unwrap();
+        assert!(mar_sum.is_some(), "March bucket must exist");
     }
 
     #[pg_test]
