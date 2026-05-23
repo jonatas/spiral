@@ -879,7 +879,7 @@ fn resolve_segments(
         .filter(|h| h.1 > 0)
         // Never use a rollup coarser than the query's grouping granularity —
         // that would collapse finer time buckets into a single coarse row.
-        .filter(|h| max_frame_secs.map_or(true, |max| h.1 as i64 <= max))
+        .filter(|h| max_frame_secs.is_none_or(|max| h.1 as i64 <= max))
         .collect();
     sorted_hierarchy.sort_by_key(|h| -h.1);
 
