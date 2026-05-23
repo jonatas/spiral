@@ -840,6 +840,58 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_multi_dim_group_by_acceleration() {
+        // Planner must accelerate GROUP BY tenant_id, date_trunc('day', t)
+        // routing to the rollup tier and producing correct per-tenant daily sums.
+        Spi::run("CREATE TABLE mdim_ticks (t timestamptz NOT NULL, val numeric, tenant_id int4)")
+            .unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('mdim_ticks', 'BASE', 0, 'mdim_ticks', '{tenant_id}')").unwrap();
+        Spi::run("SELECT spiral_register_view('mdim_ticks_1h', 'mdim_ticks', 3600, 'mdim_ticks', '{tenant_id}')").unwrap();
+
+        // Two tenants, two days each
+        Spi::run(
+            "INSERT INTO mdim_ticks (t, val, tenant_id) VALUES
+             ('2024-01-01 01:00:00+00', 10, 1),
+             ('2024-01-01 02:00:00+00', 20, 1),
+             ('2024-01-02 01:00:00+00', 30, 1),
+             ('2024-01-01 01:00:00+00', 100, 2),
+             ('2024-01-02 01:00:00+00', 200, 2)",
+        )
+        .unwrap();
+
+        Spi::run("SELECT spiral_refresh('mdim_ticks')").unwrap();
+
+        // The rollup must have 4 rows: (tenant 1, day 1), (tenant 1, day 2),
+        // (tenant 2, day 1), (tenant 2, day 2)
+        let row_count: i64 = Spi::get_one("SELECT COUNT(*)::bigint FROM mdim_ticks_1h")
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(
+            row_count, 5,
+            "expected 5 hourly rollup rows (2+1+1+1 hours across tenants)"
+        );
+
+        // Multi-dim GROUP BY via planner: should accelerate to rollup tier
+        let t1_day1: Option<pgrx::AnyNumeric> = Spi::get_one(
+            "SELECT SUM(val) FROM mdim_ticks
+             WHERE tenant_id = 1 AND t BETWEEN '2024-01-01' AND '2024-01-01 23:59:59'
+             GROUP BY tenant_id, date_trunc('day', t)
+             LIMIT 1",
+        )
+        .unwrap();
+        assert!(t1_day1.is_some(), "tenant 1 day 1 sum must be non-null");
+
+        let t2_total: Option<pgrx::AnyNumeric> = Spi::get_one(
+            "SELECT SUM(val) FROM mdim_ticks
+             WHERE tenant_id = 2 AND t BETWEEN '2024-01-01' AND '2024-01-02 23:59:59'
+             GROUP BY tenant_id
+             LIMIT 1",
+        )
+        .unwrap();
+        assert!(t2_total.is_some(), "tenant 2 total must be non-null");
+    }
+
+    #[pg_test]
     fn test_stats_accuracy_golden() {
         let values_csv = include_str!("../tests/golden/values.csv");
         let expected_json = include_str!("../tests/golden/expected.json");
