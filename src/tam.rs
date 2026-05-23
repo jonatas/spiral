@@ -24,16 +24,45 @@ pub unsafe fn spiral_tam_handler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::dat
     (*routine).scan_getnextslot = Some(spiral_scan_getnextslot);
     (*routine).scan_end = Some(spiral_scan_end);
     (*routine).scan_rescan = Some(spiral_scan_rescan);
+    (*routine).scan_set_tidrange = Some(spiral_scan_set_tidrange);
+    (*routine).scan_getnextslot_tidrange = Some(spiral_scan_getnextslot_tidrange);
+    (*routine).parallelscan_estimate = Some(spiral_parallelscan_estimate);
+    (*routine).parallelscan_initialize = Some(spiral_parallelscan_initialize);
+    (*routine).parallelscan_reinitialize = Some(spiral_parallelscan_reinitialize);
+    (*routine).index_fetch_begin = Some(spiral_index_fetch_begin);
+    (*routine).index_fetch_reset = Some(spiral_index_fetch_reset);
+    (*routine).index_fetch_end = Some(spiral_index_fetch_end);
+    (*routine).index_fetch_tuple = Some(spiral_index_fetch_tuple);
 
     (*routine).relation_size = Some(spiral_relation_size);
     (*routine).relation_estimate_size = Some(spiral_relation_estimate_size);
     (*routine).relation_set_new_filelocator = Some(spiral_relation_set_new_filelocator);
     (*routine).relation_nontransactional_truncate = Some(spiral_relation_nontransactional_truncate);
+    (*routine).relation_copy_data = Some(spiral_relation_copy_data);
     (*routine).relation_copy_for_cluster = Some(spiral_relation_copy_for_cluster);
+    (*routine).relation_vacuum = Some(spiral_relation_vacuum);
     (*routine).tuple_fetch_row_version = Some(spiral_tuple_fetch_row_version);
     (*routine).tuple_tid_valid = Some(spiral_tuple_tid_valid);
+    (*routine).tuple_get_latest_tid = Some(spiral_tuple_get_latest_tid);
     (*routine).tuple_satisfies_snapshot = Some(spiral_tuple_satisfies_snapshot);
+    (*routine).index_delete_tuples = Some(spiral_index_delete_tuples);
     (*routine).relation_needs_toast_table = Some(spiral_relation_needs_toast_table);
+    (*routine).relation_toast_am = Some(spiral_relation_toast_am);
+    (*routine).relation_fetch_toast_slice = Some(spiral_relation_fetch_toast_slice);
+    (*routine).tuple_insert_speculative = Some(spiral_tuple_insert_speculative);
+    (*routine).tuple_complete_speculative = Some(spiral_tuple_complete_speculative);
+    (*routine).multi_insert = Some(spiral_multi_insert);
+    (*routine).tuple_delete = Some(spiral_tuple_delete);
+    (*routine).tuple_update = Some(spiral_tuple_update);
+    (*routine).tuple_lock = Some(spiral_tuple_lock);
+    (*routine).finish_bulk_insert = Some(spiral_finish_bulk_insert);
+    (*routine).scan_analyze_next_block = Some(spiral_scan_analyze_next_block);
+    (*routine).scan_analyze_next_tuple = Some(spiral_scan_analyze_next_tuple);
+    (*routine).index_build_range_scan = Some(spiral_index_build_range_scan);
+    (*routine).index_validate_scan = Some(spiral_index_validate_scan);
+    (*routine).scan_bitmap_next_tuple = Some(spiral_scan_bitmap_next_tuple);
+    (*routine).scan_sample_next_block = Some(spiral_scan_sample_next_block);
+    (*routine).scan_sample_next_tuple = Some(spiral_scan_sample_next_tuple);
 
     pgrx::datum::Internal::from(Some(pg_sys::Datum::from(routine as usize)))
 }
@@ -81,6 +110,13 @@ pub unsafe extern "C-unwind" fn spiral_tuple_tid_valid(
 }
 
 #[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_get_latest_tid(
+    _scan: pg_sys::TableScanDesc,
+    _tid: pg_sys::ItemPointer,
+) {
+}
+
+#[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_satisfies_snapshot(
     _rel: pg_sys::Relation,
     _slot: *mut pg_sys::TupleTableSlot,
@@ -106,6 +142,13 @@ pub unsafe extern "C-unwind" fn spiral_relation_set_new_filelocator(
         }
         pg_sys::RelationCreateStorage(*_newrlocator, _persistence, true);
     }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_copy_data(
+    _rel: pg_sys::Relation,
+    _newrlocator: *const pg_sys::RelFileLocator,
+) {
 }
 
 #[pg_guard]
@@ -171,6 +214,169 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
     _cid: pg_sys::CommandId,
     _options: i32,
     _state: *mut pg_sys::BulkInsertStateData,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_insert_speculative(
+    rel: pg_sys::Relation,
+    slot: *mut pg_sys::TupleTableSlot,
+    cid: pg_sys::CommandId,
+    options: i32,
+    state: *mut pg_sys::BulkInsertStateData,
+    _spec_token: u32,
+) {
+    spiral_slot_insert(rel, slot, cid, options, state);
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_complete_speculative(
+    _rel: pg_sys::Relation,
+    _slot: *mut pg_sys::TupleTableSlot,
+    _spec_token: u32,
+    _succeeded: bool,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_multi_insert(
+    rel: pg_sys::Relation,
+    slots: *mut *mut pg_sys::TupleTableSlot,
+    nslots: i32,
+    cid: pg_sys::CommandId,
+    options: i32,
+    state: *mut pg_sys::BulkInsertStateData,
+) {
+    for idx in 0..nslots {
+        let slot = unsafe { *slots.add(idx as usize) };
+        spiral_slot_insert(rel, slot, cid, options, state);
+    }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_delete(
+    _rel: pg_sys::Relation,
+    _tid: pg_sys::ItemPointer,
+    _cid: pg_sys::CommandId,
+    _snapshot: pg_sys::Snapshot,
+    _crosscheck: pg_sys::Snapshot,
+    _wait: bool,
+    _tmfd: *mut pg_sys::TM_FailureData,
+    _changing_part: bool,
+) -> pg_sys::TM_Result::Type {
+    pg_sys::TM_Result::TM_Ok
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_update(
+    _rel: pg_sys::Relation,
+    _otid: pg_sys::ItemPointer,
+    _slot: *mut pg_sys::TupleTableSlot,
+    _cid: pg_sys::CommandId,
+    _snapshot: pg_sys::Snapshot,
+    _crosscheck: pg_sys::Snapshot,
+    _wait: bool,
+    _tmfd: *mut pg_sys::TM_FailureData,
+    _lockmode: *mut pg_sys::LockTupleMode::Type,
+    _update_indexes: *mut pg_sys::TU_UpdateIndexes::Type,
+) -> pg_sys::TM_Result::Type {
+    pg_sys::TM_Result::TM_Ok
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_tuple_lock(
+    _rel: pg_sys::Relation,
+    _tid: pg_sys::ItemPointer,
+    _snapshot: pg_sys::Snapshot,
+    _slot: *mut pg_sys::TupleTableSlot,
+    _cid: pg_sys::CommandId,
+    _mode: pg_sys::LockTupleMode::Type,
+    _wait_policy: pg_sys::LockWaitPolicy::Type,
+    _flags: u8,
+    _tmfd: *mut pg_sys::TM_FailureData,
+) -> pg_sys::TM_Result::Type {
+    pg_sys::TM_Result::TM_Ok
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_finish_bulk_insert(_rel: pg_sys::Relation, _options: i32) {}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_parallelscan_estimate(
+    _rel: pg_sys::Relation,
+) -> pg_sys::Size {
+    0
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_parallelscan_initialize(
+    _rel: pg_sys::Relation,
+    _pscan: pg_sys::ParallelTableScanDesc,
+) -> pg_sys::Size {
+    0
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_parallelscan_reinitialize(
+    _rel: pg_sys::Relation,
+    _pscan: pg_sys::ParallelTableScanDesc,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_index_fetch_begin(
+    _rel: pg_sys::Relation,
+) -> *mut pg_sys::IndexFetchTableData {
+    std::ptr::null_mut()
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_index_fetch_reset(_data: *mut pg_sys::IndexFetchTableData) {}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_index_fetch_end(_data: *mut pg_sys::IndexFetchTableData) {}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_index_fetch_tuple(
+    _scan: *mut pg_sys::IndexFetchTableData,
+    _tid: pg_sys::ItemPointer,
+    _snapshot: pg_sys::Snapshot,
+    _slot: *mut pg_sys::TupleTableSlot,
+    _call_again: *mut bool,
+    _all_dead: *mut bool,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_index_delete_tuples(
+    _rel: pg_sys::Relation,
+    _delstate: *mut pg_sys::TM_IndexDeleteOp,
+) -> pg_sys::TransactionId {
+    pg_sys::TransactionId::from(0)
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
+    _rel: pg_sys::Relation,
+    _params: *mut pg_sys::VacuumParams,
+    _bstrategy: pg_sys::BufferAccessStrategy,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_toast_am(_rel: pg_sys::Relation) -> pg_sys::Oid {
+    pg_sys::InvalidOid
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_relation_fetch_toast_slice(
+    _toastrel: pg_sys::Relation,
+    _valueid: pg_sys::Oid,
+    _attrsize: i32,
+    _sliceoffset: i32,
+    _slicelength: i32,
+    _result: *mut pg_sys::varlena,
 ) {
 }
 
@@ -344,6 +550,97 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
             state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
         }
     }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_scan_set_tidrange(
+    _scan: pg_sys::TableScanDesc,
+    _mintid: pg_sys::ItemPointer,
+    _maxtid: pg_sys::ItemPointer,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_scan_getnextslot_tidrange(
+    scan: pg_sys::TableScanDesc,
+    direction: pg_sys::ScanDirection::Type,
+    slot: *mut pg_sys::TupleTableSlot,
+) -> bool {
+    spiral_scan_getnextslot(scan, direction, slot)
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_block(
+    _scan: pg_sys::TableScanDesc,
+    _stream: *mut pg_sys::ReadStream,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
+    _scan: pg_sys::TableScanDesc,
+    _oldest_xmin: pg_sys::TransactionId,
+    _liverows: *mut f64,
+    _deadrows: *mut f64,
+    _slot: *mut pg_sys::TupleTableSlot,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_index_build_range_scan(
+    _table_rel: pg_sys::Relation,
+    _index_rel: pg_sys::Relation,
+    _index_info: *mut pg_sys::IndexInfo,
+    _allow_sync: bool,
+    _anyvisible: bool,
+    _progress: bool,
+    _start_blockno: pg_sys::BlockNumber,
+    _numblocks: pg_sys::BlockNumber,
+    _callback: pg_sys::IndexBuildCallback,
+    _callback_state: *mut std::ffi::c_void,
+    _scan: pg_sys::TableScanDesc,
+) -> f64 {
+    0.0
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_index_validate_scan(
+    _table_rel: pg_sys::Relation,
+    _index_rel: pg_sys::Relation,
+    _index_info: *mut pg_sys::IndexInfo,
+    _snapshot: pg_sys::Snapshot,
+    _state: *mut pg_sys::ValidateIndexState,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_scan_bitmap_next_tuple(
+    _scan: pg_sys::TableScanDesc,
+    _slot: *mut pg_sys::TupleTableSlot,
+    _recheck: *mut bool,
+    _lossy_pages: *mut u64,
+    _exact_pages: *mut u64,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_scan_sample_next_block(
+    _scan: pg_sys::TableScanDesc,
+    _scanstate: *mut pg_sys::SampleScanState,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn spiral_scan_sample_next_tuple(
+    _scan: pg_sys::TableScanDesc,
+    _scanstate: *mut pg_sys::SampleScanState,
+    _slot: *mut pg_sys::TupleTableSlot,
+) -> bool {
+    false
 }
 
 #[cfg(any(test, feature = "pg_test"))]

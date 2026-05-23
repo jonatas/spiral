@@ -441,9 +441,10 @@ unsafe fn build_time_constraints(
     // pg_timezone_names gives the correct signed offset in seconds for the current date.
     let tz_offset = Spi::get_one::<i64>(
         "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint \
-         FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1"
+         FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1",
     )
-    .unwrap_or(Some(0)).unwrap_or(0);
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
 
     if jointree.is_null() {
         return (constraints, tz_offset);
@@ -728,22 +729,32 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                              ORDER BY attnum",
                                             base_table.replace("\"", "\"\"")
                                         );
-                                        let base_table_columns: Vec<(String, String)> = Spi::connect(|client| {
-                                            Ok::<Vec<(String, String)>, spi::Error>(
-                                                client
-                                                    .select(&base_cols_query, None, &[])?
-                                                    .map(|r| {
-                                                        let name = r.get::<String>(1).unwrap().unwrap_or_default();
-                                                        let typ = r.get::<String>(2).unwrap().unwrap_or_default();
-                                                        (name, typ)
-                                                    })
-                                                    .collect(),
-                                            )
-                                        })
-                                        .unwrap_or_default();
+                                        let base_table_columns: Vec<(String, String)> =
+                                            Spi::connect(|client| {
+                                                Ok::<Vec<(String, String)>, spi::Error>(
+                                                    client
+                                                        .select(&base_cols_query, None, &[])?
+                                                        .map(|r| {
+                                                            let name = r
+                                                                .get::<String>(1)
+                                                                .unwrap()
+                                                                .unwrap_or_default();
+                                                            let typ = r
+                                                                .get::<String>(2)
+                                                                .unwrap()
+                                                                .unwrap_or_default();
+                                                            (name, typ)
+                                                        })
+                                                        .collect(),
+                                                )
+                                            })
+                                            .unwrap_or_default();
 
                                         // col_types: name -> original SQL type for casting
-                                        let mut col_types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                                        let mut col_types: std::collections::HashMap<
+                                            String,
+                                            String,
+                                        > = std::collections::HashMap::new();
                                         for (name, typ) in &base_table_columns {
                                             col_types.insert(name.clone(), typ.clone());
                                         }
@@ -1447,9 +1458,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
 /// In PG17+, GROUP BY targets are Vars pointing to an RTE_GROUP entry; this
 /// function dereferences through RTE_GROUP.groupexprs to find the actual FuncExpr.
 /// Returns `None` if no date_trunc is found or the field is unrecognised.
-pub(crate) unsafe fn extract_group_granularity_secs(
-    query: *mut pg_sys::Query,
-) -> Option<i64> {
+pub(crate) unsafe fn extract_group_granularity_secs(query: *mut pg_sys::Query) -> Option<i64> {
     let group_clause = (*query).groupClause;
     if group_clause.is_null() {
         return None;
@@ -1496,8 +1505,7 @@ pub(crate) unsafe fn extract_group_granularity_secs(
                     && varattno >= 1
                     && varattno <= (*(*rte).groupexprs).length as usize
                 {
-                    pg_sys::list_nth((*rte).groupexprs, (varattno - 1) as i32)
-                        as *mut pg_sys::Node
+                    pg_sys::list_nth((*rte).groupexprs, (varattno - 1) as i32) as *mut pg_sys::Node
                 } else {
                     tle_expr
                 }
@@ -1540,7 +1548,8 @@ pub(crate) unsafe fn extract_group_granularity_secs(
             Some("week") | Some("weeks") => 604800,
             Some("month") | Some("months") => 2_592_000,
             Some("quarter") | Some("quarters") => 7_776_000,
-            Some("year") | Some("years") | Some("decade") | Some("century") | Some("millennium") => i64::MAX / 2,
+            Some("year") | Some("years") | Some("decade") | Some("century")
+            | Some("millennium") => i64::MAX / 2,
             _ => continue,
         };
         return Some(secs);
@@ -1632,17 +1641,19 @@ fn construct_union_sql_hierarchical(
         let rollup_cols: std::collections::HashSet<String> = if is_rollup {
             Spi::connect(|client| {
                 Ok::<std::collections::HashSet<String>, spi::Error>(
-                    client.select(
-                        &format!(
-                            "SELECT attname::text FROM pg_attribute \
+                    client
+                        .select(
+                            &format!(
+                                "SELECT attname::text FROM pg_attribute \
                              WHERE attrelid = '\"{}\"'::regclass \
                              AND attnum > 0 AND NOT attisdropped",
-                            src.replace("\"", "\"\"")
-                        ),
-                        None, &[],
-                    )?
-                    .map(|r| r.get::<String>(1).unwrap().unwrap_or_default())
-                    .collect(),
+                                src.replace("\"", "\"\"")
+                            ),
+                            None,
+                            &[],
+                        )?
+                        .map(|r| r.get::<String>(1).unwrap().unwrap_or_default())
+                        .collect(),
                 )
             })
             .unwrap_or_default()
@@ -1670,15 +1681,23 @@ fn construct_union_sql_hierarchical(
                 }
                 let mapped = if is_rollup {
                     Spi::connect(|client| {
-                        client.select(&format!(
-                            "SELECT mat_column FROM spiral.sources \
+                        client
+                            .select(
+                                &format!(
+                                    "SELECT mat_column FROM spiral.sources \
                              WHERE view_name = '{}' AND base_column = '{}' AND formula = '{}' \
                              LIMIT 1",
-                            src.replace("'", "''"),
-                            col.replace("'", "''"),
-                            agg_fn.to_lowercase().replace("'", "''")
-                        ), None, &[])?.get_one::<String>()
-                    }).unwrap_or(None).unwrap_or_else(|| col.clone())
+                                    src.replace("'", "''"),
+                                    col.replace("'", "''"),
+                                    agg_fn.to_lowercase().replace("'", "''")
+                                ),
+                                None,
+                                &[],
+                            )?
+                            .get_one::<String>()
+                    })
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| col.clone())
                 } else {
                     col.clone()
                 };
@@ -1875,8 +1894,15 @@ pub fn spiral_explain(query_sql: &str) -> String {
                 if let (Some(ts), Some(te)) = (range.start, range.end) {
                     let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, None);
 
-                    let segments =
-                        resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset, None);
+                    let segments = resolve_segments(
+                        &base_table,
+                        ts,
+                        te,
+                        &hierarchy,
+                        &dirty_ranges,
+                        tz_offset,
+                        None,
+                    );
 
                     report.push_str(&format!(
                         "--- Spiral Slicing Plan for '{}' ---\n",
