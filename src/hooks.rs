@@ -1207,6 +1207,7 @@ pub fn generate_hierarchy_internal(
                 &current_parent,
                 frame.seconds,
                 &scope_columns,
+                frame.calendar_field.as_deref(),
             );
             for src in parent_sources {
                 if !seen_cols.insert(src.mat_column.clone()) {
