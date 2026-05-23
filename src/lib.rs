@@ -822,52 +822,50 @@ mod tests {
 
     #[pg_test]
     fn test_ivm_concurrent_write_safety() {
-        Spi::run(
-            "CREATE TABLE concurrent_ticks (
-                t timestamptz NOT NULL,
-                symbol_id int NOT NULL,
-                price numeric
-            ) WITH (spiral.frames = '1h', spiral.tenant = 'symbol_id')",
-        )
-        .unwrap();
+        // Use spiral_register_view (same pattern as test_spiral_validate_basic) to
+        // avoid triggering maybe_start_worker via the WITH (spiral.frames) DDL path.
+        Spi::run("CREATE TABLE cticks (t timestamptz NOT NULL, price numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('cticks', 'BASE', 0, 'cticks', '{}')").unwrap();
+        Spi::run("SELECT spiral_register_view('cticks_1h', 'cticks', 3600, 'cticks', '{}')")
+            .unwrap();
 
         Spi::run(
-            "INSERT INTO concurrent_ticks (t, symbol_id, price)
-             SELECT now() - interval '2 hours' + (i * interval '1 minute'), 1, 100.0
+            "INSERT INTO cticks (t, price)
+             SELECT now() - interval '2 hours' + (i * interval '1 minute'), 100.0
              FROM generate_series(0, 5) i",
         )
         .unwrap();
 
-        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+        Spi::run("SELECT spiral_refresh('cticks')").unwrap();
 
-        let initial: bool = Spi::get_one("SELECT COUNT(*) > 0 FROM concurrent_ticks_1h")
+        let initial: bool = Spi::get_one("SELECT COUNT(*) > 0 FROM cticks_1h")
             .unwrap()
             .unwrap_or(false);
         assert!(initial, "view should have rows after initial refresh");
 
         Spi::run(
-            "INSERT INTO concurrent_ticks (t, symbol_id, price)
-             VALUES (now() - interval '2 hours' + interval '10 minutes', 1, 999.0)",
+            "INSERT INTO cticks (t, price)
+             VALUES (now() - interval '2 hours' + interval '10 minutes', 999.0)",
         )
         .unwrap();
 
         let before: i64 = Spi::get_one(
-            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'concurrent_ticks'",
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'cticks'",
         )
         .unwrap()
         .unwrap_or(0);
         assert!(before > 0, "changelog should have entries before refresh");
 
-        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+        Spi::run("SELECT spiral_refresh('cticks')").unwrap();
 
         let after: i64 = Spi::get_one(
-            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'concurrent_ticks'",
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'cticks'",
         )
         .unwrap()
         .unwrap_or(-1);
         assert_eq!(after, 0, "changelog should be empty after refresh");
 
-        let high_price: bool = Spi::get_one("SELECT MAX(price) >= 999 FROM concurrent_ticks_1h")
+        let high_price: bool = Spi::get_one("SELECT MAX(price) >= 999 FROM cticks_1h")
             .unwrap()
             .unwrap_or(false);
         assert!(
@@ -877,20 +875,20 @@ mod tests {
 
         // Write B scenario: post-refresh insert must survive a second refresh.
         Spi::run(
-            "INSERT INTO concurrent_ticks (t, symbol_id, price)
-             VALUES (now() - interval '2 hours' + interval '20 minutes', 1, 111.0)",
+            "INSERT INTO cticks (t, price)
+             VALUES (now() - interval '2 hours' + interval '20 minutes', 111.0)",
         )
         .unwrap();
-        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+        Spi::run("SELECT spiral_refresh('cticks')").unwrap();
 
         Spi::run(
-            "INSERT INTO concurrent_ticks (t, symbol_id, price)
-             VALUES (now() - interval '2 hours' + interval '25 minutes', 1, 222.0)",
+            "INSERT INTO cticks (t, price)
+             VALUES (now() - interval '2 hours' + interval '25 minutes', 222.0)",
         )
         .unwrap();
 
         let pending: i64 = Spi::get_one(
-            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'concurrent_ticks'",
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'cticks'",
         )
         .unwrap()
         .unwrap_or(0);
@@ -899,9 +897,9 @@ mod tests {
             "write B should be pending in changelog before second refresh"
         );
 
-        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+        Spi::run("SELECT spiral_refresh('cticks')").unwrap();
 
-        let write_b: bool = Spi::get_one("SELECT MAX(price) >= 222 FROM concurrent_ticks_1h")
+        let write_b: bool = Spi::get_one("SELECT MAX(price) >= 222 FROM cticks_1h")
             .unwrap()
             .unwrap_or(false);
         assert!(
