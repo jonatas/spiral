@@ -161,20 +161,12 @@ pub unsafe extern "C-unwind" fn spiral_slot_callbacks(
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_relation_size(
     rel: pg_sys::Relation,
-    _fork_number: pg_sys::ForkNumber::Type,
+    fork_number: pg_sys::ForkNumber::Type,
 ) -> u64 {
     if rel.is_null() {
         return 0;
     }
-    unsafe {
-        pg_sys::RelationGetSmgr(rel);
-        if (*rel).rd_smgr.is_null() {
-            return 0;
-        }
-        let nblocks =
-            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
-        (nblocks as u64) * pg_sys::BLCKSZ as u64
-    }
+    pg_sys::table_block_relation_size(rel, fork_number)
 }
 
 #[pg_guard]
@@ -188,23 +180,15 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
     if rel.is_null() {
         return;
     }
-    unsafe {
-        pg_sys::RelationGetSmgr(rel);
-        if (*rel).rd_smgr.is_null() {
-            return;
-        }
-        let nblocks =
-            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
-        if !pages.is_null() {
-            *pages = nblocks;
-        }
-        if !tuples.is_null() {
-            *tuples = (nblocks as f64) * (crate::storage::DATA_PER_PAGE as f64);
-        }
-        if !allvisfrac.is_null() {
-            *allvisfrac = 1.0;
-        }
-    }
+    pg_sys::table_block_relation_estimate_size(
+        rel,
+        std::ptr::null_mut(),
+        pages,
+        tuples,
+        allvisfrac,
+        0,
+        (crate::storage::DATA_PER_PAGE * std::mem::size_of::<f64>()) as pg_sys::Size,
+    );
 }
 
 #[pg_guard]
@@ -423,7 +407,6 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     let relname_ptr = pg_sys::get_rel_name(oid);
     if !relname_ptr.is_null() {
         let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
-        pg_sys::pfree(relname_ptr as *mut std::ffi::c_void);
         if let Some(m) = crate::catalog::get_metadata(&name) {
             tenant_scale = crate::catalog::get_tenant_scale(&m);
         }
@@ -477,6 +460,13 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
         pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
 
         let page = pg_sys::BufferGetPage(buffer);
+        if !crate::storage::is_valid_spiral_page(page) {
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+            pg_sys::ReleaseBuffer(buffer);
+            state.current_blkno += 1;
+            state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+            continue;
+        }
         let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
 
         while state.current_offset_in_page + 8 <= upper_bound {

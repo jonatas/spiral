@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn test_planner_rejects_grouped_sum_target_lists_for_now() {
+    fn test_planner_supports_grouped_sum_target_lists() {
         Spi::run(
             "CREATE TABLE planner_grouped (t timestamptz, tenant_id int, val double precision)",
         )
@@ -704,7 +704,10 @@ mod tests {
 
             let cols =
                 hooks::extract_supported_query_columns(query, (*query).rtable, "planner_grouped");
-            assert!(cols.is_none());
+            assert_eq!(
+                cols,
+                Some(vec![("val".to_string(), Some("sum".to_string()))])
+            );
         }
     }
 

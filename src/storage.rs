@@ -16,6 +16,7 @@ macro_rules! maxalign {
 pub const HEADER_SIZE: usize = maxalign!(std::mem::size_of::<pg_sys::PageHeaderData>());
 pub const SPECIAL_SIZE: usize = maxalign!(std::mem::size_of::<SpiralPageOpaque>());
 pub const DATA_PER_PAGE: usize = (BLCKSZ - HEADER_SIZE - SPECIAL_SIZE) / 8;
+pub const SPIRAL_PAGE_MAGIC: u32 = 0x5049_5241;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -30,6 +31,29 @@ pub struct SpiralPageOpaque {
     pub window_end_t: i64,
     pub tenant_scale: i32,
     pub magic: u32, // use 0x50495241 ('SPRA')
+}
+
+pub unsafe fn page_special_ptr(page: pg_sys::Page) -> *mut SpiralPageOpaque {
+    (page as *mut u8).add(BLCKSZ - SPECIAL_SIZE) as *mut SpiralPageOpaque
+}
+
+pub unsafe fn initialize_spiral_page(page: pg_sys::Page, tenant_scale: i32) {
+    pg_sys::PageInit(page, BLCKSZ as pg_sys::Size, SPECIAL_SIZE as pg_sys::Size);
+    let opaque = page_special_ptr(page);
+    (*opaque).window_start_t = 0;
+    (*opaque).window_end_t = 0;
+    (*opaque).tenant_scale = tenant_scale;
+    (*opaque).magic = SPIRAL_PAGE_MAGIC;
+}
+
+pub unsafe fn is_valid_spiral_page(page: pg_sys::Page) -> bool {
+    let header = page as *const pg_sys::PageHeaderData;
+    if (*header).pd_special as usize != BLCKSZ - SPECIAL_SIZE {
+        return false;
+    }
+
+    let opaque = page_special_ptr(page);
+    (*opaque).magic == SPIRAL_PAGE_MAGIC
 }
 
 pub fn logical_to_physical_offset(logical_offset: i64) -> (u32, u32) {
@@ -47,7 +71,7 @@ unsafe fn get_block_count(rel: pg_sys::Relation) -> u32 {
     if (*rel).rd_smgr.is_null() {
         return 0;
     }
-    pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+    pg_sys::smgrnblocks((*rel).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM)
 }
 
 fn get_tenant_scale_for_oid(rel_oid: i32) -> i64 {
@@ -57,7 +81,6 @@ fn get_tenant_scale_for_oid(rel_oid: i32) -> i64 {
             let name = std::ffi::CStr::from_ptr(relname_ptr)
                 .to_string_lossy()
                 .into_owned();
-            pg_sys::pfree(relname_ptr as *mut std::ffi::c_void);
             if let Some(m) = crate::catalog::get_metadata(&name) {
                 return crate::catalog::get_tenant_scale(&m);
             }
@@ -115,11 +138,7 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
                 let page = pg_sys::BufferGetPage(buffer);
-                pg_sys::PageInit(
-                    page,
-                    BLCKSZ as pg_sys::Size,
-                    std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size,
-                );
+                initialize_spiral_page(page, tenant_scale as i32);
                 pg_sys::MarkBufferDirty(buffer);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                 pg_sys::ReleaseBuffer(buffer);
@@ -184,11 +203,7 @@ pub fn spiral_pack_delta_compact(delta_table_name: &str, main_rel_oid: i32) {
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
                     let page = pg_sys::BufferGetPage(buffer);
 
-                    pg_sys::PageInit(
-                        page,
-                        BLCKSZ as pg_sys::Size,
-                        std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size,
-                    );
+                    initialize_spiral_page(page, tenant_scale as i32);
 
                     pg_sys::MarkBufferDirty(buffer);
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
@@ -276,11 +291,7 @@ pub fn spiral_pack_delta_blocks(delta_table_name: &str, main_rel_oid: i32) {
                     let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
                     let page = pg_sys::BufferGetPage(buffer);
-                    pg_sys::PageInit(
-                        page,
-                        BLCKSZ as pg_sys::Size,
-                        std::mem::size_of::<SpiralPageOpaque>() as pg_sys::Size,
-                    );
+                    initialize_spiral_page(page, tenant_scale as i32);
                     pg_sys::MarkBufferDirty(buffer);
                     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                     pg_sys::ReleaseBuffer(buffer);
