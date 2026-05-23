@@ -9,6 +9,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
     let db_oid_val = pg_sys::Oid::from_datum(arg, false).expect("Invalid DB OID");
 
     BackgroundWorker::connect_worker_to_spi_by_oid(Some(db_oid_val), None);
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
     let max_workers = crate::WORKER_MAX.get();
 
@@ -57,6 +58,17 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                 }
 
                 let debug_logging = crate::WORKER_DEBUG.get();
+
+                let table_exists = !client
+                    .select(
+                        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1",
+                        Some(1),
+                        &[],
+                    )?
+                    .is_empty();
+                if !table_exists {
+                    return Ok::<(), spi::Error>(());
+                }
 
                 // Find all root materialized views (parent_view = 'BASE')
                 let tuple_table = client.select(
