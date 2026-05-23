@@ -436,8 +436,14 @@ unsafe fn build_time_constraints(
         std::collections::HashMap::new();
     let mut equalities: Vec<(i32, i32)> = Vec::new();
 
-    let tz_offset = Spi::get_one::<f64>("SELECT EXTRACT(EPOCH FROM (now() AT TIME ZONE current_setting('TimeZone'))) - EXTRACT(EPOCH FROM (now() AT TIME ZONE 'UTC'))")
-        .unwrap_or(Some(0.0)).unwrap_or(0.0) as i64;
+    // Use pg_timezone_names to get the UTC offset for the current session timezone.
+    // The AT TIME ZONE + now() formula returns 0 inside the planner hook context;
+    // pg_timezone_names gives the correct signed offset in seconds for the current date.
+    let tz_offset = Spi::get_one::<i64>(
+        "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint \
+         FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1"
+    )
+    .unwrap_or(Some(0)).unwrap_or(0);
 
     if jointree.is_null() {
         return (constraints, tz_offset);
@@ -518,9 +524,12 @@ unsafe fn build_time_constraints(
                                     i64::from_datum((*con).constvalue, (*con).constisnull).unwrap(),
                                 ),
                                 pg_sys::TIMESTAMPTZOID => {
+                                    // PG stores timestamptz as microseconds since 2000-01-01.
+                                    // Convert to Unix epoch seconds by dividing and adding the
+                                    // PG→Unix offset so segment boundaries match spiral(t) values.
                                     let ts = i64::from_datum((*con).constvalue, (*con).constisnull)
                                         .unwrap();
-                                    Some(ts / 1000000)
+                                    Some(ts / 1_000_000 + crate::POSTGRES_EPOCH_JDATE)
                                 }
                                 _ => None,
                             };
@@ -703,28 +712,50 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         ) else {
                                             continue;
                                         };
+                                        // Build cols from ALL base table columns to match original
+                                        // table's column positions (Var.varattno references).
+                                        // Aggregate columns get their agg function; others get None.
+                                        // construct_union_sql_hierarchical NULL-fills columns that
+                                        // don't exist in the rollup tier.
                                         let mut cols = Vec::new();
-                                        let base_cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum", base_table.replace("\"", "\"\""));
-                                        let base_table_columns = Spi::connect(|client| {
-                                            Ok::<Vec<String>, spi::Error>(
+                                        let base_cols_query = format!(
+                                            "SELECT attname::text, atttypid::regtype::text \
+                                             FROM pg_attribute \
+                                             WHERE attrelid = '\"{}\"'::regclass \
+                                             AND attnum > 0 AND NOT attisdropped \
+                                             ORDER BY attnum",
+                                            base_table.replace("\"", "\"\"")
+                                        );
+                                        let base_table_columns: Vec<(String, String)> = Spi::connect(|client| {
+                                            Ok::<Vec<(String, String)>, spi::Error>(
                                                 client
                                                     .select(&base_cols_query, None, &[])?
-                                                    .map(|r| r.get::<String>(1).unwrap().unwrap())
+                                                    .map(|r| {
+                                                        let name = r.get::<String>(1).unwrap().unwrap_or_default();
+                                                        let typ = r.get::<String>(2).unwrap().unwrap_or_default();
+                                                        (name, typ)
+                                                    })
                                                     .collect(),
                                             )
                                         })
                                         .unwrap_or_default();
 
-                                        for c in base_table_columns {
+                                        // col_types: name -> original SQL type for casting
+                                        let mut col_types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                                        for (name, typ) in &base_table_columns {
+                                            col_types.insert(name.clone(), typ.clone());
+                                        }
+
+                                        for (c, _typ) in &base_table_columns {
                                             if c == "t" {
                                                 continue;
                                             }
                                             if let Some((_, agg)) =
-                                                query_cols.iter().find(|(name, _)| name == &c)
+                                                query_cols.iter().find(|(name, _)| name == c)
                                             {
-                                                cols.push((c, agg.clone()));
+                                                cols.push((c.clone(), agg.clone()));
                                             } else {
-                                                cols.push((c, None));
+                                                cols.push((c.clone(), None));
                                             }
                                         }
 
@@ -733,6 +764,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                             &segments,
                                             &cols,
                                             &offset_cols,
+                                            &col_types,
                                         );
                                         let new_query = parse_sql_to_query(&union_sql);
                                         if !new_query.is_null() {
@@ -1316,6 +1348,12 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 let var = node as *mut pg_sys::Var;
                 let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
+                    // PG 17+ adds an RTE_GROUP entry for GROUP BY expressions.
+                    // Vars pointing to RTE_GROUP (varno != 1 and relid == InvalidOid)
+                    // represent grouped output columns — passthrough, same as T_FuncExpr.
+                    if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_GROUP {
+                        continue;
+                    }
                     return None;
                 }
 
@@ -1451,6 +1489,7 @@ fn construct_union_sql_hierarchical(
     segments: &[Segment],
     cols: &[(String, Option<String>)],
     offset_cols: &[catalog::OffsetColumn],
+    col_types: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut sources: Vec<String> = segments.iter().map(|s| s.source.clone()).collect();
     sources.sort();
@@ -1471,19 +1510,58 @@ fn construct_union_sql_hierarchical(
         .collect();
     sources_with_seconds.sort_by_key(|s| -s.1);
 
-    let mut cte_parts = Vec::new();
-    let mut tier_names = Vec::new();
+    let mut select_parts = Vec::new();
 
-    for (src, secs) in sources_with_seconds {
+    for (src, _secs) in sources_with_seconds {
         let is_rollup = src != base_table;
+
+        // For rollup tiers, fetch columns that actually exist to NULL-fill missing ones.
+        // This preserves column positions (Var.varattno alignment) in the subquery.
+        let rollup_cols: std::collections::HashSet<String> = if is_rollup {
+            Spi::connect(|client| {
+                Ok::<std::collections::HashSet<String>, spi::Error>(
+                    client.select(
+                        &format!(
+                            "SELECT attname::text FROM pg_attribute \
+                             WHERE attrelid = '\"{}\"'::regclass \
+                             AND attnum > 0 AND NOT attisdropped",
+                            src.replace("\"", "\"\"")
+                        ),
+                        None, &[],
+                    )?
+                    .map(|r| r.get::<String>(1).unwrap().unwrap_or_default())
+                    .collect(),
+                )
+            })
+            .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         let mut inner_select = Vec::new();
-        inner_select.push("t".to_string());
+        // t is always first; cast to timestamptz to match original table type
+        inner_select.push("t::timestamptz".to_string());
 
         for (col, agg) in cols {
+            let orig_type = col_types.get(col).map(|s| s.as_str()).unwrap_or("");
+
             if let Some(agg_fn) = agg {
+                if is_rollup && !rollup_cols.contains(col.as_str()) {
+                    // NULL-fill with original type cast so Var nodes resolve correctly
+                    let null_expr = if orig_type.is_empty() {
+                        format!("NULL AS \"{}\"", col)
+                    } else {
+                        format!("NULL::{} AS \"{}\"", orig_type, col)
+                    };
+                    inner_select.push(null_expr);
+                    continue;
+                }
                 let mapped = if is_rollup {
                     Spi::connect(|client| {
-                        client.select(&format!("SELECT mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' AND formula = '{}' LIMIT 1",
+                        client.select(&format!(
+                            "SELECT mat_column FROM spiral.sources \
+                             WHERE view_name = '{}' AND base_column = '{}' AND formula = '{}' \
+                             LIMIT 1",
                             src.replace("'", "''"),
                             col.replace("'", "''"),
                             agg_fn.to_lowercase().replace("'", "''")
@@ -1493,23 +1571,38 @@ fn construct_union_sql_hierarchical(
                     col.clone()
                 };
 
-                let col_sql = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
+                let col_expr = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
                     reconstruction_expr(&mapped, &oc.formula, is_rollup)
                 } else {
                     map_agg_inner(agg_fn, &mapped, is_rollup)
                 };
 
-                inner_select.push(format!("{} as \"{}\"", col_sql, col));
+                // Cast to original type so outer Var nodes resolve without mismatch
+                let col_sql = if is_rollup && !orig_type.is_empty() {
+                    format!("({})::{}  AS \"{}\"", col_expr, orig_type, col)
+                } else {
+                    format!("{} AS \"{}\"", col_expr, col)
+                };
+                inner_select.push(col_sql);
             } else {
-                if col != "t" {
-                    let col_sql =
-                        if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
-                            reconstruction_expr(col, &oc.formula, is_rollup)
-                        } else {
-                            format!("\"{}\"", col)
-                        };
-                    inner_select.push(col_sql);
+                if col == "t" {
+                    continue;
                 }
+                let col_sql = if is_rollup && !rollup_cols.contains(col.as_str()) {
+                    // NULL-fill with typed cast
+                    if orig_type.is_empty() {
+                        format!("NULL AS \"{}\"", col)
+                    } else {
+                        format!("NULL::{} AS \"{}\"", orig_type, col)
+                    }
+                } else if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
+                    reconstruction_expr(col, &oc.formula, is_rollup)
+                } else if is_rollup && !orig_type.is_empty() {
+                    format!("\"{}\"::{} AS \"{}\"", col, orig_type, col)
+                } else {
+                    format!("\"{}\"", col)
+                };
+                inner_select.push(col_sql);
             }
         }
 
@@ -1533,26 +1626,16 @@ fn construct_union_sql_hierarchical(
                 .map(|(col, _)| format!("\"{}\"", col))
                 .collect::<Vec<_>>();
             if group_by.is_empty() {
-                "".to_string()
+                String::new()
             } else {
                 format!(" GROUP BY {}", group_by.join(", "))
             }
         } else {
-            "".to_string()
+            String::new()
         };
 
-        let tier_name = match secs {
-            86400 => "daily_tier".to_string(),
-            3600 => "hourly_tier".to_string(),
-            60 => "minutely_tier".to_string(),
-            0 => "raw_tier".to_string(),
-            _ => format!("rollup_{}_tier", secs),
-        };
-        tier_names.push(tier_name.clone());
-
-        cte_parts.push(format!(
-            "{} AS (SELECT {} FROM {} WHERE t <@ {} {})",
-            tier_name,
+        select_parts.push(format!(
+            "SELECT {} FROM {} WHERE t <@ {}{}",
             inner_select.join(", "),
             src,
             multirange_lit,
@@ -1560,17 +1643,13 @@ fn construct_union_sql_hierarchical(
         ));
     }
 
-    let mut sql = String::from("WITH ");
-    sql.push_str(&cte_parts.join(", "));
-    sql.push(' ');
+    if select_parts.is_empty() {
+        return String::new();
+    }
 
-    let union_selects: Vec<String> = tier_names
-        .iter()
-        .map(|n| format!("SELECT * FROM {}", n))
-        .collect();
-    sql.push_str(&union_selects.join(" UNION ALL "));
-    sql.push_str(" ORDER BY t");
-    sql
+    // Plain UNION ALL — no CTE, no ORDER BY. CTEs cause One-Time Filter: false
+    // when used as subquery RTEs due to Var node type resolution issues.
+    select_parts.join(" UNION ALL ")
 }
 
 pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
