@@ -1495,7 +1495,7 @@ pub(crate) unsafe fn extract_group_granularity_secs(query: *mut pg_sys::Query) -
             && !rtable.is_null()
         {
             let var = tle_expr as *mut pg_sys::Var;
-            let varno = (*var).varno as i32;
+            let varno = (*var).varno;
             let varattno = (*var).varattno as usize;
             if varno >= 1 && varno <= (*rtable).length {
                 let rte = pg_sys::list_nth(rtable, varno - 1) as *mut pg_sys::RangeTblEntry;

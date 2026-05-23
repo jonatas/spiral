@@ -33,10 +33,14 @@ pub struct SpiralPageOpaque {
     pub magic: u32, // use 0x50495241 ('SPRA')
 }
 
+/// # Safety
+/// `page` must point to a valid PostgreSQL page buffer with at least `BLCKSZ` bytes.
 pub unsafe fn page_special_ptr(page: pg_sys::Page) -> *mut SpiralPageOpaque {
     (page as *mut u8).add(BLCKSZ - SPECIAL_SIZE) as *mut SpiralPageOpaque
 }
 
+/// # Safety
+/// `page` must be an exclusive-locked writable PostgreSQL page buffer for this relation.
 pub unsafe fn initialize_spiral_page(page: pg_sys::Page, tenant_scale: i32) {
     pg_sys::PageInit(page, BLCKSZ as pg_sys::Size, SPECIAL_SIZE as pg_sys::Size);
     let opaque = page_special_ptr(page);
@@ -46,6 +50,8 @@ pub unsafe fn initialize_spiral_page(page: pg_sys::Page, tenant_scale: i32) {
     (*opaque).magic = SPIRAL_PAGE_MAGIC;
 }
 
+/// # Safety
+/// `page` must point to a readable PostgreSQL page buffer with at least `BLCKSZ` bytes.
 pub unsafe fn is_valid_spiral_page(page: pg_sys::Page) -> bool {
     let header = page as *const pg_sys::PageHeaderData;
     if (*header).pd_special as usize != BLCKSZ - SPECIAL_SIZE {
