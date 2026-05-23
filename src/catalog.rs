@@ -144,7 +144,9 @@ pub fn unify_changelog(base_view: &str) {
          ) s2
          GROUP BY base_view, scope_values, grp");
     // Only delete the rows we snapshotted; concurrent inserts survive.
-    let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM changelog_snapshot)");
+    let _ = Spi::run(
+        "DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM changelog_snapshot)",
+    );
     let _ = Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified");
     let _ = Spi::run("DROP TABLE changelog_snapshot");
     let _ = Spi::run("DROP TABLE temp_unified");
