@@ -9,6 +9,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
     let db_oid_val = pg_sys::Oid::from_datum(arg, false).expect("Invalid DB OID");
 
     BackgroundWorker::connect_worker_to_spi_by_oid(Some(db_oid_val), None);
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
     let max_workers = crate::WORKER_MAX.get();
 
