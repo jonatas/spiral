@@ -1039,6 +1039,75 @@ mod tests {
             "rollup row count must be unchanged by no-op refresh"
         );
     }
+
+    #[pg_test]
+    fn test_partial_refresh_by_scope() {
+        // spiral_refresh with a WHERE clause scoped to one tenant must only
+        // process changelog entries for that tenant and leave others untouched.
+        Spi::run("CREATE TABLE scope_ticks (t timestamptz NOT NULL, val numeric, tenant_id int4)")
+            .unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('scope_ticks', 'BASE', 0, 'scope_ticks', '{tenant_id}')").unwrap();
+        Spi::run("SELECT spiral_register_view('scope_ticks_1h', 'scope_ticks', 3600, 'scope_ticks', '{tenant_id}')").unwrap();
+
+        // Insert data for two tenants
+        Spi::run(
+            "INSERT INTO scope_ticks (t, val, tenant_id)
+             SELECT now() - interval '2 hours' + (i * interval '10 minutes'), i * 10.0, 1
+             FROM generate_series(0, 5) i",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO scope_ticks (t, val, tenant_id)
+             SELECT now() - interval '2 hours' + (i * interval '10 minutes'), i * 20.0, 2
+             FROM generate_series(0, 5) i",
+        )
+        .unwrap();
+
+        // Verify both tenants produced changelog entries (via trigger)
+        let total_entries: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'scope_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert!(
+            total_entries >= 2,
+            "both tenants should have changelog entries"
+        );
+
+        // Partial refresh for tenant 1 only
+        Spi::run("SELECT spiral_refresh('scope_ticks', 'tenant_id = 1')").unwrap();
+
+        // Tenant 2 entries must remain in changelog
+        let remaining: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'scope_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert!(
+            remaining > 0,
+            "tenant 2 changelog entries must survive partial refresh of tenant 1"
+        );
+
+        // Tenant 1 rollup data must be present
+        let t1_rows: i64 =
+            Spi::get_one("SELECT COUNT(*)::bigint FROM scope_ticks_1h WHERE tenant_id = 1")
+                .unwrap()
+                .unwrap_or(0);
+        assert!(
+            t1_rows > 0,
+            "rollup must have rows for tenant 1 after partial refresh"
+        );
+
+        // Tenant 2 rollup must be empty (not yet refreshed)
+        let t2_rows: i64 =
+            Spi::get_one("SELECT COUNT(*)::bigint FROM scope_ticks_1h WHERE tenant_id = 2")
+                .unwrap()
+                .unwrap_or(-1);
+        assert_eq!(
+            t2_rows, 0,
+            "tenant 2 must not appear in rollup before its own refresh"
+        );
+    }
 }
 
 #[cfg(test)]
