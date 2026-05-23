@@ -329,7 +329,10 @@ mod tests {
     fn test_integer_scope_type_in_changelog() {
         // Regression test for issue #8: track_changes_stmt must store integer scope
         // columns as JSON numbers, not strings, so get_dirty_ranges can match them.
-        Spi::run("CREATE TABLE scope_test (t timestamptz NOT NULL, user_id int NOT NULL, val float)").unwrap();
+        Spi::run(
+            "CREATE TABLE scope_test (t timestamptz NOT NULL, user_id int NOT NULL, val float)",
+        )
+        .unwrap();
         Spi::run("SELECT spiral_register_view('scope_test_1m', 'scope_test', 60, 'scope_test', ARRAY['user_id'])").unwrap();
 
         Spi::run("INSERT INTO scope_test VALUES ('2026-01-01 00:00:30Z', 5, 1.0)").unwrap();
@@ -338,8 +341,11 @@ mod tests {
         let json_type: Option<String> = Spi::get_one(
             "SELECT jsonb_typeof(scope_values->'user_id') FROM spiral.changelog WHERE base_view = 'scope_test' LIMIT 1"
         ).unwrap();
-        assert_eq!(json_type.as_deref(), Some("number"),
-            "scope_values must store integer columns as JSON numbers, not strings");
+        assert_eq!(
+            json_type.as_deref(),
+            Some("number"),
+            "scope_values must store integer columns as JSON numbers, not strings"
+        );
 
         // Verify the stored value equals the number 5, not the string "5".
         let matches_number: Option<bool> = Spi::get_one(
@@ -350,7 +356,10 @@ mod tests {
         let matches_string: Option<bool> = Spi::get_one(
             "SELECT scope_values = '{\"user_id\": \"5\"}'::jsonb FROM spiral.changelog WHERE base_view = 'scope_test' LIMIT 1"
         ).unwrap();
-        assert_eq!(matches_string, Some(false),
-            "scope_values must not encode integer columns as JSON strings");
+        assert_eq!(
+            matches_string,
+            Some(false),
+            "scope_values must not encode integer columns as JSON strings"
+        );
     }
 }
