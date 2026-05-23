@@ -58,6 +58,17 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
 
                 let debug_logging = crate::WORKER_DEBUG.get();
 
+                let table_exists = !client
+                    .select(
+                        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1",
+                        Some(1),
+                        &[],
+                    )?
+                    .is_empty();
+                if !table_exists {
+                    return Ok::<(), spi::Error>(());
+                }
+
                 // Find all root materialized views (parent_view = 'BASE')
                 let tuple_table = client.select(
                     "SELECT view_name FROM spiral.metadata WHERE parent_view = 'BASE'",
