@@ -772,12 +772,34 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                             }
                                         }
 
+                                        // Ordered (col, val_str) pairs for z-order bound injection.
+                                        let scope_vals: Vec<(String, String)> = metadata_obj
+                                            .as_ref()
+                                            .map(|m| {
+                                                m.scope_columns
+                                                    .iter()
+                                                    .filter_map(|col| {
+                                                        qc.scopes.get(col).and_then(|v| match v {
+                                                            serde_json::Value::Number(n) => {
+                                                                Some((col.clone(), n.to_string()))
+                                                            }
+                                                            serde_json::Value::String(s) => {
+                                                                Some((col.clone(), s.clone()))
+                                                            }
+                                                            _ => None,
+                                                        })
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+
                                         let union_sql = construct_union_sql_hierarchical(
                                             &base_table,
                                             &segments,
                                             &cols,
                                             &offset_cols,
                                             &col_types,
+                                            &scope_vals,
                                         );
                                         let new_query = parse_sql_to_query(&union_sql);
                                         if !new_query.is_null() {
@@ -1606,12 +1628,17 @@ fn reconstruction_expr(col: &str, formula: &str, is_rollup: bool) -> String {
     }
 }
 
+/// Ordered (column, value-as-string) pairs for the current tenant scope filter.
+/// Used to inject z-order BETWEEN predicates into rollup-tier sub-SELECTs so the
+/// planner can use the `idx_z_*` index without the caller needing to know about
+/// z-order internals.
 fn construct_union_sql_hierarchical(
     base_table: &str,
     segments: &[Segment],
     cols: &[(String, Option<String>)],
     offset_cols: &[catalog::OffsetColumn],
     col_types: &std::collections::HashMap<String, String>,
+    scope_vals: &[(String, String)],
 ) -> String {
     let mut sources: Vec<String> = segments.iter().map(|s| s.source.clone()).collect();
     sources.sort();
@@ -1755,11 +1782,37 @@ fn construct_union_sql_hierarchical(
 
         let multirange_lit = format!("'{{ {} }}'::tstzmultirange", range_strs.join(", "));
 
+        // For rollup tiers with a tenant scope filter, inject a z-order BETWEEN predicate
+        // so PostgreSQL can use the automatically-created idx_z_* index.
+        // Z-order is monotone in t for a fixed tenant hash, so BETWEEN(lo, hi) exactly
+        // covers the queried time range for this tenant with no false negatives.
+        let zorder_pred = if is_rollup && !scope_vals.is_empty() {
+            let src_segs: Vec<&Segment> = segments.iter().filter(|s| s.source == src).collect();
+            let min_t = src_segs.iter().map(|s| s._t_start).min().unwrap_or(0);
+            let max_t = src_segs.iter().map(|s| s._t_end).max().unwrap_or(0);
+            let dim_strings: Vec<Option<String>> =
+                scope_vals.iter().map(|(_, v)| Some(v.clone())).collect();
+            let lo = crate::spiral_zorder(min_t, dim_strings.clone());
+            let hi = crate::spiral_zorder(max_t, dim_strings);
+            let array_lit = scope_vals
+                .iter()
+                .map(|(_, v)| format!("'{}'", v.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                " AND spiral_zorder(spiral(t), ARRAY[{}]::text[]) BETWEEN {} AND {}",
+                array_lit, lo, hi
+            )
+        } else {
+            String::new()
+        };
+
         select_parts.push(format!(
-            "SELECT {} FROM {} WHERE t <@ {}",
+            "SELECT {} FROM {} WHERE t <@ {}{}",
             inner_select.join(", "),
             src,
-            multirange_lit
+            multirange_lit,
+            zorder_pred
         ));
     }
 
