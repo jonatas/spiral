@@ -819,6 +819,96 @@ mod tests {
         assert_eq!(spiral_hilbert_2d(0, 1), 2);
         assert_eq!(spiral_hilbert_2d(1, 1), 3);
     }
+
+    #[pg_test]
+    fn test_ivm_concurrent_write_safety() {
+        Spi::run(
+            "CREATE TABLE concurrent_ticks (
+                t timestamptz NOT NULL,
+                symbol_id int NOT NULL,
+                price numeric
+            ) WITH (spiral.frames = '1h', spiral.tenant = 'symbol_id')",
+        )
+        .unwrap();
+
+        Spi::run(
+            "INSERT INTO concurrent_ticks (t, symbol_id, price)
+             SELECT now() - interval '2 hours' + (i * interval '1 minute'), 1, 100.0
+             FROM generate_series(0, 5) i",
+        )
+        .unwrap();
+
+        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+
+        let initial: bool = Spi::get_one("SELECT COUNT(*) > 0 FROM concurrent_ticks_1h")
+            .unwrap()
+            .unwrap_or(false);
+        assert!(initial, "view should have rows after initial refresh");
+
+        Spi::run(
+            "INSERT INTO concurrent_ticks (t, symbol_id, price)
+             VALUES (now() - interval '2 hours' + interval '10 minutes', 1, 999.0)",
+        )
+        .unwrap();
+
+        let before: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'concurrent_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert!(before > 0, "changelog should have entries before refresh");
+
+        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+
+        let after: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'concurrent_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(after, 0, "changelog should be empty after refresh");
+
+        let high_price: bool = Spi::get_one("SELECT MAX(price) >= 999 FROM concurrent_ticks_1h")
+            .unwrap()
+            .unwrap_or(false);
+        assert!(
+            high_price,
+            "refreshed view should contain injected price 999"
+        );
+
+        // Write B scenario: post-refresh insert must survive a second refresh.
+        Spi::run(
+            "INSERT INTO concurrent_ticks (t, symbol_id, price)
+             VALUES (now() - interval '2 hours' + interval '20 minutes', 1, 111.0)",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+
+        Spi::run(
+            "INSERT INTO concurrent_ticks (t, symbol_id, price)
+             VALUES (now() - interval '2 hours' + interval '25 minutes', 1, 222.0)",
+        )
+        .unwrap();
+
+        let pending: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'concurrent_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert!(
+            pending > 0,
+            "write B should be pending in changelog before second refresh"
+        );
+
+        Spi::run("SELECT spiral_refresh('concurrent_ticks')").unwrap();
+
+        let write_b: bool = Spi::get_one("SELECT MAX(price) >= 222 FROM concurrent_ticks_1h")
+            .unwrap()
+            .unwrap_or(false);
+        assert!(
+            write_b,
+            "write B (price 222) must be present after second refresh"
+        );
+    }
 }
 
 #[cfg(test)]
