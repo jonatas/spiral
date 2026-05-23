@@ -425,7 +425,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 struct QueryConstraints {
     start: Option<i64>,
     end: Option<i64>,
-    scopes: std::collections::HashMap<String, String>,
+    scopes: std::collections::HashMap<String, serde_json::Value>,
 }
 
 unsafe fn build_time_constraints(
@@ -533,22 +533,23 @@ unsafe fn build_time_constraints(
                                 }
                             }
                         } else if opname == "=" {
-                            // Possible scope column
-                            let val = match (*con).consttype {
-                                pg_sys::TEXTOID => Some(
+                            // Possible scope column — preserve the native JSON type so it
+                            // matches what track_changes_stmt stores via jsonb_build_object.
+                            let val: Option<serde_json::Value> = match (*con).consttype {
+                                pg_sys::TEXTOID => Some(serde_json::Value::String(
                                     String::from_datum((*con).constvalue, (*con).constisnull)
                                         .unwrap(),
-                                ),
-                                pg_sys::INT4OID => Some(
+                                )),
+                                pg_sys::INT4OID => Some(serde_json::Value::Number(
                                     i32::from_datum((*con).constvalue, (*con).constisnull)
                                         .unwrap()
-                                        .to_string(),
-                                ),
-                                pg_sys::INT8OID => Some(
+                                        .into(),
+                                )),
+                                pg_sys::INT8OID => Some(serde_json::Value::Number(
                                     i64::from_datum((*con).constvalue, (*con).constisnull)
                                         .unwrap()
-                                        .to_string(),
-                                ),
+                                        .into(),
+                                )),
                                 _ => None,
                             };
                             if let Some(v) = val {
@@ -665,10 +666,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         let mut map = serde_json::Map::new();
                                         for col in &m.scope_columns {
                                             if let Some(val) = qc.scopes.get(col) {
-                                                map.insert(
-                                                    col.clone(),
-                                                    serde_json::Value::String(val.clone()),
-                                                );
+                                                map.insert(col.clone(), val.clone());
                                             }
                                         }
                                         if map.is_empty() {
