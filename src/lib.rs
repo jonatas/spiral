@@ -57,9 +57,26 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     );
 }
 
+/// FNV-1a 64-bit hash — stable, documented, no external dependency.
+/// Output is deterministic across Rust versions and builds.
+///
+/// See https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
+#[inline]
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Computes the Z-order curve for a timestamp and a set of string dimensions.
 ///
-/// Hashes string dimensions and interleaves their bits with the time bit representation.
+/// Hashes string dimensions with FNV-1a (stable across Rust versions) and
+/// interleaves their bits with the time bit representation.
 ///
 /// Time is encoded using the low 32 bits of `t` (Unix epoch seconds), giving coverage
 /// from 1970-01-01 to approximately 2106-02-07 without loss of ordering information.
@@ -80,11 +97,7 @@ pub fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> i64 {
     let mut y = 0u64;
     for (i, dim) in dimensions.iter().enumerate() {
         if let Some(d) = dim {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::Hasher;
-            hasher.write(d.as_bytes());
-            let hash = hasher.finish();
-            y ^= hash << (i % 8);
+            y ^= fnv1a_64(d.as_bytes()) << (i % 8);
         }
     }
     y &= 0x0000_0000_FFFF_FFFF;
@@ -1249,5 +1262,35 @@ mod zorder_tests {
             vec![Some("sensor_a".to_string()), Some("region_eu".to_string())],
         );
         assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_zorder_string_hash_stable() {
+        // Pin FNV-1a outputs. If the hash algorithm changes, persisted z-order index
+        // values would silently diverge and queries would return wrong results.
+        // FNV-1a spec: empty input = offset basis = 0xcbf29ce484222325.
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        // "sensor_a" pinned to FNV-1a output (verified against reference implementation).
+        assert_eq!(fnv1a_64(b"sensor_a"), 11_461_482_958_241_160_951_u64);
+
+        // Distinct strings must hash to different values.
+        assert_ne!(fnv1a_64(b"sensor_a"), fnv1a_64(b"sensor_b"));
+        assert_ne!(fnv1a_64(b"tenant_1"), fnv1a_64(b"tenant_2"));
+
+        // z-order output must be self-consistent across calls.
+        let r1 = spiral_zorder(
+            12345,
+            vec![Some("sensor_a".to_string()), Some("region_eu".to_string())],
+        );
+        let r2 = spiral_zorder(
+            12345,
+            vec![Some("sensor_a".to_string()), Some("region_eu".to_string())],
+        );
+        assert_eq!(r1, r2, "z-order must be deterministic across calls");
+
+        // Different tenant strings must yield different z-order values (for same t).
+        let za = spiral_zorder(0, vec![Some("tenant_a".to_string())]);
+        let zb = spiral_zorder(0, vec![Some("tenant_b".to_string())]);
+        assert_ne!(za, zb, "different tenant strings must not collide");
     }
 }
