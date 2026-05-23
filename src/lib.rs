@@ -944,7 +944,10 @@ mod tests {
         let rollup_rows: i64 = Spi::get_one("SELECT COUNT(*)::bigint FROM ticks2_1h")
             .unwrap()
             .unwrap_or(0);
-        assert!(rollup_rows > 0, "rollup must have rows after initial refresh");
+        assert!(
+            rollup_rows > 0,
+            "rollup must have rows after initial refresh"
+        );
 
         // Second refresh with no new data: changelog is empty, rollup is populated.
         // Must return immediately without re-bootstrapping.
