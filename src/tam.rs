@@ -253,6 +253,7 @@ pub unsafe extern "C-unwind" fn spiral_multi_insert(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_delete(
     _rel: pg_sys::Relation,
@@ -267,6 +268,7 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
     pg_sys::TM_Result::TM_Ok
 }
 
+#[allow(clippy::too_many_arguments)]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_update(
     _rel: pg_sys::Relation,
@@ -283,6 +285,7 @@ pub unsafe extern "C-unwind" fn spiral_tuple_update(
     pg_sys::TM_Result::TM_Ok
 }
 
+#[allow(clippy::too_many_arguments)]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_lock(
     _rel: pg_sys::Relation,
@@ -588,6 +591,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_index_build_range_scan(
     _table_rel: pg_sys::Relation,
