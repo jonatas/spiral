@@ -1784,6 +1784,44 @@ fn construct_union_sql_hierarchical(
     select_parts.join(" UNION ALL ")
 }
 
+/// Parse a simple `col = val` predicate from a WHERE clause string.
+/// Only handles integer equality on a single column — the primary use case
+/// for scope-scoped refresh. Returns `None` for anything more complex.
+fn parse_scope_predicate(where_clause: &str) -> Option<(String, i64)> {
+    let trimmed = where_clause.trim();
+    // Pattern: optional whitespace, identifier, optional whitespace, '=', optional whitespace, integer
+    let re_parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+    if re_parts.len() != 2 {
+        return None;
+    }
+    let col = re_parts[0].trim();
+    let val_str = re_parts[1].trim();
+    // col must be a plain identifier (alphanumeric + underscore)
+    if !col.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let val: i64 = val_str.parse().ok()?;
+    Some((col.to_string(), val))
+}
+
+/// Build a JSONB scope filter for the changelog given a scope col + integer value,
+/// only if `col` is actually a registered scope column for this base view.
+fn build_changelog_scope_filter(
+    _real_base: &str,
+    col: &str,
+    val: i64,
+    scope_columns: &[String],
+) -> Option<String> {
+    if !scope_columns.iter().any(|c| c == col) {
+        return None;
+    }
+    let json_filter = format!("{{\"{}\": {}}}", col.replace('"', ""), val);
+    Some(format!(
+        "AND scope_values @> '{}'::jsonb",
+        json_filter.replace("'", "''")
+    ))
+}
+
 pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     notice!(
         "Spiral: reactive_refresh entered for '{}', where_clause={:?}",
@@ -1800,55 +1838,79 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
         .map(|m| m.base_view.clone())
         .unwrap_or_else(|| base_name.to_string());
 
+    // Derive scope filter from where_clause if it matches a simple `col = val` predicate
+    // and `col` is a registered scope column for this base view.
+    let scope_columns = metadata
+        .as_ref()
+        .map(|m| m.scope_columns.clone())
+        .unwrap_or_default();
+    let scope_filter: Option<String> = where_clause.as_deref().and_then(|wc| {
+        parse_scope_predicate(wc).and_then(|(col, val)| {
+            build_changelog_scope_filter(&real_base, &col, val, &scope_columns)
+        })
+    });
+
     if is_root {
-        // Bootstrap: if changelog is empty, only force a full rebuild when the
-        // rollup tier is also empty (first-time init).  An empty changelog with
-        // an already-populated rollup means nothing is dirty — return early so
-        // we don't re-aggregate the entire history unnecessarily.
-        let count: i64 = Spi::get_one(&format!(
-            "SELECT count(*) FROM spiral.changelog WHERE base_view = '{}'",
-            real_base.replace("'", "''")
-        ))
-        .unwrap()
-        .unwrap();
-        if count == 0 {
-            let first_tier: Option<String> = Spi::get_one(&format!(
-                "SELECT view_name FROM spiral.metadata \
-                 WHERE base_view = '{}' AND frame_seconds > 0 \
-                 ORDER BY frame_seconds LIMIT 1",
+        if scope_filter.is_some() {
+            // Partial refresh: skip bootstrap and compaction — only process changelog
+            // entries that match the requested tenant scope.
+        } else {
+            // Bootstrap: if changelog is empty, only force a full rebuild when the
+            // rollup tier is also empty (first-time init).  An empty changelog with
+            // an already-populated rollup means nothing is dirty — return early so
+            // we don't re-aggregate the entire history unnecessarily.
+            let count: i64 = Spi::get_one(&format!(
+                "SELECT count(*) FROM spiral.changelog WHERE base_view = '{}'",
                 real_base.replace("'", "''")
             ))
-            .unwrap_or(None);
+            .unwrap()
+            .unwrap();
+            if count == 0 {
+                let first_tier: Option<String> = Spi::get_one(&format!(
+                    "SELECT view_name FROM spiral.metadata \
+                     WHERE base_view = '{}' AND frame_seconds > 0 \
+                     ORDER BY frame_seconds LIMIT 1",
+                    real_base.replace("'", "''")
+                ))
+                .unwrap_or(None);
 
-            let rollup_is_empty = first_tier
-                .as_deref()
-                .map(|tier| {
-                    Spi::get_one::<i64>(&format!(
-                        "SELECT count(*) FROM (SELECT 1 FROM \"{}\" LIMIT 1) t",
-                        tier.replace("\"", "\"\"")
-                    ))
-                    .unwrap_or(Some(0))
-                    .unwrap_or(0)
-                        == 0
-                })
-                .unwrap_or(true);
+                let rollup_is_empty = first_tier
+                    .as_deref()
+                    .map(|tier| {
+                        Spi::get_one::<i64>(&format!(
+                            "SELECT count(*) FROM (SELECT 1 FROM \"{}\" LIMIT 1) t",
+                            tier.replace("\"", "\"\"")
+                        ))
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0)
+                            == 0
+                    })
+                    .unwrap_or(true);
 
-            if rollup_is_empty {
-                let bootstrap_sql = format!("INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"));
-                let _ = Spi::run(&bootstrap_sql);
-            } else {
-                return true;
+                if rollup_is_empty {
+                    let bootstrap_sql = format!("INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"));
+                    let _ = Spi::run(&bootstrap_sql);
+                } else {
+                    return true;
+                }
             }
+            catalog::unify_changelog(&real_base);
         }
-        catalog::unify_changelog(&real_base);
 
-        // Capture IDs to be refreshed
-        let _ = Spi::run(&format!("CREATE TEMP TABLE refreshing_changelog AS SELECT ctid as old_ctid FROM spiral.changelog WHERE base_view = '{}'", real_base.replace("'", "''")));
+        // Capture IDs to be refreshed (optionally scoped to one tenant).
+        let extra_filter = scope_filter.as_deref().unwrap_or("");
+        let _ = Spi::run(&format!(
+            "CREATE TEMP TABLE refreshing_changelog AS \
+             SELECT ctid as old_ctid FROM spiral.changelog \
+             WHERE base_view = '{}' {}",
+            real_base.replace("'", "''"),
+            extra_filter
+        ));
     }
 
     let success = crate::refresh_incremental(base_name, where_clause.clone(), 0);
 
-    if success && is_root && where_clause.is_none() {
+    if success && is_root {
         let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
     }
 
