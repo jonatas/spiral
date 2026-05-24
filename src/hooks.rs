@@ -218,20 +218,22 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     pg_sys::CommandCounterIncrement();
                 }
 
-                // Detect timestamptz columns and handle Date Anchors
-                let (anchor_col, offset_cols) = Spi::connect(|client| {
+                // Detect all column types for offset detection and directive validation
+                let (anchor_col, offset_cols, col_types_map) = Spi::connect(|client| {
                     let q = format!(
-                        "SELECT attname::text, atttypid 
-                         FROM pg_attribute 
-                         WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped 
+                        "SELECT attname::text, atttypid
+                         FROM pg_attribute
+                         WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped
                          ORDER BY attnum",
                         name.replace("\"", "\"\"")
                     );
                     let res = client.select(&q, None, &[])?;
                     let mut tstz_cols = Vec::new();
+                    let mut type_map = std::collections::HashMap::new();
                     for row in res {
                         let attname = row.get::<String>(1).unwrap().unwrap();
                         let atttypid = row.get::<pg_sys::Oid>(2).unwrap().unwrap();
+                        type_map.insert(attname.clone(), atttypid);
                         if atttypid == pg_sys::TIMESTAMPTZOID {
                             tstz_cols.push(attname);
                         }
@@ -247,7 +249,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
                     let offsets: Vec<String> =
                         tstz_cols.into_iter().filter(|c| c != &anchor).collect();
-                    Ok::<(String, Vec<String>), spi::Error>((anchor, offsets))
+                    Ok::<(String, Vec<String>, std::collections::HashMap<String, pg_sys::Oid>), spi::Error>((anchor, offsets, type_map))
                 })
                 .unwrap_or_else(|e| {
                     error!("Spiral: failed to detect timestamptz columns for hierarchy setup: {:?}", e);
@@ -282,11 +284,20 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     .unwrap_or_default()
                 };
 
+                // [ \t]* (not \s*) between type and -- so the comment must be on the
+                // same line as the column definition, preventing cross-line false positives.
                 let re_col =
-                    regex::Regex::new(r"(\w+)\s+[\w\(\) ]+,?\s*--\s*Spiral:\s*([^\n\r]+)").unwrap();
+                    regex::Regex::new(r"(\w+)\s+[\w\(\) ]+,?[ \t]*--\s*Spiral:\s*([^\n\r]+)").unwrap();
                 let mut captured_cols = Vec::new();
                 for cap in re_col.captures_iter(&query_str) {
                     let col_name = cap[1].to_string();
+
+                    // col_name must be an actual column in the table — filters out
+                    // false positives where a prose comment mentions "Spiral:".
+                    if !col_types_map.contains_key(&col_name) {
+                        continue;
+                    }
+
                     let formula_part = cap[2].trim().to_string();
 
                     // Support multiple formulas separated by comma, and 'as alias' syntax
@@ -303,6 +314,20 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                         } else {
                             (part.to_string(), None)
                         };
+
+                        // Formula must be a single identifier — rejects prose like
+                        // "id for the record" that leaks through the regex.
+                        if formula.split_whitespace().count() > 1 {
+                            error!(
+                                "Spiral: directive on column '{}' has invalid formula '{}' — must be a single identifier",
+                                col_name, formula
+                            );
+                        }
+
+                        // Type-compatibility check for known formulas.
+                        let col_oid = col_types_map.get(&col_name).copied().unwrap_or(pg_sys::InvalidOid);
+                        validate_formula_column_type(&col_name, &formula, col_oid);
+
                         captured_cols.push((col_name.clone(), formula, alias));
                     }
                 }
@@ -1339,6 +1364,38 @@ pub fn generate_hierarchy_internal(
                 e
             ),
         }
+    }
+}
+
+/// Validates that a Spiral magic comment formula is compatible with the column's PostgreSQL type.
+/// Raises ERROR on mismatch so the CREATE TABLE fails early with a clear message.
+fn validate_formula_column_type(col: &str, formula: &str, type_oid: pg_sys::Oid) {
+    const NUMERIC_OIDS: &[pg_sys::Oid] = &[
+        pg_sys::INT2OID,
+        pg_sys::INT4OID,
+        pg_sys::INT8OID,
+        pg_sys::FLOAT4OID,
+        pg_sys::FLOAT8OID,
+        pg_sys::NUMERICOID,
+    ];
+    let formula_lower = formula.to_lowercase();
+    let needs_numeric = matches!(
+        formula_lower.as_str(),
+        "sum" | "stats" | "ohlc" | "ohlcv" | "tdigest" | "sketch" | "quantile"
+    );
+    let needs_timestamptz = matches!(formula_lower.as_str(), "range_max_end" | "range_merge");
+
+    if needs_numeric && !NUMERIC_OIDS.contains(&type_oid) {
+        error!(
+            "Spiral: formula '{}' on column '{}' requires a numeric type (int, float, or numeric), got OID {}",
+            formula, col, type_oid
+        );
+    }
+    if needs_timestamptz && type_oid != pg_sys::TIMESTAMPTZOID {
+        error!(
+            "Spiral: formula '{}' on column '{}' requires timestamptz, got OID {}",
+            formula, col, type_oid
+        );
     }
 }
 
