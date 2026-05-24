@@ -1402,6 +1402,118 @@ mod tests {
             "changelog must be empty after refresh"
         );
     }
+
+    #[pg_test]
+    fn test_status_view_shows_dirty_entries_and_lag() {
+        Spi::run(
+            "CREATE TABLE obs_events (
+                t   timestamptz NOT NULL,
+                val double precision
+            ) WITH (spiral.frames = '1h')",
+        )
+        .unwrap();
+
+        // Before any inserts: status row exists, zero dirty entries, NULL lag.
+        let dirty_before: i64 = Spi::get_one::<i64>(
+            "SELECT dirty_entries FROM spiral.status WHERE base_view = 'obs_events'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(dirty_before, 0, "dirty_entries must be 0 before any inserts");
+
+        let lag_before: Option<bool> = Spi::get_one::<bool>(
+            "SELECT lag IS NULL FROM spiral.status WHERE base_view = 'obs_events'",
+        )
+        .unwrap();
+        assert_eq!(lag_before, Some(true), "lag must be NULL when rollup is current");
+
+        // Insert rows spanning 3 distinct 1h buckets.
+        Spi::run(
+            "INSERT INTO obs_events (t, val)
+             SELECT '2026-01-01 00:00:00+00'::timestamptz + (i * interval '1 hour'), 1.0
+             FROM generate_series(0, 2) i",
+        )
+        .unwrap();
+
+        let dirty_after: i64 = Spi::get_one::<i64>(
+            "SELECT dirty_entries FROM spiral.status WHERE base_view = 'obs_events'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert_eq!(dirty_after, 3, "3 distinct hour-buckets → 3 dirty entries");
+
+        let lag_not_null: Option<bool> = Spi::get_one::<bool>(
+            "SELECT lag IS NOT NULL FROM spiral.status WHERE base_view = 'obs_events'",
+        )
+        .unwrap();
+        assert_eq!(lag_not_null, Some(true), "lag must be non-NULL when dirty entries exist");
+
+        // After refresh: zero dirty entries, NULL lag again.
+        Spi::run("SELECT spiral_refresh('obs_events')").unwrap();
+
+        let dirty_final: i64 = Spi::get_one::<i64>(
+            "SELECT dirty_entries FROM spiral.status WHERE base_view = 'obs_events'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(dirty_final, 0, "dirty_entries must be 0 after refresh");
+    }
+
+    #[pg_test]
+    fn test_spiral_lag_function() {
+        Spi::run(
+            "CREATE TABLE lag_events (
+                t   timestamptz NOT NULL,
+                val double precision
+            ) WITH (spiral.frames = '1h')",
+        )
+        .unwrap();
+
+        // No dirty entries → lag is NULL.
+        let lag_null: Option<bool> = Spi::get_one::<bool>(
+            "SELECT spiral_lag('lag_events') IS NULL",
+        )
+        .unwrap();
+        assert_eq!(lag_null, Some(true), "spiral_lag must be NULL when fully current");
+
+        Spi::run(
+            "INSERT INTO lag_events (t, val) VALUES (now() - interval '2 hours', 42.0)",
+        )
+        .unwrap();
+
+        // Dirty entries exist → lag must be a positive interval.
+        let lag_positive: Option<bool> = Spi::get_one::<bool>(
+            "SELECT spiral_lag('lag_events') > interval '0'",
+        )
+        .unwrap();
+        assert_eq!(lag_positive, Some(true), "spiral_lag must be a positive interval when dirty entries exist");
+
+        Spi::run("SELECT spiral_refresh('lag_events')").unwrap();
+
+        let lag_after: Option<bool> = Spi::get_one::<bool>(
+            "SELECT spiral_lag('lag_events') IS NULL",
+        )
+        .unwrap();
+        assert_eq!(lag_after, Some(true), "spiral_lag must return NULL after refresh clears changelog");
+    }
+
+    #[pg_test]
+    fn test_status_view_tier_count() {
+        Spi::run(
+            "CREATE TABLE tiered_obs (
+                t   timestamptz NOT NULL,
+                val double precision
+            ) WITH (spiral.frames = '1h,1d')",
+        )
+        .unwrap();
+
+        let tier_count: i32 = Spi::get_one::<i32>(
+            "SELECT tier_count FROM spiral.status WHERE base_view = 'tiered_obs'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert_eq!(tier_count, 2, "frames '1h,1d' must produce tier_count = 2");
+    }
 }
 
 #[cfg(test)]
