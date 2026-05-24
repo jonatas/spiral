@@ -192,7 +192,7 @@ $$ LANGUAGE plpgsql;
 
 -- DOCS SUPPORT
 CREATE OR REPLACE VIEW spiral.available_sources AS
-SELECT 
+SELECT
     m.base_view,
     m.view_name,
     m.frame_seconds,
@@ -203,3 +203,55 @@ SELECT
 FROM spiral.metadata m
 JOIN spiral.sources s ON m.view_name = s.view_name
 ORDER BY m.base_view, m.frame_seconds;
+
+-- OBSERVABILITY
+-- spiral.status: one row per base table — hierarchy health, dirty backlog,
+-- and an approximate rollup lag (time since newest unprocessed data bucket).
+-- lag is NULL when no unprocessed entries exist (rollup is fully current).
+CREATE OR REPLACE VIEW spiral.status AS
+WITH roots AS (
+    SELECT DISTINCT base_view
+    FROM spiral.metadata
+    WHERE parent_view = 'BASE'
+),
+tiers AS (
+    SELECT base_view, COUNT(*) AS tier_count
+    FROM spiral.metadata
+    WHERE frame_seconds > 0
+    GROUP BY base_view
+),
+dirty AS (
+    SELECT
+        base_view,
+        COUNT(*)                                      AS dirty_entries,
+        COUNT(DISTINCT scope_values)                  AS dirty_scopes,
+        SUM(t_end - t_start)                          AS dirty_seconds,
+        to_timestamptz(MIN(t_start)::bigint)           AS oldest_dirty_ts,
+        to_timestamptz(MAX(t_end)::bigint)             AS newest_dirty_ts
+    FROM spiral.changelog
+    GROUP BY base_view
+)
+SELECT
+    r.base_view,
+    COALESCE(t.tier_count, 0)::int              AS tier_count,
+    COALESCE(d.dirty_entries, 0)::bigint        AS dirty_entries,
+    COALESCE(d.dirty_scopes,  0)::bigint        AS dirty_scopes,
+    COALESCE(d.dirty_seconds, 0)::bigint        AS dirty_seconds,
+    d.oldest_dirty_ts                           AS oldest_dirty_ts,
+    d.newest_dirty_ts                           AS newest_dirty_ts,
+    CASE WHEN d.newest_dirty_ts IS NOT NULL
+         THEN now() - d.newest_dirty_ts
+         ELSE NULL::interval
+    END                                         AS lag
+FROM roots r
+LEFT JOIN tiers t ON t.base_view = r.base_view
+LEFT JOIN dirty  d ON d.base_view = r.base_view;
+
+-- spiral_lag(base_view): returns the rollup lag for a single base table as
+-- an INTERVAL, or NULL if the rollup is fully current.
+-- Lag = time elapsed since the newest unprocessed data bucket's end timestamp.
+CREATE OR REPLACE FUNCTION spiral_lag(base_view text) RETURNS INTERVAL AS $$
+    SELECT now() - to_timestamptz(MAX(t_end)::bigint)
+    FROM spiral.changelog
+    WHERE changelog.base_view = $1
+$$ LANGUAGE SQL STABLE PARALLEL SAFE;
