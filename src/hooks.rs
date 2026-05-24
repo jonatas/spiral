@@ -364,6 +364,16 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 );
                 create_reconstruction_view(&name);
 
+                // Smallest frame determines the dirty-range bucket granularity.
+                // Coarser bucket = fewer changelog entries for dense inserts (no loss).
+                // Finer bucket = fewer wasted refresh buckets for sparse inserts (the fix).
+                let mut sorted_frames = rollup::parse_frames(&extracted_frames);
+                sorted_frames.sort_by_key(|f| f.seconds);
+                let bucket_secs = sorted_frames
+                    .first()
+                    .map(|f| f.seconds as i64)
+                    .unwrap_or(3600); // default 1h if no frames parsed
+
                 for event in &["INSERT", "UPDATE", "DELETE"] {
                     let mut transition = String::new();
                     if *event == "UPDATE" {
@@ -379,11 +389,12 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                         "CREATE TRIGGER spiral_track_{base_view}_{event_lower}
                          AFTER {event} ON \"{base_view}\"
                          {transition}
-                         FOR EACH STATEMENT EXECUTE FUNCTION spiral.track_changes_stmt('{base_view}')",
+                         FOR EACH STATEMENT EXECUTE FUNCTION spiral.track_changes_stmt('{base_view}', '{bucket_secs}')",
                         base_view = name,
                         event = event,
                         event_lower = event.to_lowercase(),
-                        transition = transition
+                        transition = transition,
+                        bucket_secs = bucket_secs
                     );
                     if let Err(e) = Spi::run(&trigger_sql) {
                         error!("Spiral: failed to create changelog trigger on '{}': {:?}", name, e);
