@@ -603,11 +603,12 @@ fn spiral_register_view(
                 "CREATE OR REPLACE TRIGGER spiral_track_{base_view}_{event_lower}
                  AFTER {event} ON \"{base_view}\"
                  {transition}
-                 FOR EACH STATEMENT EXECUTE FUNCTION spiral.track_changes_stmt('{base_view}')",
+                 FOR EACH STATEMENT EXECUTE FUNCTION spiral.track_changes_stmt('{base_view}', '{frame_seconds}')",
                 base_view = base_view,
                 event = event,
                 event_lower = event.to_lowercase(),
-                transition = transition
+                transition = transition,
+                frame_seconds = frame_seconds
             );
             let _ = Spi::run(&trigger_sql);
         }
@@ -1290,6 +1291,115 @@ mod tests {
         assert!(
             rollup_exists,
             "rollup tier must be created even when a prose comment mentions Spiral:"
+        );
+    }
+
+    #[pg_test]
+    fn test_sparse_bulk_insert_produces_bucketed_changelog() {
+        // Inserting N rows spread over a wide time span must create N changelog
+        // entries (one per frame-bucket touched), NOT a single amplified span.
+        // This verifies that dirty-range amplification is eliminated.
+        Spi::run(
+            "CREATE TABLE sparse_events (
+                t   timestamptz NOT NULL,
+                val double precision
+            ) WITH (spiral.frames = '1h,1d')",
+        )
+        .unwrap();
+
+        // 10 rows, each 1 day apart (10-day span, 1h buckets → 10 distinct buckets).
+        Spi::run(
+            "INSERT INTO sparse_events (t, val)
+             SELECT '2026-01-01 00:00:00+00'::timestamptz + (i * interval '1 day'), i::double precision
+             FROM generate_series(0, 9) i",
+        )
+        .unwrap();
+
+        let changelog_entries: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'sparse_events'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+
+        // Each row lands in a distinct 1-hour bucket → 10 changelog entries.
+        // Before this fix: 1 entry spanning the full 10-day range.
+        assert_eq!(
+            changelog_entries, 10,
+            "sparse insert over 10 days must produce 10 bucketed changelog entries, not 1 amplified span"
+        );
+    }
+
+    #[pg_test]
+    fn test_dense_bulk_insert_deduplicates_same_bucket() {
+        // Multiple rows in the same frame bucket must produce a single changelog
+        // entry for that bucket — no redundant entries from the GROUP BY.
+        Spi::run(
+            "CREATE TABLE dense_events (
+                t   timestamptz NOT NULL,
+                val double precision
+            ) WITH (spiral.frames = '1h,1d')",
+        )
+        .unwrap();
+
+        // 60 rows in the same hour (one per minute) → all in the same 1h bucket.
+        Spi::run(
+            "INSERT INTO dense_events (t, val)
+             SELECT '2026-01-01 00:00:00+00'::timestamptz + (i * interval '1 minute'), i::double precision
+             FROM generate_series(0, 59) i",
+        )
+        .unwrap();
+
+        let changelog_entries: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'dense_events'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+
+        assert_eq!(
+            changelog_entries, 1,
+            "60 rows in the same 1h bucket must produce exactly 1 changelog entry"
+        );
+    }
+
+    #[pg_test]
+    fn test_sparse_bulk_insert_refresh_only_touches_affected_buckets() {
+        // End-to-end: sparse insert over 10 days, refresh, verify rollup has 10
+        // hour-buckets populated and changelog is cleared.
+        Spi::run(
+            "CREATE TABLE sparse_refresh (
+                t   timestamptz NOT NULL,
+                val double precision
+            ) WITH (spiral.frames = '1h')",
+        )
+        .unwrap();
+
+        Spi::run(
+            "INSERT INTO sparse_refresh (t, val)
+             SELECT '2026-01-01 00:00:00+00'::timestamptz + (i * interval '1 day'), 1.0
+             FROM generate_series(0, 9) i",
+        )
+        .unwrap();
+
+        Spi::run("SELECT spiral_refresh('sparse_refresh')").unwrap();
+
+        let rollup_rows: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM sparse_refresh_1h",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert_eq!(
+            rollup_rows, 10,
+            "rollup must have exactly 10 hour-buckets after sparse insert of 10 rows"
+        );
+
+        let remaining_changelog: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'sparse_refresh'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(
+            remaining_changelog, 0,
+            "changelog must be empty after refresh"
         );
     }
 }

@@ -63,9 +63,16 @@ CREATE OR REPLACE FUNCTION to_timestamptz(BIGINT) RETURNS TIMESTAMPTZ AS $$
     SELECT spiral_from_epoch($1);
 $$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
 
+-- track_changes_stmt(base_view, bucket_seconds)
+-- Records one changelog entry per frame-aligned time bucket touched by the
+-- statement, rather than a single MIN..MAX span over the whole batch.
+-- This bounds refresh cost to O(buckets touched) instead of O(time span),
+-- eliminating dirty-range amplification from sparse bulk operations.
 CREATE OR REPLACE FUNCTION spiral.track_changes_stmt() RETURNS TRIGGER AS $$
 DECLARE
-    v_base_view TEXT := TG_ARGV[0];
+    v_base_view    TEXT   := TG_ARGV[0];
+    -- Fall back to 3600s (1h) for triggers created before bucket_secs arg was added.
+    v_bucket_secs  BIGINT := COALESCE(NULLIF(TG_ARGV[1], '')::BIGINT, 3600);
     v_scope_columns TEXT[];
     v_has_scopes BOOLEAN;
     v_sql TEXT;
@@ -86,9 +93,9 @@ BEGIN
                    string_agg('"' || col || '"', ', ')
             INTO v_json_build, v_cols_csv
             FROM unnest(v_scope_columns) as col;
-            
+
             v_json_build := 'jsonb_build_object(' || v_json_build || ')';
-            
+
             IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
                 v_union_sql := 'SELECT t, ' || v_cols_csv || ' FROM new_table';
             END IF;
@@ -98,12 +105,15 @@ BEGIN
                 END IF;
                 v_union_sql := v_union_sql || 'SELECT t, ' || v_cols_csv || ' FROM old_table';
             END IF;
-            
+
+            -- One row per (scope, frame-bucket) instead of one MIN..MAX per scope.
             v_sql := 'INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) ' ||
-                     'SELECT $1, ' || v_json_build || ', MIN(spiral(t::timestamptz)), MAX(spiral(t::timestamptz)) ' ||
-                     'FROM (' || v_union_sql || ') sub ' ||
-                     'GROUP BY ' || v_cols_csv;
-                     
+                     'SELECT $1, ' || v_json_build || ', bucket, bucket + ' || v_bucket_secs || ' ' ||
+                     'FROM (SELECT ' || v_cols_csv || ', ' ||
+                     '      (spiral(t::timestamptz) / ' || v_bucket_secs || ') * ' || v_bucket_secs || ' AS bucket ' ||
+                     '      FROM (' || v_union_sql || ') sub ' ||
+                     '      GROUP BY ' || v_cols_csv || ', bucket) bucketed';
+
             EXECUTE v_sql USING v_base_view;
         END;
     ELSE
@@ -119,16 +129,18 @@ BEGIN
                 END IF;
                 v_union_sql := v_union_sql || 'SELECT t FROM old_table';
             END IF;
-            
+
+            -- One row per frame-bucket instead of one MIN..MAX per statement.
             v_sql := 'INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) ' ||
-                     'SELECT $1, ''{}''::jsonb, MIN(spiral(t::timestamptz)), MAX(spiral(t::timestamptz)) ' ||
-                     'FROM (' || v_union_sql || ') sub ' ||
-                     'HAVING COUNT(*) > 0';
-                     
+                     'SELECT $1, ''{}''::jsonb, bucket, bucket + ' || v_bucket_secs || ' ' ||
+                     'FROM (SELECT (spiral(t::timestamptz) / ' || v_bucket_secs || ') * ' || v_bucket_secs || ' AS bucket ' ||
+                     '      FROM (' || v_union_sql || ') sub ' ||
+                     '      GROUP BY bucket) bucketed';
+
             EXECUTE v_sql USING v_base_view;
         END;
     END IF;
-    
+
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
