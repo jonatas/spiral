@@ -250,8 +250,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     Ok::<(String, Vec<String>), spi::Error>((anchor, offsets))
                 })
                 .unwrap_or_else(|e| {
-                    warning!("Spiral failed to detect timestamptz columns: {:?}", e);
-                    ("t".to_string(), Vec::new())
+                    error!("Spiral: failed to detect timestamptz columns for hierarchy setup: {:?}", e);
                 });
 
                 // 2. Parse frames
@@ -362,7 +361,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                         transition = transition
                     );
                     if let Err(e) = Spi::run(&trigger_sql) {
-                        warning!("Spiral failed to create trigger: {:?}", e);
+                        error!("Spiral: failed to create changelog trigger on '{}': {:?}", name, e);
                     }
                 }
 
@@ -1334,8 +1333,8 @@ pub fn generate_hierarchy_internal(
                 }
                 current_parent = child_name;
             }
-            Err(e) => warning!(
-                "Spiral failed to create child table {}: {:?}",
+            Err(e) => error!(
+                "Spiral: failed to create rollup tier '{}': {:?}",
                 child_name,
                 e
             ),

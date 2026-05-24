@@ -1173,6 +1173,62 @@ mod tests {
             "tenant 2 must not appear in rollup before its own refresh"
         );
     }
+
+    #[pg_test]
+    fn test_hierarchy_build_failure_is_error_not_warning() {
+        // A column annotated with an unsupported aggregate (sum on text) must
+        // cause generate_hierarchy_internal to raise an ERROR, not silently
+        // emit a warning and leave a broken hierarchy.
+        // In pgrx's SPI test context the error surfaces as a Rust panic.
+        let result = std::panic::catch_unwind(|| {
+            Spi::run(
+                "CREATE TABLE bad_hierarchy (
+                    t       timestamptz NOT NULL,
+                    label   text        -- Spiral: sum
+                ) WITH (spiral.frames = '1h')",
+            )
+            .unwrap();
+        });
+        assert!(
+            result.is_err(),
+            "CREATE TABLE with un-aggregatable column must raise an error, not a silent warning"
+        );
+    }
+
+    #[pg_test]
+    fn test_hierarchy_build_success_has_triggers_and_rollup() {
+        // Happy-path regression: a valid Spiral table must have changelog triggers
+        // and at least one rollup tier created — no silent partial failures.
+        Spi::run(
+            "CREATE TABLE good_hierarchy (
+                t   timestamptz NOT NULL,
+                val double precision  -- Spiral: sum
+            ) WITH (spiral.frames = '1h')",
+        )
+        .unwrap();
+
+        let trigger_count: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM pg_trigger t
+             JOIN pg_class c ON c.oid = t.tgrelid
+             WHERE c.relname = 'good_hierarchy'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert!(
+            trigger_count > 0,
+            "changelog triggers must exist on the base table"
+        );
+
+        let rollup_exists: bool = Spi::get_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'good_hierarchy_1h')",
+        )
+        .unwrap()
+        .unwrap_or(false);
+        assert!(
+            rollup_exists,
+            "rollup tier good_hierarchy_1h must be created"
+        );
+    }
 }
 
 #[cfg(test)]
