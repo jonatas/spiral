@@ -1229,6 +1229,69 @@ mod tests {
             "rollup tier good_hierarchy_1h must be created"
         );
     }
+
+    #[pg_test]
+    fn test_magic_comment_type_mismatch_is_error() {
+        // sum on a text column → numeric required → must raise an error.
+        let result = std::panic::catch_unwind(|| {
+            Spi::run(
+                "CREATE TABLE type_mismatch (
+                    t     timestamptz NOT NULL,
+                    label text  -- Spiral: sum
+                ) WITH (spiral.frames = '1h')",
+            )
+            .unwrap();
+        });
+        assert!(
+            result.is_err(),
+            "sum directive on text column must raise an error"
+        );
+    }
+
+    #[pg_test]
+    fn test_magic_comment_range_max_end_on_non_tstz_is_error() {
+        // range_max_end on an integer column → timestamptz required → error.
+        let result = std::panic::catch_unwind(|| {
+            Spi::run(
+                "CREATE TABLE tstz_mismatch (
+                    t      timestamptz NOT NULL,
+                    amount int  -- Spiral: range_max_end
+                ) WITH (spiral.frames = '1h')",
+            )
+            .unwrap();
+        });
+        assert!(
+            result.is_err(),
+            "range_max_end directive on int column must raise an error"
+        );
+    }
+
+    #[pg_test]
+    fn test_magic_comment_prose_false_positive_ignored() {
+        // A standalone "-- Note: the Spiral: sum ..." comment must NOT be captured
+        // as a column directive. The same-line anchor ([ \t]* not \s*) prevents
+        // the regex from matching across newlines, and the column-existence filter
+        // rejects tokens that are not real column names.
+        // Verification: CREATE TABLE succeeds (no phantom error from prose comment).
+        Spi::run(
+            "CREATE TABLE prose_comment (
+                t   timestamptz NOT NULL,
+                val double precision
+                -- Note: the Spiral: sum formula is documented elsewhere
+            ) WITH (spiral.frames = '1h')",
+        )
+        .unwrap();
+
+        let rollup_exists: bool = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'prose_comment_1h')",
+        )
+        .unwrap()
+        .unwrap_or(false);
+        assert!(
+            rollup_exists,
+            "rollup tier must be created even when a prose comment mentions Spiral:"
+        );
+    }
 }
 
 #[cfg(test)]
