@@ -725,12 +725,19 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                             let offset_cols = catalog::get_offset_columns(&base_table);
                             let metadata_obj = catalog::get_metadata(&base_table);
 
-                            if let Some(qc) = constraint_map.get(&varno) {
-                                if let (Some(ts), Some(te)) = (qc.start, qc.end) {
-                                    // Publish time range so the TAM scan can skip pages outside [ts, te].
-                                    crate::SCAN_TIME_RANGE.with(|r| r.set(Some((ts, te))));
-                                    // Build scope_values JsonB from qc.scopes if they match view's scope_columns
-                                    let scope_values = metadata_obj.as_ref().and_then(|m| {
+                            // Time range: from WHERE clause or inferred from coarsest rollup
+                            // (enables unbounded queries like SELECT sum(col) FROM tbl).
+                            let qc_opt = constraint_map.get(&varno);
+                            let time_range = qc_opt
+                                .and_then(|q| q.start.zip(q.end))
+                                .or_else(|| get_actual_data_range(&base_table, &hierarchy));
+
+                            if let Some((ts, te)) = time_range {
+                                // Publish time range so the TAM scan can skip pages outside [ts, te].
+                                crate::SCAN_TIME_RANGE.with(|r| r.set(Some((ts, te))));
+                                // Build scope_values JsonB from qc.scopes if they match view's scope_columns
+                                let scope_values = qc_opt.and_then(|qc| {
+                                    metadata_obj.as_ref().and_then(|m| {
                                         let mut map = serde_json::Map::new();
                                         for col in &m.scope_columns {
                                             if let Some(val) = qc.scopes.get(col) {
@@ -742,98 +749,97 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         } else {
                                             Some(pgrx::JsonB(serde_json::Value::Object(map)))
                                         }
-                                    });
+                                    })
+                                });
 
-                                    let dirty_ranges = catalog::get_dirty_ranges(
+                                let dirty_ranges = catalog::get_dirty_ranges(
+                                    &base_table,
+                                    ts,
+                                    te,
+                                    scope_values,
+                                );
+                                let max_frame_secs = extract_group_granularity_secs(query);
+                                let segments = resolve_segments(
+                                    &base_table,
+                                    ts,
+                                    te,
+                                    &hierarchy,
+                                    &dirty_ranges,
+                                    tz_offset,
+                                    max_frame_secs,
+                                );
+
+                                if !segments.is_empty()
+                                    && (segments.len() > 1 || segments[0].source != base_table)
+                                {
+                                    let Some(query_cols) = extract_supported_query_columns(
+                                        query,
+                                        rtable,
                                         &base_table,
-                                        ts,
-                                        te,
-                                        scope_values,
+                                    ) else {
+                                        continue;
+                                    };
+                                    // Build cols from ALL base table columns to match original
+                                    // table's column positions (Var.varattno references).
+                                    // Aggregate columns get their agg function; others get None.
+                                    // construct_union_sql_hierarchical NULL-fills columns that
+                                    // don't exist in the rollup tier.
+                                    let mut cols = Vec::new();
+                                    let base_cols_query = format!(
+                                        "SELECT attname::text, atttypid::regtype::text \
+                                         FROM pg_attribute \
+                                         WHERE attrelid = '\"{}\"'::regclass \
+                                         AND attnum > 0 AND NOT attisdropped \
+                                         ORDER BY attnum",
+                                        base_table.replace("\"", "\"\"")
                                     );
-                                    let max_frame_secs = extract_group_granularity_secs(query);
-                                    let segments = resolve_segments(
-                                        &base_table,
-                                        ts,
-                                        te,
-                                        &hierarchy,
-                                        &dirty_ranges,
-                                        tz_offset,
-                                        max_frame_secs,
-                                    );
+                                    let base_table_columns: Vec<(String, String)> =
+                                        Spi::connect(|client| {
+                                            Ok::<Vec<(String, String)>, spi::Error>(
+                                                client
+                                                    .select(&base_cols_query, None, &[])?
+                                                    .map(|r| {
+                                                        let name = r
+                                                            .get::<String>(1)
+                                                            .unwrap()
+                                                            .unwrap_or_default();
+                                                        let typ = r
+                                                            .get::<String>(2)
+                                                            .unwrap()
+                                                            .unwrap_or_default();
+                                                        (name, typ)
+                                                    })
+                                                    .collect(),
+                                            )
+                                        })
+                                        .unwrap_or_default();
 
-                                    if !segments.is_empty()
-                                        && (segments.len() > 1 || segments[0].source != base_table)
-                                    {
-                                        notice!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
+                                    // col_types: name -> original SQL type for casting
+                                    let mut col_types: std::collections::HashMap<
+                                        String,
+                                        String,
+                                    > = std::collections::HashMap::new();
+                                    for (name, typ) in &base_table_columns {
+                                        col_types.insert(name.clone(), typ.clone());
+                                    }
 
-                                        let Some(query_cols) = extract_supported_query_columns(
-                                            query,
-                                            rtable,
-                                            &base_table,
-                                        ) else {
+                                    for (c, _typ) in &base_table_columns {
+                                        if c == "t" {
                                             continue;
-                                        };
-                                        // Build cols from ALL base table columns to match original
-                                        // table's column positions (Var.varattno references).
-                                        // Aggregate columns get their agg function; others get None.
-                                        // construct_union_sql_hierarchical NULL-fills columns that
-                                        // don't exist in the rollup tier.
-                                        let mut cols = Vec::new();
-                                        let base_cols_query = format!(
-                                            "SELECT attname::text, atttypid::regtype::text \
-                                             FROM pg_attribute \
-                                             WHERE attrelid = '\"{}\"'::regclass \
-                                             AND attnum > 0 AND NOT attisdropped \
-                                             ORDER BY attnum",
-                                            base_table.replace("\"", "\"\"")
-                                        );
-                                        let base_table_columns: Vec<(String, String)> =
-                                            Spi::connect(|client| {
-                                                Ok::<Vec<(String, String)>, spi::Error>(
-                                                    client
-                                                        .select(&base_cols_query, None, &[])?
-                                                        .map(|r| {
-                                                            let name = r
-                                                                .get::<String>(1)
-                                                                .unwrap()
-                                                                .unwrap_or_default();
-                                                            let typ = r
-                                                                .get::<String>(2)
-                                                                .unwrap()
-                                                                .unwrap_or_default();
-                                                            (name, typ)
-                                                        })
-                                                        .collect(),
-                                                )
-                                            })
-                                            .unwrap_or_default();
-
-                                        // col_types: name -> original SQL type for casting
-                                        let mut col_types: std::collections::HashMap<
-                                            String,
-                                            String,
-                                        > = std::collections::HashMap::new();
-                                        for (name, typ) in &base_table_columns {
-                                            col_types.insert(name.clone(), typ.clone());
                                         }
-
-                                        for (c, _typ) in &base_table_columns {
-                                            if c == "t" {
-                                                continue;
-                                            }
-                                            if let Some((_, agg)) =
-                                                query_cols.iter().find(|(name, _)| name == c)
-                                            {
-                                                cols.push((c.clone(), agg.clone()));
-                                            } else {
-                                                cols.push((c.clone(), None));
-                                            }
+                                        if let Some((_, agg)) =
+                                            query_cols.iter().find(|(name, _)| name == c)
+                                        {
+                                            cols.push((c.clone(), agg.clone()));
+                                        } else {
+                                            cols.push((c.clone(), None));
                                         }
+                                    }
 
-                                        // Ordered (col, val_str) pairs for z-order bound injection.
-                                        let scope_vals: Vec<(String, String)> = metadata_obj
-                                            .as_ref()
-                                            .map(|m| {
+                                    // Ordered (col, val_str) pairs for z-order bound injection.
+                                    let scope_vals: Vec<(String, String)> = qc_opt
+                                        .and_then(|qc| {
+                                            metadata_obj.as_ref().map(|m| {
                                                 m.scope_columns
                                                     .iter()
                                                     .filter_map(|col| {
@@ -849,24 +855,26 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                                     })
                                                     .collect()
                                             })
-                                            .unwrap_or_default();
+                                        })
+                                        .unwrap_or_default();
 
-                                        let union_sql = construct_union_sql_hierarchical(
-                                            &base_table,
-                                            &segments,
-                                            &cols,
-                                            &offset_cols,
-                                            &col_types,
-                                            &scope_vals,
-                                        );
-                                        let new_query = parse_sql_to_query(&union_sql);
-                                        if !new_query.is_null() {
-                                            (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
-                                            (*rte).subquery = new_query;
-                                            (*rte).relid = pg_sys::InvalidOid;
-                                            (*rte).perminfoindex = 0;
-                                            continue; // Accelerated, move to next RTE
-                                        }
+                                    let union_sql = construct_union_sql_hierarchical(
+                                        &base_table,
+                                        &segments,
+                                        &cols,
+                                        &offset_cols,
+                                        &col_types,
+                                        &scope_vals,
+                                    );
+                                    let new_query = parse_sql_to_query(&union_sql);
+                                    if !new_query.is_null() {
+                                        (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
+                                        (*rte).subquery = new_query;
+                                        (*rte).relid = pg_sys::InvalidOid;
+                                        (*rte).perminfoindex = 0;
+                                        // Notice fires only after acceleration confirmed.
+                                        notice!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
+                                        continue; // Accelerated, move to next RTE
                                     }
                                 }
                             }
@@ -1042,6 +1050,33 @@ fn resolve_segments(
         final_segments.push(seg);
     }
     final_segments
+}
+
+/// Infer the actual data range [ts, te) for unbounded queries by probing
+/// the coarsest rollup view. Returns None when the view is empty or missing.
+fn get_actual_data_range(base_table: &str, hierarchy: &[String]) -> Option<(i64, i64)> {
+    let coarsest = hierarchy
+        .iter()
+        .filter_map(|h| catalog::get_metadata(h).map(|m| (h.clone(), m.frame_seconds)))
+        .filter(|(_, s)| *s > 0)
+        .max_by_key(|(_, s)| *s)
+        .map(|(name, _)| name)?;
+
+    Spi::connect(|client| {
+        let sql = format!(
+            "SELECT MIN(spiral(t))::bigint, MAX(spiral(t))::bigint FROM \"{}\"",
+            coarsest.replace('"', "\"\"")
+        );
+        let result = client.select(&sql, Some(1), &[])?;
+        if result.is_empty() {
+            return Ok::<Option<(i64, i64)>, spi::Error>(None);
+        }
+        let row = result.first();
+        let ts = row.get::<i64>(1)?;
+        let te = row.get::<i64>(2)?;
+        Ok(ts.zip(te).map(|(s, e)| (s, e + 1)))
+    })
+    .unwrap_or(None)
 }
 
 pub fn create_reconstruction_view(rel_name: &str) {
@@ -1458,7 +1493,10 @@ pub(crate) unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
 }
 
 fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
-    agg_fn.eq_ignore_ascii_case("sum")
+    matches!(
+        agg_fn.to_lowercase().as_str(),
+        "sum" | "min" | "max" | "count"
+    )
 }
 
 pub(crate) unsafe fn extract_supported_query_columns(
@@ -1575,10 +1613,13 @@ pub(crate) unsafe fn extract_supported_query_columns(
                     return None;
                 }
 
-                cols.push((
-                    CStr::from_ptr(varname).to_string_lossy().into_owned(),
-                    Some(fn_name),
-                ));
+                let col_name = CStr::from_ptr(varname).to_string_lossy().into_owned();
+                // Two different aggregates on the same source column (e.g. MIN(x) + MAX(x))
+                // can't share a single varattno position in the UNION ALL subquery — fall back.
+                if cols.iter().any(|(c, a)| c == &col_name && a.as_deref() != Some(fn_name.as_str())) {
+                    return None;
+                }
+                cols.push((col_name, Some(fn_name)));
             }
             _ => return None,
         }
@@ -1691,29 +1732,36 @@ pub(crate) unsafe fn extract_group_granularity_secs(query: *mut pg_sys::Query) -
     None
 }
 
-/// Maps an aggregate function name to its corresponding column projection,
-/// adjusting for whether it's querying a rollup view or the base table.
+/// Maps an aggregate function + stored formula to the correct SQL expression
+/// for either a rollup tier or the base table.
 ///
-/// Planner support is intentionally narrow for correctness:
-/// - `SUM(col)` can read directly from a rollup's materialized `sum` column.
-/// - `COUNT`, `MIN`, `MAX`, `AVG`, `DISTINCT`, ordered aggregates, and filtered
-///   aggregates currently fall back to standard PostgreSQL planning.
+/// For rollup tiers the formula determines which sub-column to expose:
+/// - `ohlcv` + MAX → `col_h` (high), MIN → `col_l` (low), SUM → `col_v` (volume)
+/// - `sum`   + MAX/MIN → bare `col` (re-max/re-min of pre-agg maxes/mins is correct)
+/// - `stats` + COUNT → `(col->>'n')::bigint`
+/// - anything else → bare `col` (outer query re-applies the aggregate)
 ///
 /// # Examples
 /// ```rust
 /// use spiral::hooks::map_agg_inner;
 ///
-/// // When not querying a rollup, it preserves the aggregate function call.
-/// assert_eq!(map_agg_inner("SUM", "col_a", false), "SUM(\"col_a\")");
-///
-/// // When querying a rollup, it maps directly to the pre-aggregated column.
-/// assert_eq!(map_agg_inner("SUM", "col_a", true), "\"col_a\"");
+/// assert_eq!(map_agg_inner("SUM", "col_a",     false, "sum"),   "SUM(\"col_a\")");
+/// assert_eq!(map_agg_inner("SUM", "col_a",     true,  "sum"),   "\"col_a\"");
+/// assert_eq!(map_agg_inner("MAX", "temp_ohlcv", true, "ohlcv"), "\"temp_ohlcv_h\"");
+/// assert_eq!(map_agg_inner("MIN", "temp_ohlcv", true, "ohlcv"), "\"temp_ohlcv_l\"");
+/// assert_eq!(map_agg_inner("SUM", "temp_ohlcv", true, "ohlcv"), "\"temp_ohlcv_v\"");
 /// ```
-pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool) -> String {
+pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &str) -> String {
     if !is_rollup {
         return format!("{}(\"{}\")", agg_fn, mapped_col);
     }
-    format!("\"{}\"", mapped_col)
+    match (agg_fn.to_lowercase().as_str(), formula) {
+        ("sum", "ohlcv")   => format!("\"{}_v\"", mapped_col),
+        ("max", "ohlcv")   => format!("\"{}_h\"", mapped_col),
+        ("min", "ohlcv")   => format!("\"{}_l\"", mapped_col),
+        ("count", "stats") => format!("(\"{}\"->>'n')::bigint", mapped_col),
+        _                  => format!("\"{}\"", mapped_col),
+    }
 }
 
 fn format_epoch(epoch: i64) -> String {
@@ -1818,34 +1866,37 @@ fn construct_union_sql_hierarchical(
                     inner_select.push(null_expr);
                     continue;
                 }
-                let mapped = if is_rollup {
-                    Spi::connect(|client| {
-                        client
-                            .select(
-                                &format!(
-                                    "SELECT mat_column FROM spiral.sources \
-                             WHERE view_name = '{}' AND base_column = '{}' AND formula = '{}' \
-                             LIMIT 1",
-                                    src.replace("'", "''"),
-                                    col.replace("'", "''"),
-                                    agg_fn.to_lowercase().replace("'", "''")
-                                ),
-                                None,
-                                &[],
-                            )?
-                            .get_one::<String>()
+                // Two-step lookup: first get (formula, mat_column) by (view, base_col),
+                // then use the formula to pick the right sub-column for the aggregate.
+                let (formula_for_col, mapped) = if is_rollup {
+                    Spi::connect(|client| -> Result<(String, String), spi::Error> {
+                        let rows = client.select(
+                            &format!(
+                                "SELECT formula, mat_column FROM spiral.sources \
+                                 WHERE view_name = '{}' AND base_column = '{}' \
+                                 LIMIT 1",
+                                src.replace("'", "''"),
+                                col.replace("'", "''"),
+                            ),
+                            Some(1),
+                            &[],
+                        )?;
+                        for row in rows {
+                            let formula = row.get::<String>(1)?.unwrap_or_default();
+                            let mat_col = row.get::<String>(2)?.unwrap_or_default();
+                            return Ok((formula, mat_col));
+                        }
+                        Ok((String::new(), col.clone()))
                     })
-                    .unwrap_or(None)
-                    .unwrap_or_else(|| col.clone())
+                    .unwrap_or_else(|_| (String::new(), col.clone()))
                 } else {
-                    col.clone()
+                    (String::new(), col.clone())
                 };
 
                 let col_expr = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
                     reconstruction_expr(&mapped, &oc.formula, is_rollup)
                 } else if is_rollup {
-                    // Rollup: expose pre-aggregated column directly; outer query re-sums.
-                    map_agg_inner(agg_fn, &mapped, true)
+                    map_agg_inner(agg_fn, &mapped, is_rollup, &formula_for_col)
                 } else {
                     // Base table: expose raw column; outer query handles aggregation.
                     format!("\"{}\"", mapped)

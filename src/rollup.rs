@@ -314,7 +314,16 @@ pub fn derive_child_sql(
                     }
                 } else {
                     let bc = if parent_is_view { &src.mat_column } else { &src.base_column };
-                    select_cols.push(format!("sum(\"{}\") as \"{}\"", bc, src.mat_column));
+                    // min/max must propagate with their own aggregate, not sum.
+                    // count propagates as sum-of-counts when rolling up across tiers.
+                    let agg = match src.formula.as_str() {
+                        "min" => "min",
+                        "max" => "max",
+                        "count" if parent_is_view => "sum",
+                        "count" => "count",
+                        _ => "sum",
+                    };
+                    select_cols.push(format!("{}(\"{}\") as \"{}\"", agg, bc, src.mat_column));
                 }
             }
         } else {
