@@ -1,0 +1,131 @@
+LOAD
+psql:tests/pg_regress/sql/regular_tables.sql:3: NOTICE:  extension "spiral" already exists, skipping
+CREATE EXTENSION
+SET
+DROP TABLE
+DROP TABLE
+DROP TABLE
+psql:tests/pg_regress/sql/regular_tables.sql:14: NOTICE:  Spiral: Utility hook caught CREATE relation 'regular_table', query_str length=84
+psql:tests/pg_regress/sql/regular_tables.sql:14: NOTICE:  Spiral: No magic comments in 'regular_table', following standard path.
+CREATE TABLE
+ count 
+-------
+     0
+(1 linha)
+
+ tgname 
+--------
+(0 linha)
+
+    relname    
+---------------
+ regular_table
+(1 linha)
+
+psql:tests/pg_regress/sql/regular_tables.sql:29: NOTICE:  Spiral: Utility hook caught CREATE relation 'regular_table_with_magic', query_str length=111
+psql:tests/pg_regress/sql/regular_tables.sql:29: NOTICE:  Spiral: No magic comments in 'regular_table_with_magic', following standard path.
+CREATE TABLE
+ count 
+-------
+     0
+(1 linha)
+
+ tgname 
+--------
+(0 linha)
+
+         relname          
+--------------------------
+ regular_table_with_magic
+(1 linha)
+
+psql:tests/pg_regress/sql/regular_tables.sql:41: NOTICE:  Spiral: Utility hook caught CREATE relation 'spiral_table', query_str length=98
+psql:tests/pg_regress/sql/regular_tables.sql:41: NOTICE:  Spiral: No magic comments in 'spiral_table', following standard path.
+CREATE TABLE
+ count 
+-------
+     0
+(1 linha)
+
+ ?column? 
+----------
+ f
+(1 linha)
+
+ relname 
+---------
+(0 linha)
+
+psql:tests/pg_regress/sql/regular_tables.sql:49: NOTICE:  drop cascades to view standard_metrics_view
+DROP TABLE
+psql:tests/pg_regress/sql/regular_tables.sql:50: NOTICE:  drop cascades to view standard_metrics_1m_view
+DROP TABLE
+psql:tests/pg_regress/sql/regular_tables.sql:51: NOTICE:  drop cascades to view standard_metrics_1h_view
+DROP TABLE
+DELETE 3
+DELETE 4
+psql:tests/pg_regress/sql/regular_tables.sql:58: NOTICE:  Spiral: Utility hook caught CREATE relation 'standard_metrics', query_str length=87
+psql:tests/pg_regress/sql/regular_tables.sql:58: NOTICE:  Spiral: No magic comments in 'standard_metrics', following standard path.
+CREATE TABLE
+INSERT 0 100
+psql:tests/pg_regress/sql/regular_tables.sql:65: NOTICE:  Spiral: Entering generate_hierarchy_internal for 'standard_metrics', frames='1m,1h'
+psql:tests/pg_regress/sql/regular_tables.sql:65: NOTICE:  Spiral: Utility hook caught CREATE relation 'standard_metrics_1m', query_str length=329
+psql:tests/pg_regress/sql/regular_tables.sql:65: NOTICE:  Spiral: No magic comments in 'standard_metrics_1m', following standard path.
+psql:tests/pg_regress/sql/regular_tables.sql:65: NOTICE:  Spiral: Utility hook caught CREATE relation 'standard_metrics_1h', query_str length=352
+psql:tests/pg_regress/sql/regular_tables.sql:65: NOTICE:  Spiral: No magic comments in 'standard_metrics_1h', following standard path.
+psql:tests/pg_regress/sql/regular_tables.sql:65: NOTICE:  Spiral: Successfully accelerated relation 'standard_metrics'
+ accelerate 
+------------
+ 
+(1 linha)
+
+ count 
+-------
+     2
+(1 linha)
+
+psql:tests/pg_regress/sql/regular_tables.sql:71: NOTICE:  Spiral: reactive_refresh entered for 'standard_metrics', where_clause=None
+psql:tests/pg_regress/sql/regular_tables.sql:71: NOTICE:  Spiral: Utility hook caught CREATE relation 'changelog_snapshot', query_str length=125
+psql:tests/pg_regress/sql/regular_tables.sql:71: NOTICE:  Spiral: No magic comments in 'changelog_snapshot', following standard path.
+psql:tests/pg_regress/sql/regular_tables.sql:71: NOTICE:  Spiral: Utility hook caught CREATE relation 'temp_unified', query_str length=612
+psql:tests/pg_regress/sql/regular_tables.sql:71: NOTICE:  Spiral: No magic comments in 'temp_unified', following standard path.
+psql:tests/pg_regress/sql/regular_tables.sql:71: NOTICE:  Spiral: Utility hook caught CREATE relation 'refreshing_changelog', query_str length=125
+psql:tests/pg_regress/sql/regular_tables.sql:71: NOTICE:  Spiral: No magic comments in 'refreshing_changelog', following standard path.
+ spiral_refresh 
+----------------
+ 
+(1 linha)
+
+psql:tests/pg_regress/sql/regular_tables.sql:74: NOTICE:  Spiral: Accelerating 'standard_metrics' (RTE #1) with range 2026-05-25 07:00:00 to 2026-05-25 08:00:00 (Offset: -10800s)
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on standard_metrics_1h
+         Recheck Cond: ((t >= '2026-05-25 07:00:00-03'::timestamp with time zone) AND (t < '2026-05-25 08:00:00-03'::timestamp with time zone))
+         Filter: (t <@ '{["2026-05-25 07:00:00-03","2026-05-25 08:00:00-03")}'::tstzmultirange)
+         ->  Bitmap Index Scan on idx_u_standard_metrics_1h
+               Index Cond: ((t >= '2026-05-25 07:00:00-03'::timestamp with time zone) AND (t < '2026-05-25 08:00:00-03'::timestamp with time zone))
+(6 linhas)
+
+psql:tests/pg_regress/sql/regular_tables.sql:75: NOTICE:  Spiral: Accelerating 'standard_metrics' (RTE #1) with range 2026-05-25 07:00:00 to 2026-05-25 08:00:00 (Offset: -10800s)
+ sum  
+------
+ 1000
+(1 linha)
+
+psql:tests/pg_regress/sql/regular_tables.sql:78: NOTICE:  Spiral: Accelerating 'standard_metrics' (RTE #1) with range 2026-05-25 07:00:00 to 2026-05-25 08:00:00 (Offset: -10800s)
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on standard_metrics_1h
+         Recheck Cond: ((t >= '2026-05-25 07:00:00-03'::timestamp with time zone) AND (t < '2026-05-25 08:00:00-03'::timestamp with time zone))
+         Filter: (t <@ '{["2026-05-25 07:00:00-03","2026-05-25 08:00:00-03")}'::tstzmultirange)
+         ->  Bitmap Index Scan on idx_u_standard_metrics_1h
+               Index Cond: ((t >= '2026-05-25 07:00:00-03'::timestamp with time zone) AND (t < '2026-05-25 08:00:00-03'::timestamp with time zone))
+(6 linhas)
+
+ spiral_stats_mean 
+-------------------
+                10
+(1 linha)
+

@@ -89,6 +89,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
     _tuples: *mut f64,
     _allvisfrac: *mut f64,
 ) {
+    warning!("Spiral: CLUSTER is currently a no-op for Spiral TAM relations.");
 }
 
 #[pg_guard]
@@ -193,12 +194,91 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_slot_insert(
-    _rel: pg_sys::Relation,
-    _slot: *mut pg_sys::TupleTableSlot,
+    rel: pg_sys::Relation,
+    slot: *mut pg_sys::TupleTableSlot,
     _cid: pg_sys::CommandId,
     _options: i32,
     _state: *mut pg_sys::BulkInsertStateData,
 ) {
+    if rel.is_null() || slot.is_null() {
+        return;
+    }
+
+    let tupdesc = (*slot).tts_tupleDescriptor;
+    let mut t_val: Option<i64> = None;
+    let mut tenant_id: Option<i32> = None;
+    let mut value: Option<f64> = None;
+
+    pg_sys::slot_getallattrs(slot);
+    for i in 0..(*tupdesc).natts {
+        let name_ptr = pg_sys::get_attname((*rel).rd_id, (i + 1) as i16, true);
+        if name_ptr.is_null() {
+            continue;
+        }
+        let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+        notice!("Spiral: found column '{}'", name);
+        let is_null = *(*slot).tts_isnull.add(i as usize);
+        if is_null {
+            continue;
+        }
+        let datum = *(*slot).tts_values.add(i as usize);
+
+        match name.as_str() {
+            "t" => {
+                t_val = Some(i64::from_datum(datum, false).unwrap());
+            }
+            "tenant_id" | "sensor_id" | "symbol_id" => {
+                tenant_id = Some(i32::from_datum(datum, false).unwrap());
+            }
+            "value" | "price" | "reading" | "val" => {
+                value = Some(f64::from_datum(datum, false).unwrap());
+            }
+            _ => {}
+        }
+    }
+
+    if let (Some(t), Some(tid), Some(v)) = (t_val, tenant_id, value) {
+        notice!("Spiral: insert (t={}, tid={}, v={})", t, tid, v);
+        let mut tenant_scale = 1024;
+        let rel_oid = (*rel).rd_id;
+        let relname_ptr = pg_sys::get_rel_name(rel_oid);
+        if !relname_ptr.is_null() {
+            let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
+            if let Some(m) = crate::catalog::get_metadata(&name) {
+                tenant_scale = crate::catalog::get_tenant_scale(&m);
+            }
+        }
+
+        let kickoff = crate::get_kickoff_epoch();
+        let t_rel = t - kickoff;
+
+        if t_rel >= 0 && (0..tenant_scale).contains(&(tid as i64)) {
+            let logical_offset = (t_rel * tenant_scale * 8) + (tid as i64 * 8);
+            let (blkno, page_offset) = crate::storage::logical_to_physical_offset(logical_offset);
+
+            let mut nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            while nblocks <= blkno {
+                let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
+                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+                let page = pg_sys::BufferGetPage(buffer);
+                crate::storage::initialize_spiral_page(page, tenant_scale as i32);
+                pg_sys::MarkBufferDirty(buffer);
+                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                pg_sys::ReleaseBuffer(buffer);
+                nblocks += 1;
+            }
+
+            let buffer = pg_sys::ReadBuffer(rel, blkno);
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+            let page = pg_sys::BufferGetPage(buffer);
+            let ptr = (page as *mut u8).add(page_offset as usize);
+            *(ptr as *mut f64) = v;
+
+            pg_sys::MarkBufferDirty(buffer);
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+            pg_sys::ReleaseBuffer(buffer);
+        }
+    }
 }
 
 #[pg_guard]
@@ -349,6 +429,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
     _params: *mut pg_sys::VacuumParams,
     _bstrategy: pg_sys::BufferAccessStrategy,
 ) {
+    warning!("Spiral: VACUUM is currently a no-op for Spiral TAM relations.");
 }
 
 #[pg_guard]
@@ -584,20 +665,91 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot_tidrange(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_block(
-    _scan: pg_sys::TableScanDesc,
+    scan: pg_sys::TableScanDesc,
     _stream: *mut pg_sys::ReadStream,
 ) -> bool {
-    false
+    let spiral_scan = scan as *mut SpiralScanDescData;
+    let state = &mut *(*spiral_scan).state;
+
+    state.current_blkno < state.total_blks
 }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
-    _scan: pg_sys::TableScanDesc,
+    scan: pg_sys::TableScanDesc,
     _oldest_xmin: pg_sys::TransactionId,
-    _liverows: *mut f64,
+    liverows: *mut f64,
     _deadrows: *mut f64,
-    _slot: *mut pg_sys::TupleTableSlot,
+    slot: *mut pg_sys::TupleTableSlot,
 ) -> bool {
+    let spiral_scan = scan as *mut SpiralScanDescData;
+    let state = &mut *(*spiral_scan).state;
+    let rel = (*scan).rs_rd;
+
+    while state.current_blkno < state.total_blks {
+        let buffer = pg_sys::ReadBuffer(rel, state.current_blkno);
+        if buffer == 0 {
+            state.current_blkno += 1;
+            state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+            continue;
+        }
+
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buffer);
+        
+        if !crate::storage::is_valid_spiral_page(page) {
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+            pg_sys::ReleaseBuffer(buffer);
+            state.current_blkno += 1;
+            state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+            continue;
+        }
+
+        let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
+        while state.current_offset_in_page + 8 <= upper_bound {
+            let ptr = (page as *const u8).add(state.current_offset_in_page as usize);
+            let val = *(ptr as *const f64);
+            state.current_offset_in_page += 8;
+
+            if val != 0.0 {
+                let items_before = (state.current_offset_in_page - 8 - crate::storage::HEADER_SIZE as u32) / 8;
+                let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64)
+                    + items_before as i64;
+
+                let t = idx / state.tenant_scale;
+                let tenant_id = (idx % state.tenant_scale) as i32;
+
+                pg_sys::ExecClearTuple(slot);
+                let values = (*slot).tts_values;
+                let isnull = (*slot).tts_isnull;
+
+                if !values.is_null() && !isnull.is_null() {
+                    *values.add(0) = t.into_datum().unwrap();
+                    *isnull.add(0) = false;
+                    *values.add(1) = tenant_id.into_datum().unwrap();
+                    *isnull.add(1) = false;
+                    *values.add(2) = val.into_datum().unwrap();
+                    *isnull.add(2) = false;
+                    pg_sys::ExecStoreVirtualTuple(slot);
+                }
+
+                if !liverows.is_null() {
+                    *liverows += 1.0;
+                }
+
+                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                pg_sys::ReleaseBuffer(buffer);
+                return true;
+            }
+        }
+
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+        pg_sys::ReleaseBuffer(buffer);
+        state.current_blkno += 1;
+        state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+        
+        return false;
+    }
     false
 }
 
@@ -663,13 +815,33 @@ mod tests {
     use pgrx::prelude::*;
 
     #[pg_test]
-    fn test_tam_insert_placeholder() {
+    fn test_tam_insert_functional() {
         Spi::connect_mut(|client| {
-            client.update("CREATE TABLE tam_test_internal (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
-            client.update("INSERT INTO tam_test_internal (t, tenant_id, value) VALUES (1, 1, 42.0);", None, &[])?;
-            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_test_internal").unwrap().unwrap();
-            // Since INSERT is a placeholder, count should be 0
-            assert_eq!(count, 0);
+            client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
+            client.update("CREATE TABLE tam_test_functional (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
+            client.update("INSERT INTO tam_test_functional (t, tenant_id, value) VALUES (1, 1, 42.0);", None, &[])?;
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_test_functional").unwrap().unwrap();
+            assert_eq!(count, 1);
+            
+            let val = Spi::get_one::<f64>("SELECT value FROM tam_test_functional LIMIT 1").unwrap().unwrap();
+            assert_eq!(val, 42.0);
+            Ok::<(), spi::Error>(())
+        }).unwrap();
+    }
+
+    #[pg_test]
+    fn test_tam_analyze() {
+        Spi::connect_mut(|client| {
+            client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
+            client.update("CREATE TABLE tam_analyze_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
+            client.update("INSERT INTO tam_analyze_test (t, tenant_id, value) VALUES (0, 0, 10.0), (0, 1, 20.0), (0, 2, 30.0);", None, &[])?;
+            
+            client.update("ANALYZE tam_analyze_test;", None, &[])?;
+            
+            // Check pg_stats to verify that ANALYZE successfully scanned the columns
+            let row_count = Spi::get_one::<i64>("SELECT count(*) FROM pg_stats WHERE tablename = 'tam_analyze_test'").unwrap().unwrap();
+            assert!(row_count > 0);
+            
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
