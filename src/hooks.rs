@@ -2115,15 +2115,7 @@ pub fn spiral_explain(query_sql: &str) -> String {
             }
             let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
 
-            let hierarchy = Spi::connect(|client| {
-                let mut views = Vec::new();
-                let table_exists = !client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.is_empty();
-                if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
-
-                let table = client.select(&format!("SELECT view_name FROM spiral.metadata WHERE base_view = '{}'", base_table.replace("'", "''")), None, &[])?;
-                for row in table { views.push(row.get::<String>(1)?.unwrap()); }
-                Ok::<Vec<String>, spi::Error>(views)
-            }).unwrap_or_default();
+            let hierarchy = catalog::get_hierarchy(&base_table);
 
             if hierarchy.is_empty() {
                 report.push_str(&format!(
