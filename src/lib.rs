@@ -21,6 +21,10 @@ pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
 
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
+    /// Set by the planner hook when a time-range constraint is detected on a spiral
+    /// table that will be scanned via the TAM (not redirected to a rollup tier).
+    /// Consumed (taken) by `spiral_scan_begin` to compute the first/last page.
+    pub static SCAN_TIME_RANGE: Cell<Option<(i64, i64)>> = const { Cell::new(None) };
 }
 
 #[pg_guard]

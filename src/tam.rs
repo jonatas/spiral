@@ -373,6 +373,10 @@ struct SpiralScanState {
     tenant_scale: i64,
     current_blkno: pg_sys::BlockNumber,
     total_blks: pg_sys::BlockNumber,
+    /// First page that could contain data within the query's time range.
+    scan_first_blk: pg_sys::BlockNumber,
+    /// Exclusive upper page bound for the query's time range.
+    scan_last_blk: pg_sys::BlockNumber,
     current_offset_in_page: u32,
 }
 
@@ -420,10 +424,25 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     } else {
         0
     };
+    // Consume the time range set by the planner hook (None → full scan).
+    let time_range = crate::SCAN_TIME_RANGE.with(|r| r.take());
+    let (scan_first_blk, scan_last_blk) = if let Some((ts, te)) = time_range {
+        let dpg = crate::storage::DATA_PER_PAGE as i64;
+        let first = (ts.saturating_mul(tenant_scale) / dpg).max(0) as u32;
+        let last = ((te.saturating_mul(tenant_scale) / dpg) + 1)
+            .min(total_blks as i64)
+            .max(0) as u32;
+        (first, last)
+    } else {
+        (0, total_blks)
+    };
+
     let state = pg_sys::palloc0(std::mem::size_of::<SpiralScanState>()) as *mut SpiralScanState;
     (*state).tenant_scale = tenant_scale;
-    (*state).current_blkno = 0;
+    (*state).current_blkno = scan_first_blk;
     (*state).total_blks = total_blks;
+    (*state).scan_first_blk = scan_first_blk;
+    (*state).scan_last_blk = scan_last_blk;
     (*state).current_offset_in_page = crate::storage::HEADER_SIZE as u32;
 
     (*spiral_scan).state = state;
@@ -449,7 +468,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
     let state = &mut *(*spiral_scan).state;
     let rel = (*scan).rs_rd;
 
-    while state.current_blkno < state.total_blks {
+    let blk_limit = state.scan_last_blk.min(state.total_blks);
+    while state.current_blkno < blk_limit {
         let buffer = pg_sys::ReadBuffer(rel, state.current_blkno);
         if buffer == 0 {
             // InvalidBuffer is 0
@@ -539,7 +559,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
         let spiral_scan = scan as *mut SpiralScanDescData;
         if !(*spiral_scan).state.is_null() {
             let state = &mut *(*spiral_scan).state;
-            state.current_blkno = 0;
+            state.current_blkno = state.scan_first_blk;
             state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
         }
     }

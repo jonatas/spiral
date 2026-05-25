@@ -3,6 +3,7 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::cell::Cell;
 use std::ffi::CStr;
+use std::panic::AssertUnwindSafe;
 use std::os::raw::{c_char, c_int};
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
@@ -52,7 +53,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
         return;
     }
     IN_UTILITY.with(|h| h.set(true));
-
+    PgTryBuilder::new(AssertUnwindSafe(|| {
     let utility_stmt = (*pstmt).utilityStmt;
     if !utility_stmt.is_null() {
         let tag = (*utility_stmt).type_;
@@ -107,7 +108,6 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                         qc,
                     );
                 }
-                IN_UTILITY.with(|h| h.set(false));
                 return;
             }
 
@@ -419,7 +419,6 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     crate::bgworker::maybe_start_worker();
                 }
 
-                IN_UTILITY.with(|h| h.set(false));
                 return;
             } else {
                 notice!(
@@ -453,7 +452,21 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
             qc,
         );
     }
-    IN_UTILITY.with(|h| h.set(false));
+    })) // end PgTryBuilder closure
+    .catch_others(|e| {
+        // Bad magic comment or SPI failure during hierarchy setup. Table was already
+        // created by standard_ProcessUtility above; only Spiral acceleration is skipped.
+        warning!(
+            "Spiral: error during CREATE TABLE hook processing — hierarchy setup skipped. \
+             The table was created but Spiral acceleration is NOT configured. \
+             Fix the magic comment directives and recreate the table to enable acceleration. \
+             Error: {:?}",
+            e
+        );
+        e.rethrow()
+    })
+    .finally(|| IN_UTILITY.with(|h| h.set(false)))
+    .execute()
 }
 
 #[derive(Default, Clone, Debug)]
@@ -670,6 +683,9 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
         };
     }
     IN_HOOK.with(|h| h.set(true));
+    // Clear any stale time range from a previous query so non-spiral scans see None.
+    crate::SCAN_TIME_RANGE.with(|r| r.set(None));
+    PgTryBuilder::new(AssertUnwindSafe(|| {
     // Ensure background worker is running for this database. The WORKER_STARTED
     // thread-local guard makes this a cheap no-op after the first query per session,
     // which lets the worker recover after a server restart without a new CREATE TABLE.
@@ -706,6 +722,8 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
 
                             if let Some(qc) = constraint_map.get(&varno) {
                                 if let (Some(ts), Some(te)) = (qc.start, qc.end) {
+                                    // Publish time range so the TAM scan can skip pages outside [ts, te].
+                                    crate::SCAN_TIME_RANGE.with(|r| r.set(Some((ts, te))));
                                     // Build scope_values JsonB from qc.scopes if they match view's scope_columns
                                     let scope_values = metadata_obj.as_ref().and_then(|m| {
                                         let mut map = serde_json::Map::new();
@@ -903,13 +921,14 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
             }
         }
     }
-    let result = if let Some(prev_hook) = PREV_PLANNER_HOOK {
+    if let Some(prev_hook) = PREV_PLANNER_HOOK {
         prev_hook(parse, query_string, cursor_options, bound_params)
     } else {
         pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
-    };
-    IN_HOOK.with(|h| h.set(false));
-    result
+    }
+    })) // end PgTryBuilder closure
+    .finally(|| IN_HOOK.with(|h| h.set(false)))
+    .execute()
 }
 
 #[derive(Debug)]
