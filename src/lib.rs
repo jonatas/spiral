@@ -248,10 +248,34 @@ pub fn cluster_table_internal(table_name: &str, time_col: &str, dimensions: Vec<
 }
 
 #[pg_extern]
+/// Convert a scope_values JSONB string like `{"tenant_id": 42}` to a SQL WHERE clause
+/// like `"tenant_id" = 42` for tight base-table index pushdown during per-scope refresh.
+fn scope_json_to_where(scope_json: &str) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_str(scope_json).ok()?;
+    let obj = val.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = obj
+        .iter()
+        .map(|(k, v)| {
+            let rhs = match v {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => format!("'{}'", v.to_string().replace('\'', "''")),
+            };
+            format!("\"{}\" = {}", k.replace('"', "\"\""), rhs)
+        })
+        .collect();
+    Some(clauses.join(" AND "))
+}
+
 fn refresh_incremental(
     view_name: &str,
-    extra_where: default!(Option<String>, "NULL"),
-    depth: default!(i32, 0),
+    extra_where: Option<String>,
+    depth: i32,
+    scope_json: Option<String>,
 ) -> bool {
     if depth > 5 {
         notice!(
@@ -342,14 +366,24 @@ fn refresh_incremental(
             .collect::<Vec<_>>()
             .join(", ");
 
-        let mut source_where = if scope_cols_raw.is_empty() {
+        let safe_key = changelog_key.replace('\'', "''");
+        let mut source_where = if let Some(ref sj) = scope_json {
+            // Per-scope refresh: exact JSONB match — tight changelog JOIN, no cross-scope fan-out.
+            let safe_sj = sj.replace('\'', "''");
             format!(
-                "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
+                "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
+                    AND spiral(t) >= (c.t_start/{0})*{0}
+                    AND spiral(t) < ((c.t_end/{0})+1)*{0}
+                    AND c.scope_values = '{safe_sj}'::jsonb",
+                frame_seconds,
+            )
+        } else if scope_cols_raw.is_empty() {
+            format!(
+                "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
                     AND spiral(t) >= (c.t_start/{0})*{0}
                     AND spiral(t) < ((c.t_end/{0})+1)*{0}
                     AND c.scope_values = '{{}}'::jsonb",
                 frame_seconds,
-                changelog_key = changelog_key.replace("'", "''")
             )
         } else {
             let scope_cols_json = scope_cols_raw
@@ -358,17 +392,22 @@ fn refresh_incremental(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "JOIN spiral.changelog c ON c.base_view = '{changelog_key}'
+                "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
                     AND spiral(t) >= (c.t_start/{0})*{0}
                     AND spiral(t) < ((c.t_end/{0})+1)*{0}
                     AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
                 frame_seconds,
                 scope_cols_json,
-                changelog_key = changelog_key.replace("'", "''")
             )
         };
-        if let Some(ref extra) = extra_where {
-            source_where.push_str(&format!(" WHERE ({})", extra));
+
+        // Base table WHERE: scope_json-derived filter for index pushdown, else extra_where.
+        let base_where = scope_json
+            .as_deref()
+            .and_then(scope_json_to_where)
+            .or_else(|| extra_where.clone());
+        if let Some(ref w) = base_where {
+            source_where.push_str(&format!(" WHERE ({})", w));
         }
 
         let group_by_clause = if scope_cols.is_empty() {
@@ -418,7 +457,7 @@ fn refresh_incremental(
     let children = catalog::get_children(view_name);
     for child in children {
         if child != view_name {
-            let _ = refresh_incremental(&child, extra_where.clone(), depth + 1);
+            let _ = refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone());
         }
     }
     true
@@ -489,6 +528,14 @@ fn spiral_status(base_table: &str) -> pgrx::JsonB {
 #[pg_extern(name = "spiral_refresh")]
 fn spiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL")) {
     hooks::reactive_refresh(view_name, where_clause.map(|s| s.to_string()));
+}
+
+/// Refresh a single scope identified by its scope_values JSONB text.
+/// Building block for parallel dispatch: callers can invoke this concurrently
+/// across scopes (e.g. via pg_background) to achieve N-scope parallelism.
+#[pg_extern(name = "spiral_refresh_scope")]
+fn spiral_refresh_scope(view_name: &str, scope_json: &str) {
+    hooks::reactive_refresh_by_scope(view_name, scope_json.to_string());
 }
 
 #[pg_extern(name = "spiral_register_view_rust")]
@@ -1177,6 +1224,95 @@ mod tests {
             t2_rows, 0,
             "tenant 2 must not appear in rollup before its own refresh"
         );
+    }
+
+    #[pg_test]
+    fn test_full_refresh_processes_all_scopes() {
+        // Full spiral_refresh must process all tenant scopes and clear their changelog entries.
+        // Per-scope MERGE must produce correct rollup rows for every distinct scope_values bucket.
+        Spi::run("CREATE TABLE par_ticks (t timestamptz NOT NULL, val numeric, org_id int4)")
+            .unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('par_ticks', 'BASE', 0, 'par_ticks', '{org_id}')").unwrap();
+        Spi::run("SELECT spiral_register_view('par_ticks_1h', 'par_ticks', 3600, 'par_ticks', '{org_id}')").unwrap();
+
+        // Insert 3 tenants, 4 rows each across 2 hours
+        for org in 1..=3_i32 {
+            Spi::run(&format!(
+                "INSERT INTO par_ticks (t, val, org_id)
+                 SELECT now() - interval '1 hour' + (i * interval '20 minutes'), {org} * 10.0, {org}
+                 FROM generate_series(0, 3) i"
+            ))
+            .unwrap();
+        }
+
+        // All 3 tenants must have changelog entries
+        let entries: i64 = Spi::get_one(
+            "SELECT COUNT(DISTINCT scope_values)::bigint FROM spiral.changelog WHERE base_view = 'par_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert_eq!(entries, 3, "3 distinct scope buckets expected in changelog");
+
+        // Full refresh — must process all scopes in one call
+        Spi::run("SELECT spiral_refresh('par_ticks')").unwrap();
+
+        // Changelog cleared
+        let remaining: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'par_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(remaining, 0, "changelog must be empty after full refresh");
+
+        // All 3 tenants have rollup rows
+        for org in 1..=3_i32 {
+            let rows: i64 = Spi::get_one(&format!(
+                "SELECT COUNT(*)::bigint FROM par_ticks_1h WHERE org_id = {org}"
+            ))
+            .unwrap()
+            .unwrap_or(0);
+            assert!(rows > 0, "org {org} must have rollup rows after full refresh");
+        }
+    }
+
+    #[pg_test]
+    fn test_spiral_refresh_scope_single_tenant() {
+        // spiral_refresh_scope must refresh exactly one scope and leave others untouched.
+        Spi::run("CREATE TABLE rscope_ticks (t timestamptz NOT NULL, val numeric, uid int4)")
+            .unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('rscope_ticks', 'BASE', 0, 'rscope_ticks', '{uid}')").unwrap();
+        Spi::run("SELECT spiral_register_view('rscope_ticks_1h', 'rscope_ticks', 3600, 'rscope_ticks', '{uid}')").unwrap();
+
+        for uid in [10_i32, 20_i32] {
+            Spi::run(&format!(
+                "INSERT INTO rscope_ticks (t, val, uid)
+                 SELECT now() - interval '30 minutes', {uid}.0, {uid}"
+            ))
+            .unwrap();
+        }
+
+        // Refresh only uid=10 via spiral_refresh_scope
+        Spi::run("SELECT spiral_refresh_scope('rscope_ticks', '{\"uid\": 10}')").unwrap();
+
+        let uid10_rows: i64 =
+            Spi::get_one("SELECT COUNT(*)::bigint FROM rscope_ticks_1h WHERE uid = 10")
+                .unwrap()
+                .unwrap_or(0);
+        assert!(uid10_rows > 0, "uid=10 must have rollup rows");
+
+        let uid20_rows: i64 =
+            Spi::get_one("SELECT COUNT(*)::bigint FROM rscope_ticks_1h WHERE uid = 20")
+                .unwrap()
+                .unwrap_or(0);
+        assert_eq!(uid20_rows, 0, "uid=20 must be untouched by single-scope refresh");
+
+        // uid=20 changelog entry must still exist
+        let remaining: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'rscope_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert!(remaining > 0, "uid=20 changelog entry must survive");
     }
 
     #[pg_test]
