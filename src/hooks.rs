@@ -1054,13 +1054,12 @@ fn resolve_segments(
 
 /// Infer the actual data range [ts, te) for unbounded queries by probing
 /// the coarsest rollup view. Returns None when the view is empty or missing.
-fn get_actual_data_range(base_table: &str, hierarchy: &[String]) -> Option<(i64, i64)> {
-    let coarsest = hierarchy
+fn get_actual_data_range(_base_table: &str, hierarchy: &[String]) -> Option<(i64, i64)> {
+    let (coarsest, frame_secs) = hierarchy
         .iter()
         .filter_map(|h| catalog::get_metadata(h).map(|m| (h.clone(), m.frame_seconds)))
         .filter(|(_, s)| *s > 0)
-        .max_by_key(|(_, s)| *s)
-        .map(|(name, _)| name)?;
+        .max_by_key(|(_, s)| *s)?;
 
     Spi::connect(|client| {
         let sql = format!(
@@ -1074,7 +1073,9 @@ fn get_actual_data_range(base_table: &str, hierarchy: &[String]) -> Option<(i64,
         let row = result.first();
         let ts = row.get::<i64>(1)?;
         let te = row.get::<i64>(2)?;
-        Ok(ts.zip(te).map(|(s, e)| (s, e + 1)))
+        // te = last bucket start + frame_seconds covers the full last bucket.
+        // +1 would only cover 1 second, missing the rest of the final bucket.
+        Ok(ts.zip(te).map(|(s, e)| (s, e + frame_secs as i64)))
     })
     .unwrap_or(None)
 }
@@ -1856,18 +1857,10 @@ fn construct_union_sql_hierarchical(
             let orig_type = col_types.get(col).map(|s| s.as_str()).unwrap_or("");
 
             if let Some(agg_fn) = agg {
-                if is_rollup && !rollup_cols.contains(col.as_str()) {
-                    // NULL-fill with original type cast so Var nodes resolve correctly
-                    let null_expr = if orig_type.is_empty() {
-                        format!("NULL AS \"{}\"", col)
-                    } else {
-                        format!("NULL::{} AS \"{}\"", orig_type, col)
-                    };
-                    inner_select.push(null_expr);
-                    continue;
-                }
                 // Two-step lookup: first get (formula, mat_column) by (view, base_col),
                 // then use the formula to pick the right sub-column for the aggregate.
+                // Must run BEFORE NULL-fill check: ohlcv columns are not in rollup_cols
+                // under the base column name (e.g. "temperature" → "temperature_ohlcv_h").
                 let (formula_for_col, mapped) = if is_rollup {
                     Spi::connect(|client| -> Result<(String, String), spi::Error> {
                         let rows = client.select(
@@ -1892,6 +1885,19 @@ fn construct_union_sql_hierarchical(
                 } else {
                     (String::new(), col.clone())
                 };
+
+                // NULL-fill only when: rollup tier AND no formula mapping found AND base
+                // column not directly present. If a formula mapping exists, the column is
+                // accessible via the mapped sub-column expression.
+                if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) {
+                    let null_expr = if orig_type.is_empty() {
+                        format!("NULL AS \"{}\"", col)
+                    } else {
+                        format!("NULL::{} AS \"{}\"", orig_type, col)
+                    };
+                    inner_select.push(null_expr);
+                    continue;
+                }
 
                 let col_expr = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
                     reconstruction_expr(&mapped, &oc.formula, is_rollup)
