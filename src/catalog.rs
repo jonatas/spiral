@@ -1,15 +1,85 @@
 use pgrx::prelude::*;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
+#[derive(Clone)]
 pub struct Metadata {
     pub parent_view: String,
     pub frame_seconds: i32,
     pub base_view: String,
     pub scope_columns: Vec<String>,
-    pub columns_metadata: pgrx::JsonB,
+    pub columns_metadata: serde_json::Value,
+}
+
+thread_local! {
+    /// Cached result of checking whether spiral.metadata exists.
+    /// None = unchecked, Some(false) = absent, Some(true) = present.
+    static METADATA_TABLE_EXISTS: Cell<Option<bool>> = const { Cell::new(None) };
+    /// base_table → ordered list of rollup view names (the hierarchy).
+    static HIERARCHY_CACHE: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+    /// view_name → metadata row (None = confirmed absent).
+    static METADATA_CACHE: RefCell<HashMap<String, Option<Metadata>>> = RefCell::new(HashMap::new());
+    /// view_name → offset columns.
+    static OFFSET_COLS_CACHE: RefCell<HashMap<String, Vec<OffsetColumn>>> = RefCell::new(HashMap::new());
+}
+
+/// Invalidate all per-session catalog caches. Call after any DDL that touches
+/// spiral.metadata or the set of rollup views.
+pub fn invalidate_catalog_cache() {
+    METADATA_TABLE_EXISTS.with(|c| c.set(None));
+    HIERARCHY_CACHE.with(|c| c.borrow_mut().clear());
+    METADATA_CACHE.with(|c| c.borrow_mut().clear());
+    OFFSET_COLS_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+fn spiral_metadata_table_exists() -> bool {
+    if let Some(cached) = METADATA_TABLE_EXISTS.with(|c| c.get()) {
+        return cached;
+    }
+    let exists = Spi::connect(|client| {
+        Ok::<bool, spi::Error>(
+            !client.select(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1",
+                Some(1),
+                &[],
+            )?.is_empty()
+        )
+    }).unwrap_or(false);
+    METADATA_TABLE_EXISTS.with(|c| c.set(Some(exists)));
+    exists
+}
+
+/// Returns the ordered list of rollup view names for `base_table`, cached per session.
+pub fn get_hierarchy(base_table: &str) -> Vec<String> {
+    let cached = HIERARCHY_CACHE.with(|c| c.borrow().get(base_table).cloned());
+    if let Some(v) = cached {
+        return v;
+    }
+    if !spiral_metadata_table_exists() {
+        return vec![];
+    }
+    let views = Spi::connect(|client| {
+        let mut v = Vec::new();
+        let table = client.select(
+            &format!("SELECT view_name FROM spiral.metadata WHERE base_view = '{}'",
+                     base_table.replace("'", "''")),
+            None, &[])?;
+        for row in table {
+            v.push(row.get::<String>(1)?.unwrap_or_default());
+        }
+        Ok::<Vec<String>, spi::Error>(v)
+    }).unwrap_or_default();
+    HIERARCHY_CACHE.with(|c| c.borrow_mut().insert(base_table.to_string(), views.clone()));
+    views
 }
 
 pub fn get_metadata(view_name: &str) -> Option<Metadata> {
-    Spi::connect(|client| {
+    let cached = METADATA_CACHE.with(|c| c.borrow().get(view_name).cloned());
+    if let Some(entry) = cached {
+        return entry;
+    }
+    let result = Spi::connect(|client| {
         let table = client.select(
             &format!("SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata WHERE view_name = '{}'", view_name.replace("'", "''")),
             None,
@@ -24,9 +94,11 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
             frame_seconds: row.get::<i32>(2)?.unwrap_or(0),
             base_view: row.get::<String>(3)?.unwrap_or_default(),
             scope_columns: row.get::<Vec<String>>(4)?.unwrap_or_default(),
-            columns_metadata: row.get::<pgrx::JsonB>(5)?.unwrap_or_else(|| pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new()))),
+            columns_metadata: row.get::<pgrx::JsonB>(5)?.map(|j| j.0).unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
         }))
-    }).unwrap_or_default()
+    }).unwrap_or_default();
+    METADATA_CACHE.with(|c| c.borrow_mut().insert(view_name.to_string(), result.clone()));
+    result
 }
 
 pub fn get_children(view_name: &str) -> Vec<String> {
@@ -86,6 +158,8 @@ pub fn insert_metadata(
         metadata_json.replace("'", "''")
     );
     let _ = Spi::run(&sql);
+    // Inserted new metadata — invalidate so the next planner lookup picks it up.
+    invalidate_catalog_cache();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,7 +271,7 @@ pub fn get_dirty_ranges(
 }
 
 pub fn get_tenant_scale(metadata: &Metadata) -> i64 {
-    if let serde_json::Value::Object(map) = &metadata.columns_metadata.0 {
+    if let serde_json::Value::Object(map) = &metadata.columns_metadata {
         if let Some(serde_json::Value::String(s)) = map.get("cardinality") {
             return match s.as_str() {
                 "d" => 10,
@@ -213,13 +287,18 @@ pub fn get_tenant_scale(metadata: &Metadata) -> i64 {
     1024
 }
 
+#[derive(Clone)]
 pub struct OffsetColumn {
     pub mat_column: String,
     pub formula: String,
 }
 
 pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
-    Spi::connect(|client| {
+    let cached = OFFSET_COLS_CACHE.with(|c| c.borrow().get(view_name).cloned());
+    if let Some(v) = cached {
+        return v;
+    }
+    let cols = Spi::connect(|client| {
         let sql = format!(
             "SELECT mat_column, formula FROM spiral.sources
              WHERE view_name = '{}' AND formula IN ('range_max_end', 'range_merge')",
@@ -235,5 +314,7 @@ pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
                 .collect(),
         )
     })
-    .unwrap_or_default()
+    .unwrap_or_default();
+    OFFSET_COLS_CACHE.with(|c| c.borrow_mut().insert(view_name.to_string(), cols.clone()));
+    cols
 }

@@ -1201,6 +1201,44 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_utility_hook_resets_in_utility_after_bad_directive() {
+        // Verify IN_UTILITY is false before we start.
+        assert!(!hooks::is_in_utility_for_test());
+
+        // Multi-word formula ("bad formula here") triggers error! inside the utility
+        // hook body — after standard_ProcessUtility already ran (table exists).
+        // Before the fix this left IN_UTILITY stuck true for the session.
+        let result = std::panic::catch_unwind(|| {
+            Spi::run(
+                "CREATE TABLE _reentry_bad (
+                    t timestamptz,
+                    v float8  -- Spiral: bad formula here
+                ) WITH (spiral.frames = '1h')",
+            )
+            .unwrap();
+        });
+        assert!(result.is_err(), "multi-word formula must raise an error");
+
+        // PgTryBuilder.finally must have reset IN_UTILITY regardless of the error.
+        assert!(
+            !hooks::is_in_utility_for_test(),
+            "IN_UTILITY stuck true after hook error — reentrancy guard broken"
+        );
+    }
+
+    #[pg_test]
+    fn test_planner_hook_resets_in_hook_after_normal_select() {
+        // After the planner hook runs and returns normally, IN_HOOK must be false.
+        // Verifies PgTryBuilder.finally fires on the happy path (replaces manual reset).
+        Spi::run("CREATE TABLE _planner_reset (t timestamptz, v float8)").unwrap();
+        let _ = Spi::get_one::<f64>("SELECT sum(v) FROM _planner_reset");
+        assert!(
+            !hooks::is_in_hook_for_test(),
+            "IN_HOOK stuck true after planner hook completed — reentrancy guard broken"
+        );
+    }
+
+    #[pg_test]
     fn test_hierarchy_build_success_has_triggers_and_rollup() {
         // Happy-path regression: a valid Spiral table must have changelog triggers
         // and at least one rollup tier created — no silent partial failures.

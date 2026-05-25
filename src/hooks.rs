@@ -14,6 +14,16 @@ thread_local! {
     static IN_UTILITY: Cell<bool> = const { Cell::new(false) };
 }
 
+#[cfg(any(test, feature = "pg_test"))]
+pub fn is_in_hook_for_test() -> bool {
+    IN_HOOK.with(|h| h.get())
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn is_in_utility_for_test() -> bool {
+    IN_UTILITY.with(|h| h.get())
+}
+
 #[pg_guard]
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C-unwind" fn spiral_process_utility_hook(
@@ -465,7 +475,11 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
         );
         e.rethrow()
     })
-    .finally(|| IN_UTILITY.with(|h| h.set(false)))
+    .finally(|| {
+        IN_UTILITY.with(|h| h.set(false));
+        // DDL may have added/removed spiral relations — invalidate cached hierarchy.
+        catalog::invalidate_catalog_cache();
+    })
     .execute()
 }
 
@@ -705,16 +719,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                     let relname = pg_sys::get_rel_name(relid);
                     if !relname.is_null() {
                         let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
-                        let hierarchy = Spi::connect(|client| {
-                            let mut views = Vec::new();
-                            // Safety check: Ensure the metadata table exists before querying
-                            let table_exists = !client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1", Some(1), &[])?.is_empty();
-                            if !table_exists { return Ok::<Vec<String>, spi::Error>(views); }
-
-                            let table = client.select(&format!("SELECT view_name FROM spiral.metadata WHERE base_view = '{}'", base_table.replace("'", "''")), None, &[])?;
-                            for row in table { views.push(row.get::<String>(1)?.unwrap()); }
-                            Ok::<Vec<String>, spi::Error>(views)
-                        }).unwrap_or_default();
+                        let hierarchy = catalog::get_hierarchy(&base_table);
 
                         if !hierarchy.is_empty() {
                             let offset_cols = catalog::get_offset_columns(&base_table);
