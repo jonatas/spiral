@@ -2,7 +2,12 @@
 
 These issue drafts are intended to keep the implementation, docs, and benchmark claims aligned. Each item is written to be pasted directly into GitHub as a new issue.
 
-## 1. Tighten planner rewrite correctness for aggregate mapping
+## 1. Tighten planner rewrite correctness for aggregate mapping [PARTIALLY DONE]
+
+**Status Update (2026-05-25):** 
+- Implemented support for complex aggregates (Stats, T-Digest, Sketch) with proper type alignment.
+- Added recursive aggregate rewriter to support nested functions like `spiral_stats_mean(spiral_stats(val))`.
+- Fixed `ohlcv` mapping to correctly route `MIN`/`MAX` to `_l`/`_h` sub-columns.
 
 **Title**
 `planner: validate aggregate mapping correctness across rollup and raw fallback segments`
@@ -61,7 +66,12 @@ Either way, the implementation needs explicit semantics, test coverage, and benc
 - `docs/BENCHMARK.md`
 - `README.md`
 
-## 3. Complete or narrow the TAM implementation surface
+## 3. Complete or narrow the TAM implementation surface [PARTIALLY DONE]
+
+**Status Update (2026-05-25):**
+- Implemented `tuple_insert` for functional basic inserts.
+- Added basic `ANALYZE` support via `relation_estimate_size`.
+- Updated `docs/TAM_AUDIT.md` with current status.
 
 **Title**
 `tam: audit unimplemented callbacks and define supported storage semantics`

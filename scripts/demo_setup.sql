@@ -1,6 +1,10 @@
 -- spiral_demo setup script
 -- validates all SQL examples from the spiral-intro blog post
 
+LOAD 'spiral';
+CREATE EXTENSION IF NOT EXISTS spiral;
+SET client_min_messages = notice;
+
 \echo '=== 1. Create sensor_data table ==='
 CREATE TABLE sensor_data (
     t timestamptz NOT NULL,
@@ -101,5 +105,29 @@ SELECT * FROM spiral.status;
 EXPLAIN (VERBOSE) SELECT sum(humidity) FROM sensor_data;
 EXPLAIN (VERBOSE) SELECT max(temperature) FROM sensor_data;
 EXPLAIN (VERBOSE) SELECT min(temperature) FROM sensor_data;
+
+\echo '=== 12. On-demand acceleration for regular PostgreSQL tables ==='
+-- Create a standard table (no USING spiral)
+CREATE TABLE legacy_metrics (
+    t timestamptz NOT NULL,
+    val double precision
+);
+
+INSERT INTO legacy_metrics (t, val)
+SELECT '2026-05-25 10:00:00Z'::timestamptz + (n || ' seconds')::interval, 10.0
+FROM generate_series(1, 100) n;
+
+-- Register for acceleration with SUM and STATS
+SELECT accelerate('legacy_metrics', frames => '1m,1h', columns => ARRAY['val sum', 'val stats']);
+
+-- Populate rollups
+SELECT spiral_refresh('legacy_metrics');
+
+-- Verify acceleration (SUM)
+EXPLAIN (COSTS OFF) SELECT sum(val) FROM legacy_metrics WHERE t >= '2026-05-25 10:00:00Z' AND t < '2026-05-25 11:00:00Z';
+
+-- Verify acceleration of nested aggregates (Stats Mean)
+EXPLAIN (COSTS OFF) SELECT spiral_stats_mean(spiral_stats(val)) FROM legacy_metrics WHERE t >= '2026-05-25 10:00:00Z' AND t < '2026-05-25 11:00:00Z';
+SELECT spiral_stats_mean(spiral_stats(val)) FROM legacy_metrics WHERE t >= '2026-05-25 10:00:00Z' AND t < '2026-05-25 11:00:00Z';
 
 \echo '=== DONE: all examples validated ==='

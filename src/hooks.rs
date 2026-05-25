@@ -1794,16 +1794,14 @@ pub(crate) unsafe fn extract_supported_query_columns(
         return None;
     }
 
-    let mut cols = Vec::new();
-    for i in 0..(*target_list).length {
-        let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
-        if (*tle).resjunk {
-            continue;
-        }
-
-        let node = (*tle).expr as *mut pg_sys::Node;
+    unsafe fn walk_expr(
+        node: *mut pg_sys::Node,
+        base_table: &str,
+        rtable: *mut pg_sys::List,
+        cols: &mut Vec<(String, Option<String>)>,
+    ) -> bool {
         if node.is_null() {
-            return None;
+            return true;
         }
 
         match (*node).type_ {
@@ -1811,28 +1809,26 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 let var = node as *mut pg_sys::Var;
                 let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
-                    // PG 17+ adds an RTE_GROUP entry for GROUP BY expressions.
-                    // Vars pointing to RTE_GROUP (varno != 1 and relid == InvalidOid)
-                    // represent grouped output columns — passthrough, same as T_FuncExpr.
                     if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_GROUP {
-                        continue;
+                        return true;
                     }
-                    return None;
+                    return false;
                 }
 
                 let relname = pg_sys::get_rel_name((*rte).relid);
                 if relname.is_null()
                     || CStr::from_ptr(relname).to_string_lossy().as_ref() != base_table
                 {
-                    return None;
+                    return false;
                 }
 
                 let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                 if varname.is_null() {
-                    return None;
+                    return false;
                 }
 
                 cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None));
+                true
             }
             pg_sys::NodeTag::T_Aggref => {
                 let agg = node as *mut pg_sys::Aggref;
@@ -1841,59 +1837,94 @@ pub(crate) unsafe fn extract_supported_query_columns(
                     || !(*agg).aggfilter.is_null()
                     || (*agg).aggstar
                 {
-                    return None;
+                    return false;
                 }
 
                 let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
                 if agg_fn.is_null() {
-                    return None;
+                    return false;
                 }
                 let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
                 if !is_supported_rollup_aggregate(&fn_name) {
-                    return None;
+                    return false;
                 }
 
                 let args = (*agg).args;
                 if args.is_null() || (*args).length != 1 {
-                    return None;
+                    return false;
                 }
 
                 let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
                 let arg_expr = (*arg).expr as *mut pg_sys::Node;
                 if arg_expr.is_null() || (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
-                    return None;
+                    return false;
                 }
 
                 let var = arg_expr as *mut pg_sys::Var;
                 let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
-                    return None;
+                    return false;
                 }
 
                 let relname = pg_sys::get_rel_name((*rte).relid);
                 if relname.is_null()
                     || CStr::from_ptr(relname).to_string_lossy().as_ref() != base_table
                 {
-                    return None;
+                    return false;
                 }
 
                 let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                 if varname.is_null() {
-                    return None;
+                    return false;
                 }
 
                 let col_name = CStr::from_ptr(varname).to_string_lossy().into_owned();
-                // Two different aggregates on the same source column (e.g. MIN(x) + MAX(x))
-                // can't share a single varattno position in the UNION ALL subquery — fall back.
-                if cols.iter().any(|(c, a)| c == &col_name && a.as_deref() != Some(fn_name.as_str())) {
-                    return None;
+                if cols
+                    .iter()
+                    .any(|(c, a)| c == &col_name && a.as_deref() != Some(fn_name.as_str()))
+                {
+                    return false;
                 }
                 cols.push((col_name, Some(fn_name)));
+                true
             }
-            _ => return None,
+            pg_sys::NodeTag::T_FuncExpr => {
+                let func = node as *mut pg_sys::FuncExpr;
+                if (*func).args.is_null() {
+                    return true;
+                }
+                for i in 0..(*(*func).args).length {
+                    if !walk_expr(
+                        pg_sys::list_nth((*func).args, i) as *mut pg_sys::Node,
+                        base_table,
+                        rtable,
+                        cols,
+                    ) {
+                        return false;
+                    }
+                }
+                true
+            }
+            pg_sys::NodeTag::T_Const => true,
+            _ => false,
         }
     }
 
+    let mut cols = Vec::new();
+    for i in 0..(*target_list).length {
+        let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+        if (*tle).resjunk {
+            continue;
+        }
+
+        if !walk_expr((*tle).expr as *mut pg_sys::Node, base_table, rtable, &mut cols) {
+            return None;
+        }
+    }
+
+    if cols.is_empty() {
+        return None;
+    }
     Some(cols)
 }
 
@@ -2152,7 +2183,7 @@ fn construct_union_sql_hierarchical(
                             _ => "",
                         };
 
-                        let sql = if formula_filter.is_empty() {
+                        let mut sql = if formula_filter.is_empty() {
                             format!(
                                 "SELECT formula, mat_column FROM spiral.sources \
                                  WHERE view_name = '{}' AND base_column = '{}' \
@@ -2164,7 +2195,7 @@ fn construct_union_sql_hierarchical(
                             format!(
                                 "SELECT formula, mat_column FROM spiral.sources \
                                  WHERE view_name = '{}' AND base_column = '{}' \
-                                 AND formula = '{}' \
+                                 AND (formula = '{}' OR formula = 'ohlcv') \
                                  LIMIT 1",
                                 src.replace("'", "''"),
                                 col.replace("'", "''"),
@@ -2172,7 +2203,19 @@ fn construct_union_sql_hierarchical(
                             )
                         };
 
-                        let rows = client.select(&sql, Some(1), &[])?;
+                        let mut rows = client.select(&sql, Some(1), &[])?;
+                        if rows.is_empty() && !formula_filter.is_empty() {
+                            // Fallback: try without formula filter if the specific one didn't match
+                            sql = format!(
+                                "SELECT formula, mat_column FROM spiral.sources \
+                                 WHERE view_name = '{}' AND base_column = '{}' \
+                                 LIMIT 1",
+                                src.replace("'", "''"),
+                                col.replace("'", "''"),
+                            );
+                            rows = client.select(&sql, Some(1), &[])?;
+                        }
+
                         for row in rows {
                             let formula = row.get::<String>(1)?.unwrap_or_default();
                             let mat_col = row.get::<String>(2)?.unwrap_or_default();
