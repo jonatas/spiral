@@ -2,12 +2,13 @@
 
 These issue drafts are intended to keep the implementation, docs, and benchmark claims aligned. Each item is written to be pasted directly into GitHub as a new issue.
 
-## 1. Tighten planner rewrite correctness for aggregate mapping [PARTIALLY DONE]
+## 1. Tighten planner rewrite correctness for aggregate mapping [DONE]
 
 **Status Update (2026-05-25):** 
 - Implemented support for complex aggregates (Stats, T-Digest, Sketch) with proper type alignment.
-- Added recursive aggregate rewriter to support nested functions like `spiral_stats_mean(spiral_stats(val))`.
+- Added recursive aggregate rewriter to support nested functions and arithmetic on top of aggregates.
 - Fixed `ohlcv` mapping to correctly route `MIN`/`MAX` to `_l`/`_h` sub-columns.
+- Implemented `COUNT(*)` acceleration via a hidden internal `_spiral_count` column.
 
 **Title**
 `planner: validate aggregate mapping correctness across rollup and raw fallback segments`
@@ -97,7 +98,12 @@ This issue tracks two possible outcomes:
 - `src/storage.rs`
 - `README.md`
 
-## 4. Make planner support boundaries explicit for filters, joins, and nested queries
+## 4. Make planner support boundaries explicit for filters, joins, and nested queries [PARTIALLY DONE]
+
+**Status Update (2026-05-25):**
+- Implemented **AST Pattern Catalog** for declarative predicate matching.
+- Fixed boolean logic awareness: Spiral now correctly identifies safe acceleration paths in `AND` chains and safely ignores `OR`/`NOT` branches.
+- Added support for `ScalarArrayOpExpr` (`IN` clauses) in tenant/scope filtering.
 
 **Title**
 `planner: define and test support boundaries for filters, joins, CTEs, and nested queries`
