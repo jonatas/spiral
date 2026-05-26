@@ -106,19 +106,31 @@ fn decompose_quadrant(
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_zorder_contained_by(z: AnyNumeric, b: pgrx::datum::Box) -> bool {
+pub fn spiral_zorder_contained_by(z: AnyNumeric, b: pg_sys::BOX) -> bool {
     let z_str = z.to_string();
     let z_val = u128::from_str_radix(z_str.as_str(), 10).unwrap_or(0);
     let (x, y) = decode_zorder_2d(z_val);
     
     // Postgres BOX: high is (max_x, max_y), low is (min_x, min_y)
-    let b_low_x = b.low().x as u64;
-    let b_high_x = b.high().x as u64;
-    let b_low_y = b.low().y as u64;
-    let b_high_y = b.high().y as u64;
+    let b_low_x = b.low.x as u64;
+    let b_high_x = b.high.x as u64;
+    let b_low_y = b.low.y as u64;
+    let b_high_y = b.high.y as u64;
 
     x >= b_low_x && x <= b_high_x && y >= b_low_y && y <= b_high_y
 }
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR <@ (
+        LEFTARG = numeric,
+        RIGHTARG = box,
+        PROCEDURE = spiral_zorder_contained_by
+    );
+    "#,
+    name = "create_zorder_slice_operators",
+    requires = [spiral_zorder_contained_by]
+);
 
 pub fn spiral_zorder_core(t: i64, dimensions: Vec<Option<String>>) -> u128 {
     let x = t as u64;
@@ -244,9 +256,11 @@ mod tests {
         assert_eq!(ranges[0], (0, 0));
 
         // Box (2,0) to (2,0)
-        // (2,0) is bits (10, 00) -> interleaved 1000 = 8
+        // (2,0) is bits (10, 00)
+        // x0=0 at pos 0, y0=0 at pos 1, x1=1 at pos 2, y1=0 at pos 3
+        // Result: 2^2 = 4
         let ranges = generate_z_ranges_2d(2, 0, 2, 0);
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0], (8, 8));
+        assert_eq!(ranges[0], (4, 4));
     }
 }

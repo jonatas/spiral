@@ -7,5 +7,12 @@
   "kurtosis": 215.5949153892171,
   "p50": 500.0,
   "p95": 950.0,
-  "p99": 990.0
+  "p99": 990.0,
+  "ohlcv_open": 0.0,
+  "ohlcv_high": 10000.0,
+  "ohlcv_low": -5000.0,
+  "ohlcv_close": -5000.0,
+  "ohlcv_volume": 504500.0,
+  "zorder_at_0": "0",
+  "zorder_at_max_u32": "6148914691236517205"
 }

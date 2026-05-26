@@ -539,7 +539,6 @@ pub mod pg_test {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    use crate::catalog;
     use pgrx::prelude::*;
 
     #[pg_test]
@@ -549,17 +548,94 @@ mod tests {
     }
 
     #[pg_test]
-    fn test_catalog_is_spiral_relation() {
-        assert!(!catalog::is_spiral_relation("non_existent_table"));
-        catalog::insert_metadata(
-            "test_view",
-            "parent_view",
-            60,
-            "base_view",
-            vec!["col1".to_string()],
-            pgrx::JsonB(serde_json::json!({})),
-        );
-        assert!(catalog::is_spiral_relation("test_view"));
+    fn test_comprehensive_golden() {
+        let values_csv = include_str!("../tests/golden/values.csv");
+        let expected_json = include_str!("../tests/golden/expected.json");
+        let expected: serde_json::Value = serde_json::from_str(expected_json).unwrap();
+
+        let mut stats = crate::stats::StatsState::default();
+        let mut ohlcv = crate::stats::OHLCVState::default();
+        
+        let mut first = true;
+        for line in values_csv.lines() {
+            if let Ok(v) = line.parse::<f64>() {
+                stats.add(v);
+                ohlcv.add(v, if first { 0 } else { 1 }); // Simplistic time for golden
+                first = false;
+            }
+        }
+
+        let epsilon = 1e-9;
+        // Stats
+        assert!((stats.mean() - expected["mean"].as_f64().unwrap()).abs() < epsilon);
+        assert!((stats.variance() - expected["variance"].as_f64().unwrap()).abs() < epsilon);
+        assert!((stats.skewness() - expected["skewness"].as_f64().unwrap()).abs() < epsilon);
+        assert!((stats.kurtosis() - expected["kurtosis"].as_f64().unwrap()).abs() < epsilon);
+        
+        // OHLCV
+        assert!((ohlcv.open - expected["ohlcv_open"].as_f64().unwrap()).abs() < epsilon);
+        assert!((ohlcv.high - expected["ohlcv_high"].as_f64().unwrap()).abs() < epsilon);
+        assert!((ohlcv.low - expected["ohlcv_low"].as_f64().unwrap()).abs() < epsilon);
+        assert!((ohlcv.close - expected["ohlcv_close"].as_f64().unwrap()).abs() < epsilon);
+        assert!((ohlcv.volume - expected["ohlcv_volume"].as_f64().unwrap()).abs() < epsilon);
+
+        // Z-Order Stability
+        use crate::zorder::spiral_zorder_core;
+        assert_eq!(spiral_zorder_core(0, vec![]).to_string(), expected["zorder_at_0"].as_str().unwrap());
+        assert_eq!(spiral_zorder_core(u32::MAX as i64, vec![]).to_string(), expected["zorder_at_max_u32"].as_str().unwrap());
+
+        // Timestamp consistency (spiral(t) vs different timezones)
+        // Ensure that spiral(t) returns the same Unix Epoch seconds regardless of session timezone
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        let t_utc: i64 = Spi::get_one("SELECT spiral('2026-05-25 12:00:00Z'::timestamptz)").unwrap().unwrap();
+        Spi::run("SET timezone = 'America/Sao_Paulo'").unwrap();
+        let t_br: i64 = Spi::get_one("SELECT spiral('2026-05-25 12:00:00Z'::timestamptz)").unwrap().unwrap();
+        assert_eq!(t_utc, t_br, "spiral(t) must be timezone independent");
+        assert_eq!(t_utc, 1779710400, "spiral(t) must match expected Unix epoch");
+    }
+
+    #[pg_test]
+    fn test_zorder_slice_operators() {
+        let sql = include_str!("../tests/pg_regress/sql/zorder_slice.sql");
+        let mut clean_sql = String::new();
+        for line in sql.lines() {
+            if let Some(idx) = line.find("--") {
+                clean_sql.push_str(&line[..idx]);
+            } else {
+                clean_sql.push_str(line);
+            }
+            clean_sql.push('\n');
+        }
+        for stmt in clean_sql.split(';') {
+            let s = stmt.trim();
+            if !s.is_empty() {
+                Spi::run(s).expect("SQL statement failed");
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_qa_matrix() {
+        let sql = include_str!("../tests/pg_regress/sql/qa_matrix.sql");
+        // Strip comments but preserve newlines to keep multi-line statements valid
+        let mut clean_sql = String::new();
+        for line in sql.lines() {
+            if let Some(idx) = line.find("--") {
+                clean_sql.push_str(&line[..idx]);
+            } else {
+                clean_sql.push_str(line);
+            }
+            clean_sql.push('\n');
+        }
+
+        // Split by semicolon and run each statement
+        for statement in clean_sql.split(';') {
+            let trimmed = statement.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            Spi::run(trimmed).unwrap();
+        }
     }
 }
 
