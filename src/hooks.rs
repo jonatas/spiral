@@ -448,11 +448,13 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
     .execute()
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone)]
 struct QueryConstraints {
     start: Option<i64>,
     end: Option<i64>,
-    scopes: std::collections::HashMap<String, serde_json::Value>,
+    start_node: Option<*mut pg_sys::Node>,
+    end_node: Option<*mut pg_sys::Node>,
+    scopes: std::collections::HashMap<String, (serde_json::Value, *mut pg_sys::Node)>,
 }
 
 unsafe fn build_time_constraints(
@@ -565,8 +567,10 @@ unsafe fn build_time_constraints(
                                 let qc = constraints.entry((*var).varno).or_default();
                                 if opname == ">=" {
                                     qc.start = Some(v);
+                                    qc.start_node = Some(node);
                                 } else if opname == "<" {
                                     qc.end = Some(v);
+                                    qc.end_node = Some(node);
                                 }
                             }
                         } else if opname == "=" {
@@ -591,7 +595,7 @@ unsafe fn build_time_constraints(
                             };
                             if let Some(v) = val {
                                 let qc = constraints.entry((*var).varno).or_default();
-                                qc.scopes.insert(varname.into_owned(), v);
+                                qc.scopes.insert(varname.into_owned(), (v, node));
                             }
                         }
                     }
@@ -708,8 +712,8 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                     metadata_obj.as_ref().and_then(|m| {
                                         let mut map = serde_json::Map::new();
                                         for col in &m.scope_columns {
-                                            if let Some(val) = qc.scopes.get(col) {
-                                                map.insert(col.clone(), val.clone());
+                                            if let Some(val_tuple) = qc.scopes.get(col) {
+                                                map.insert(col.clone(), val_tuple.0.clone());
                                             }
                                         }
                                         if map.is_empty() {
@@ -719,6 +723,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         }
                                     })
                                 });
+
 
                                 let dirty_ranges = catalog::get_dirty_ranges(
                                     &base_table,
@@ -815,7 +820,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                                 m.scope_columns
                                                     .iter()
                                                     .filter_map(|col| {
-                                                        qc.scopes.get(col).and_then(|v| match v {
+                                                        qc.scopes.get(col).and_then(|val_tuple| match &val_tuple.0 {
                                                             serde_json::Value::Number(n) => {
                                                                 Some((col.clone(), n.to_string()))
                                                             }
@@ -848,6 +853,19 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
 
                                         // Rewrite top-level aggregates to their merge equivalents
                                         rewrite_query_aggregates(query);
+
+                                        // Neutralize consumed constraints from the outer query to avoid double verification.
+                                        if let Some(qc) = constraint_map.get(&varno) {
+                                            if let Some(node) = qc.start_node {
+                                                neutralize_op_expr(node);
+                                            }
+                                            if let Some(node) = qc.end_node {
+                                                neutralize_op_expr(node);
+                                            }
+                                            for (_, (_, node)) in &qc.scopes {
+                                                neutralize_op_expr(*node);
+                                            }
+                                        }
 
                                         // Notice fires only after acceleration confirmed.
                                         warning!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
@@ -1704,6 +1722,56 @@ pub(crate) unsafe fn parse_sql_to_query(sql: &str) -> *mut pg_sys::Query {
     pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query
 }
 
+/// Neutralize an OpExpr by replacing it with 'true = true'.
+/// This allows the planner to discard the redundant filter without needing
+/// to re-balance the expression tree or modify parent pointers.
+unsafe fn neutralize_op_expr(node: *mut pg_sys::Node) {
+    use std::os::raw::c_void;
+    if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+        return;
+    }
+    let op = node as *mut pg_sys::OpExpr;
+
+    static mut EQ_BOOL_OP: pg_sys::Oid = pg_sys::InvalidOid;
+    static mut EQ_BOOL_FUNC: pg_sys::Oid = pg_sys::InvalidOid;
+
+    if EQ_BOOL_OP == pg_sys::InvalidOid {
+        Spi::connect(|client| {
+            let mut res = client.select(
+                "SELECT oid, oprcode FROM pg_operator \
+                 WHERE oprname = '=' AND oprleft = 'bool'::regtype \
+                 AND oprright = 'bool'::regtype LIMIT 1",
+                Some(1),
+                &[],
+            )?;
+            if let Some(row) = res.next() {
+                EQ_BOOL_OP = row.get::<pg_sys::Oid>(1).unwrap().unwrap_or(pg_sys::InvalidOid);
+                EQ_BOOL_FUNC = row.get::<pg_sys::Oid>(2).unwrap().unwrap_or(pg_sys::InvalidOid);
+            }
+            Ok::<(), spi::Error>(())
+        })
+        .unwrap();
+    }
+
+    if EQ_BOOL_OP != pg_sys::InvalidOid {
+        let true_const = pg_sys::makeConst(
+            pg_sys::BOOLOID,
+            -1,
+            pg_sys::InvalidOid,
+            1,
+            true.into_datum().unwrap(),
+            false,
+            true,
+        );
+        (*op).opno = EQ_BOOL_OP;
+        (*op).opfuncid = EQ_BOOL_FUNC;
+        let mut args = std::ptr::null_mut();
+        args = pg_sys::lappend(args, true_const as *mut c_void);
+        args = pg_sys::lappend(args, true_const as *mut c_void);
+        (*op).args = args;
+    }
+}
+
 fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
     matches!(
         agg_fn.to_lowercase().as_str(),
@@ -1748,11 +1816,19 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
         "SELECT oid FROM pg_proc WHERE proname = 'spiral_avg' AND pronargs = 1",
     )
     .unwrap_or(None);
+    warning!("Spiral: avg_merge_oid={:?}", avg_merge_oid);
 
     let count_merge_oid = Spi::get_one::<pg_sys::Oid>(
         "SELECT oid FROM pg_proc WHERE proname = 'spiral_count' AND pronargs = 1",
     )
     .unwrap_or(None);
+    warning!("Spiral: count_merge_oid={:?}", count_merge_oid);
+
+    let sum_merge_oid = Spi::get_one::<pg_sys::Oid>(
+        "SELECT oid FROM pg_proc WHERE proname = 'spiral_sum' AND pronargs = 1",
+    )
+    .unwrap_or(None);
+    warning!("Spiral: sum_merge_oid={:?}", sum_merge_oid);
 
     unsafe fn walk_and_rewrite(
         node: *mut pg_sys::Node,
@@ -1761,6 +1837,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
         sketch_oid: Option<pg_sys::Oid>,
         avg_oid: Option<pg_sys::Oid>,
         count_oid: Option<pg_sys::Oid>,
+        sum_oid: Option<pg_sys::Oid>,
     ) {
         if node.is_null() {
             return;
@@ -1771,15 +1848,27 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
             let agg_fn_ptr = pg_sys::get_func_name((*agg).aggfnoid);
             if !agg_fn_ptr.is_null() {
                 let agg_fn = CStr::from_ptr(agg_fn_ptr).to_string_lossy().to_lowercase();
+                warning!("Spiral: rewrite_query_aggregates checking '{}'", agg_fn);
                 let new_oid = match agg_fn.as_ref() {
                     "spiral_stats" => stats_oid,
                     "spiral_tdigest" => tdigest_oid,
                     "spiral_sketch" => sketch_oid,
-                    "avg" => avg_oid,
-                    "count" => count_oid,
+                    "avg" => {
+                        warning!("Spiral: mapping AVG to {:?}", avg_oid);
+                        avg_oid
+                    }
+                    "count" => {
+                        warning!("Spiral: mapping COUNT to {:?}", count_oid);
+                        count_oid
+                    }
+                    "sum" => {
+                        warning!("Spiral: mapping SUM to {:?}", sum_oid);
+                        sum_oid
+                    }
                     _ => None,
                 };
                 if let Some(oid) = new_oid {
+                    warning!("Spiral: updated aggfnoid to {}", oid);
                     (*agg).aggfnoid = oid;
                 }
             }
@@ -1795,6 +1884,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
                         sketch_oid,
                         avg_oid,
                         count_oid,
+                        sum_oid,
                     );
                 }
             }
@@ -1810,6 +1900,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
             sketch_merge_oid,
             avg_merge_oid,
             count_merge_oid,
+            sum_merge_oid,
         );
     }
 }
@@ -2117,19 +2208,22 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
         "spiral_stats" | "spiral_tdigest" | "spiral_sketch"
     );
 
+    // Common aggregates that can be fulfilled by the 'stats' formula
+    let is_stats_agg = matches!(
+        agg_lower.as_str(),
+        "sum" | "count" | "avg" | "spiral_stats"
+    );
+
     if !is_rollup {
-        if is_json_agg || agg_lower == "avg" {
-            let accum_fn = if agg_lower == "avg" {
+        if is_json_agg || is_stats_agg {
+            let accum_fn = if is_stats_agg {
                 "spiral_stats_accum"
             } else {
                 &format!("{}_accum", agg_lower)
             };
             return format!("{}(NULL, \"{}\")", accum_fn, mapped_col);
         }
-        if agg_lower == "count" {
-            return format!("(CASE WHEN \"{}\" IS NOT NULL THEN 1 ELSE 0 END)", mapped_col);
-        }
-        // For non-JSON aggregates (SUM, MIN, MAX), return the raw column.
+        // For non-JSON aggregates (MIN, MAX), return the raw column.
         return format!("\"{}\"", mapped_col);
     }
 
@@ -2137,8 +2231,9 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
         ("sum", "ohlcv") => format!("\"{}_v\"", mapped_col),
         ("max", "ohlcv") => format!("\"{}_h\"", mapped_col),
         ("min", "ohlcv") => format!("\"{}_l\"", mapped_col),
-        ("count", "stats") => format!("(\"{}\"->>'n')::numeric::bigint", mapped_col),
-        ("avg", "stats") => format!("\"{}\"", mapped_col),
+        ("count", "stats") | ("sum", "stats") | ("avg", "stats") | ("spiral_stats", "stats") => {
+            format!("\"{}\"", mapped_col)
+        }
         _ => format!("\"{}\"", mapped_col),
     }
 }
@@ -2238,13 +2333,13 @@ fn construct_union_sql_hierarchical(
                 let (formula_for_col, mapped) = if is_rollup {
                     Spi::connect(|client| -> Result<(String, String), spi::Error> {
                         let formula_filter = match agg_fn.to_lowercase().as_str() {
-                            "spiral_stats" | "spiral_stats_merge" => "stats",
+                            "spiral_stats" | "spiral_stats_merge" | "avg" => "stats",
                             "spiral_tdigest" | "spiral_tdigest_merge" => "tdigest",
                             "spiral_sketch" | "spiral_sketch_merge" => "sketch",
                             "sum" => "sum",
                             "min" => "min",
                             "max" => "max",
-                            "count" => "count",
+                            "count" => "stats",
                             _ => "",
                         };
 
@@ -2314,7 +2409,12 @@ fn construct_union_sql_hierarchical(
 
                 let is_json_agg = matches!(
                     agg_fn.to_lowercase().as_str(),
-                    "spiral_stats" | "spiral_tdigest" | "spiral_sketch"
+                    "spiral_stats"
+                        | "spiral_tdigest"
+                        | "spiral_sketch"
+                        | "sum"
+                        | "count"
+                        | "avg"
                 );
 
                 // Cast to original type so outer Var nodes resolve without mismatch.
@@ -2348,25 +2448,34 @@ fn construct_union_sql_hierarchical(
             }
         }
 
-        let mut range_strs = Vec::new();
-        for seg in segments.iter().filter(|s| s.source == src) {
-            let ts_start = format_epoch(seg._t_start);
-            let ts_end = format_epoch(seg._t_end);
-            range_strs.push(format!("[\"{}\", \"{}\")", ts_start, ts_end));
-        }
-
-        if range_strs.is_empty() {
+        let src_segs: Vec<&Segment> = segments.iter().filter(|s| s.source == src).collect();
+        if src_segs.is_empty() {
             continue;
         }
 
-        let multirange_lit = format!("'{{ {} }}'::tstzmultirange", range_strs.join(", "));
+        let time_pred = if src_segs.len() == 1 {
+            let seg = src_segs[0];
+            let ts_start = format_epoch(seg._t_start);
+            let ts_end = format_epoch(seg._t_end);
+            format!(
+                "t >= '{}'::timestamptz AND t < '{}'::timestamptz",
+                ts_start, ts_end
+            )
+        } else {
+            let mut range_strs = Vec::new();
+            for seg in src_segs.iter() {
+                let ts_start = format_epoch(seg._t_start);
+                let ts_end = format_epoch(seg._t_end);
+                range_strs.push(format!("[\"{}\", \"{}\")", ts_start, ts_end));
+            }
+            format!("t <@ '{{ {} }}'::tstzmultirange", range_strs.join(", "))
+        };
 
         // For rollup tiers with a tenant scope filter, inject a z-order BETWEEN predicate
         // so PostgreSQL can use the automatically-created idx_z_* index.
         // Z-order is monotone in t for a fixed tenant hash, so BETWEEN(lo, hi) exactly
         // covers the queried time range for this tenant with no false negatives.
         let zorder_pred = if is_rollup && !scope_vals.is_empty() {
-            let src_segs: Vec<&Segment> = segments.iter().filter(|s| s.source == src).collect();
             let min_t = src_segs.iter().map(|s| s._t_start).min().unwrap_or(0);
             let max_t = src_segs.iter().map(|s| s._t_end).max().unwrap_or(0);
             let dim_strings: Vec<Option<String>> =
@@ -2387,10 +2496,10 @@ fn construct_union_sql_hierarchical(
         };
 
         select_parts.push(format!(
-            "SELECT {} FROM {} WHERE t <@ {}{}",
+            "SELECT {} FROM {} WHERE {}{}",
             inner_select.join(", "),
             src,
-            multirange_lit,
+            time_pred,
             zorder_pred
         ));
     }
