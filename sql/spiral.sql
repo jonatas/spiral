@@ -255,3 +255,19 @@ CREATE OR REPLACE FUNCTION spiral_lag(base_view text) RETURNS INTERVAL AS $$
     FROM spiral.changelog
     WHERE changelog.base_view = $1
 $$ LANGUAGE SQL STABLE PARALLEL SAFE;
+
+-- spiral.scope_status: per-(base_view, scope) lag and backlog.
+-- Useful for identifying hot or lagging tenants under concurrent write load.
+-- lag is NULL when the scope has no unprocessed entries.
+CREATE OR REPLACE VIEW spiral.scope_status AS
+SELECT
+    base_view,
+    scope_values,
+    COUNT(*)                                        AS dirty_entries,
+    SUM(t_end - t_start)                            AS dirty_seconds,
+    to_timestamptz(MIN(t_start)::bigint)            AS oldest_dirty_ts,
+    to_timestamptz(MAX(t_end)::bigint)              AS newest_dirty_ts,
+    now() - to_timestamptz(MAX(t_end)::bigint)      AS lag
+FROM spiral.changelog
+GROUP BY base_view, scope_values
+ORDER BY lag DESC NULLS LAST;

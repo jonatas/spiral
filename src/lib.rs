@@ -18,6 +18,7 @@ extension_sql_file!("../sql/spiral.sql", name = "spiral_setup");
 pub static WORKER_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static WORKER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub static WORKER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10);
 
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
@@ -59,6 +60,17 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"spiral.worker_batch_size",
+        c"Max scopes refreshed per worker tick",
+        c"Each worker processes at most this many (base_view, scope) pairs per 1-second tick.",
+        &WORKER_BATCH_SIZE,
+        1,
+        1000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 }
 
 /// FNV-1a 64-bit hash — stable, documented, no external dependency.
@@ -66,7 +78,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
 ///
 /// See https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
 #[inline]
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;
@@ -1271,7 +1283,10 @@ mod tests {
             ))
             .unwrap()
             .unwrap_or(0);
-            assert!(rows > 0, "org {org} must have rollup rows after full refresh");
+            assert!(
+                rows > 0,
+                "org {org} must have rollup rows after full refresh"
+            );
         }
     }
 
@@ -1304,7 +1319,10 @@ mod tests {
             Spi::get_one("SELECT COUNT(*)::bigint FROM rscope_ticks_1h WHERE uid = 20")
                 .unwrap()
                 .unwrap_or(0);
-        assert_eq!(uid20_rows, 0, "uid=20 must be untouched by single-scope refresh");
+        assert_eq!(
+            uid20_rows, 0,
+            "uid=20 must be untouched by single-scope refresh"
+        );
 
         // uid=20 changelog entry must still exist
         let remaining: i64 = Spi::get_one(
@@ -1560,11 +1578,10 @@ mod tests {
 
         Spi::run("SELECT spiral_refresh('sparse_refresh')").unwrap();
 
-        let rollup_rows: i64 = Spi::get_one::<i64>(
-            "SELECT COUNT(*)::bigint FROM sparse_refresh_1h",
-        )
-        .unwrap()
-        .unwrap_or(0);
+        let rollup_rows: i64 =
+            Spi::get_one::<i64>("SELECT COUNT(*)::bigint FROM sparse_refresh_1h")
+                .unwrap()
+                .unwrap_or(0);
         assert_eq!(
             rollup_rows, 10,
             "rollup must have exactly 10 hour-buckets after sparse insert of 10 rows"
@@ -1597,13 +1614,20 @@ mod tests {
         )
         .unwrap()
         .unwrap_or(-1);
-        assert_eq!(dirty_before, 0, "dirty_entries must be 0 before any inserts");
+        assert_eq!(
+            dirty_before, 0,
+            "dirty_entries must be 0 before any inserts"
+        );
 
         let lag_before: Option<bool> = Spi::get_one::<bool>(
             "SELECT lag IS NULL FROM spiral.status WHERE base_view = 'obs_events'",
         )
         .unwrap();
-        assert_eq!(lag_before, Some(true), "lag must be NULL when rollup is current");
+        assert_eq!(
+            lag_before,
+            Some(true),
+            "lag must be NULL when rollup is current"
+        );
 
         // Insert rows spanning 3 distinct 1h buckets.
         Spi::run(
@@ -1624,7 +1648,11 @@ mod tests {
             "SELECT lag IS NOT NULL FROM spiral.status WHERE base_view = 'obs_events'",
         )
         .unwrap();
-        assert_eq!(lag_not_null, Some(true), "lag must be non-NULL when dirty entries exist");
+        assert_eq!(
+            lag_not_null,
+            Some(true),
+            "lag must be non-NULL when dirty entries exist"
+        );
 
         // After refresh: zero dirty entries, NULL lag again.
         Spi::run("SELECT spiral_refresh('obs_events')").unwrap();
@@ -1648,31 +1676,35 @@ mod tests {
         .unwrap();
 
         // No dirty entries → lag is NULL.
-        let lag_null: Option<bool> = Spi::get_one::<bool>(
-            "SELECT spiral_lag('lag_events') IS NULL",
-        )
-        .unwrap();
-        assert_eq!(lag_null, Some(true), "spiral_lag must be NULL when fully current");
+        let lag_null: Option<bool> =
+            Spi::get_one::<bool>("SELECT spiral_lag('lag_events') IS NULL").unwrap();
+        assert_eq!(
+            lag_null,
+            Some(true),
+            "spiral_lag must be NULL when fully current"
+        );
 
-        Spi::run(
-            "INSERT INTO lag_events (t, val) VALUES (now() - interval '2 hours', 42.0)",
-        )
-        .unwrap();
+        Spi::run("INSERT INTO lag_events (t, val) VALUES (now() - interval '2 hours', 42.0)")
+            .unwrap();
 
         // Dirty entries exist → lag must be a positive interval.
-        let lag_positive: Option<bool> = Spi::get_one::<bool>(
-            "SELECT spiral_lag('lag_events') > interval '0'",
-        )
-        .unwrap();
-        assert_eq!(lag_positive, Some(true), "spiral_lag must be a positive interval when dirty entries exist");
+        let lag_positive: Option<bool> =
+            Spi::get_one::<bool>("SELECT spiral_lag('lag_events') > interval '0'").unwrap();
+        assert_eq!(
+            lag_positive,
+            Some(true),
+            "spiral_lag must be a positive interval when dirty entries exist"
+        );
 
         Spi::run("SELECT spiral_refresh('lag_events')").unwrap();
 
-        let lag_after: Option<bool> = Spi::get_one::<bool>(
-            "SELECT spiral_lag('lag_events') IS NULL",
-        )
-        .unwrap();
-        assert_eq!(lag_after, Some(true), "spiral_lag must return NULL after refresh clears changelog");
+        let lag_after: Option<bool> =
+            Spi::get_one::<bool>("SELECT spiral_lag('lag_events') IS NULL").unwrap();
+        assert_eq!(
+            lag_after,
+            Some(true),
+            "spiral_lag must return NULL after refresh clears changelog"
+        );
     }
 
     #[pg_test]
@@ -1691,6 +1723,60 @@ mod tests {
         .unwrap()
         .unwrap_or(0);
         assert_eq!(tier_count, 2, "frames '1h,1d' must produce tier_count = 2");
+    }
+
+    #[pg_test]
+    fn test_scope_status_view() {
+        Spi::run(
+            "CREATE TABLE scope_obs (
+                t      timestamptz NOT NULL,
+                tenant int         NOT NULL,
+                val    double precision
+            ) WITH (spiral.frames = '1h', spiral.tenant = 'tenant')",
+        )
+        .unwrap();
+
+        // No dirty entries → scope_status has no rows for this table.
+        let rows_before: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM spiral.scope_status WHERE base_view = 'scope_obs'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(rows_before, 0, "scope_status must be empty before any inserts");
+
+        // Insert 2 rows for tenant 1 and 1 row for tenant 2 — same time bucket.
+        Spi::run(
+            "INSERT INTO scope_obs (t, tenant, val) VALUES
+             ('2026-01-01 00:00:00+00', 1, 1.0),
+             ('2026-01-01 00:00:30+00', 1, 2.0),
+             ('2026-01-01 00:00:00+00', 2, 3.0)",
+        )
+        .unwrap();
+
+        // 2 distinct scopes dirty.
+        let scope_count: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM spiral.scope_status WHERE base_view = 'scope_obs'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert_eq!(scope_count, 2, "2 distinct tenants → 2 scope_status rows");
+
+        // Each scope must report positive lag.
+        let all_positive: Option<bool> = Spi::get_one::<bool>(
+            "SELECT bool_and(lag > interval '0') FROM spiral.scope_status WHERE base_view = 'scope_obs'",
+        )
+        .unwrap();
+        assert_eq!(all_positive, Some(true), "all dirty scopes must have positive lag");
+
+        // After refresh: scope_status must be empty.
+        Spi::run("SELECT spiral_refresh('scope_obs')").unwrap();
+
+        let rows_after: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM spiral.scope_status WHERE base_view = 'scope_obs'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(rows_after, 0, "scope_status must be empty after refresh");
     }
 }
 
