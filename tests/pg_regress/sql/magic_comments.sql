@@ -29,11 +29,11 @@ INSERT INTO sensors (t, sensor_id, voltage, current, status_code) VALUES
 SELECT spiral_refresh('sensors');
 
 -- Check 1m view
-SELECT t, sensor_id, voltage_ohlcv_o, voltage_ohlcv_h, voltage_ohlcv_l, voltage_ohlcv_c, current, status_code
+SELECT t, sensor_id, v, current, status_code
 FROM sensors_1m
 ORDER BY t, sensor_id;
 
 -- Check 1h view (should be automatically updated by cascading refresh)
-SELECT t, sensor_id, voltage_ohlcv_o, voltage_ohlcv_h, voltage_ohlcv_l, voltage_ohlcv_c, current, status_code
+SELECT t, sensor_id, v, current, status_code
 FROM sensors_1h
 ORDER BY t, sensor_id;

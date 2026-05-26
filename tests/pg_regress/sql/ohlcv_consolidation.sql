@@ -1,4 +1,4 @@
--- Test for Consolidated OHLCV and Heuristic Mapping
+-- Test for Consolidated OHLCV and Heuristic Mapping (Shine New Mode)
 SELECT spiral_register_view_rust('ohlcv_source', 'BASE', 0, 'ohlcv_source', ARRAY[]::text[]);
 
 CREATE TABLE ohlcv_source (
@@ -18,16 +18,16 @@ INSERT INTO ohlcv_source (t, price) VALUES
 SELECT spiral_register_view_rust('ohlcv_1h', 'ohlcv_source', 3600, 'ohlcv_source', ARRAY[]::text[]);
 
 -- Manually populate the rollup (simulating bgworker)
-INSERT INTO ohlcv_1h (t, price_ohlcv)
+-- Note: Column name is now just 'price', same as base
+INSERT INTO ohlcv_1h (t, price)
 SELECT 
     date_trunc('hour', t),
     spiral_ohlcv(price, spiral(t))
 FROM ohlcv_source
 GROUP BY 1;
 
--- Verify the reconstruction view expansion
-SELECT price_ohlcv_o, price_ohlcv_h, price_ohlcv_l, price_ohlcv_c, price_ohlcv_v 
-FROM ohlcv_1h_view;
+-- Verify the reconstruction view expansion (now returns consolidated JSONB)
+SELECT t, price FROM ohlcv_1h_view;
 
 -- Verify planner acceleration and heuristic mapping
 -- This should be accelerated and rewritten to use accessor functions on the consolidated state

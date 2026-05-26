@@ -22,11 +22,11 @@ Previously, OHLCV was stored as five separate columns. It is now consolidated in
 
 **Heuristic Mapping**:
 The query planner automatically maps standard aggregates to the consolidated state:
-- `first(col, t)` $\rightarrow$ `spiral_open(col_ohlcv)`
-- `max(col)` $\rightarrow$ `spiral_high(col_ohlcv)`
-- `min(col)` $\rightarrow$ `spiral_low(col_ohlcv)`
-- `last(col, t)` $\rightarrow$ `spiral_close(col_ohlcv)`
-- `sum(col)` $\rightarrow$ `spiral_volume(col_ohlcv)`
+- `first(col, t)` $\rightarrow$ `spiral_open(col)`
+- `max(col)` $\rightarrow$ `spiral_high(col)`
+- `min(col)` $\rightarrow$ `spiral_low(col)`
+- `last(col, t)` $\rightarrow$ `spiral_close(col)`
+- `sum(col)` $\rightarrow$ `spiral_volume(col)`
 
 ### Stats & Sketches
 - **Stats**: Consolidated moments (Mean, Variance, Skewness, Kurtosis).

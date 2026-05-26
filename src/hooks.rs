@@ -1336,23 +1336,8 @@ pub fn create_reconstruction_view(rel_name: &str) {
                 }
             }
 
-            // Check if this column is an ohlcv consolidated state
-            let formula_res = client.select(&format!("SELECT formula FROM spiral.sources WHERE view_name = '{}' AND mat_column = '{}'", rel_name.replace("'", "''"), col.replace("'", "''")), Some(1), &[]);
-            let mut formula = String::new();
-            if let Ok(f) = formula_res {
-                if !f.is_empty() {
-                    formula = f.first().get::<String>(1).unwrap().unwrap_or_default();
-                }
-            }
-
             if col == "t" {
                 select_parts.push(format!("t AS \"{}\"", time_col));
-            } else if formula == "ohlcv" {
-                select_parts.push(format!("spiral_ohlcv_open(\"{}\") as \"{}_o\"", col, col));
-                select_parts.push(format!("spiral_ohlcv_high(\"{}\") as \"{}_h\"", col, col));
-                select_parts.push(format!("spiral_ohlcv_low(\"{}\") as \"{}_l\"", col, col));
-                select_parts.push(format!("spiral_ohlcv_close(\"{}\") as \"{}_c\"", col, col));
-                select_parts.push(format!("spiral_ohlcv_volume(\"{}\") as \"{}_v\"", col, col));
             } else if offset_cols.contains(&col) && !is_tstz {
                 select_parts.push(format!(
                     "t + make_interval(secs => \"{}\"::double precision) AS \"{}\"",
@@ -1474,7 +1459,7 @@ pub fn generate_hierarchy_internal(
             for (col, formula, alias) in &custom_cols {
                 let formula_lower = formula.to_lowercase();
                 if formula_lower.contains("stats") {
-                    let mat = alias.clone().unwrap_or_else(|| format!("{}_stats", col));
+                    let mat = alias.clone().unwrap_or_else(|| col.clone());
                     if seen_cols.insert(mat.clone()) {
                         select_parts.push(format!("spiral_stats(\"{}\") as \"{}\"", col, mat));
                         sources.push(rollup::SourceDef {
@@ -1485,7 +1470,7 @@ pub fn generate_hierarchy_internal(
                         });
                     }
                 } else if formula_lower.contains("ohlc") {
-                    let mat = alias.clone().unwrap_or_else(|| format!("{}_ohlcv", col));
+                    let mat = alias.clone().unwrap_or_else(|| col.clone());
                     if seen_cols.insert(mat.clone()) {
                         select_parts.push(format!("spiral_ohlcv(\"{}\", spiral(t)) as \"{}\"", col, mat));
                         sources.push(rollup::SourceDef {
@@ -1499,7 +1484,7 @@ pub fn generate_hierarchy_internal(
                     || formula_lower.contains("tdigest")
                     || formula_lower.contains("quantile")
                 {
-                    let mat = alias.clone().unwrap_or_else(|| format!("{}_tdigest", col));
+                    let mat = alias.clone().unwrap_or_else(|| col.clone());
                     let formula_name = if formula_lower.contains("tdigest")
                         || formula_lower.contains("quantile")
                     {
@@ -2304,7 +2289,7 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
                     }
                 }
             };
-            
+
             if formula == "ohlcv" {
                 return format!("{}(NULL, \"{}\", spiral(t))", accum_fn, mapped_col);
             } else {
@@ -2314,9 +2299,20 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
         return format!("\"{}\"", mapped_col);
     }
 
-    format!("\"{}\"", mapped_col)
+    match (agg_lower.as_str(), formula) {
+        ("sum", "ohlcv") => format!("\"{}_v\"", mapped_col),
+        ("max", "ohlcv") => format!("\"{}_h\"", mapped_col),
+        ("min", "ohlcv") => format!("\"{}_l\"", mapped_col),
+        ("first", "ohlcv") => format!("\"{}_o\"", mapped_col),
+        ("last", "ohlcv") => format!("\"{}_c\"", mapped_col),
+        ("count", "stats") | ("sum", "stats") | ("avg", "stats") | ("spiral_stats", "stats") => {
+            format!("\"{}\"", mapped_col)
+        }
+        ("min", "stats") => format!("(\"{}\"->>'min')::numeric", mapped_col),
+        ("max", "stats") => format!("(\"{}\"->>'max')::numeric", mapped_col),
+        _ => format!("\"{}\"", mapped_col),
+    }
 }
-
 fn format_epoch(epoch: i64) -> String {
     Spi::get_one::<String>(&format!(
         "SELECT to_char(to_timestamp({}::double precision), 'YYYY-MM-DD HH24:MI:SS')",

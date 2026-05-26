@@ -19,7 +19,7 @@ INSERT INTO metrics (t, device_id, val) VALUES
 SELECT spiral_refresh('metrics');
 
 -- Check initial state
-SELECT t, device_id, val_ohlcv_o, val_ohlcv_h, val_ohlcv_l, val_ohlcv_c, val_ohlcv_v 
+SELECT t, device_id, val 
 FROM metrics_1m;
 
 -- Update data (Backfill)
@@ -33,7 +33,7 @@ FROM spiral.changelog;
 SELECT spiral_refresh('metrics');
 
 -- Check updated state
-SELECT t, device_id, val_ohlcv_o, val_ohlcv_h, val_ohlcv_l, val_ohlcv_c, val_ohlcv_v 
+SELECT t, device_id, val 
 FROM metrics_1m;
 
 -- Delete data
@@ -49,5 +49,5 @@ FROM spiral.changelog;
 SELECT spiral_refresh('metrics');
 
 -- Check final state
-SELECT t, device_id, val_ohlcv_o, val_ohlcv_h, val_ohlcv_l, val_ohlcv_c, val_ohlcv_v 
+SELECT t, device_id, val 
 FROM metrics_1m;
