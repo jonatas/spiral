@@ -1,40 +1,61 @@
-# Transparent Query Acceleration in Spiral
+# Spiral Query Acceleration Matrix
 
-Spiral includes an experimental planner hook that can rewrite some aggregate queries against raw tables so they read from compatible rollup tiers where possible. The implementation is intentionally conservative: unsupported query shapes should fall back to standard PostgreSQL planning.
+Spiral uses a **Constraint Reasoning Engine** to transform standard SQL queries into accelerated hierarchical scans. This document outlines the supported syntaxes, current limitations, and the mathematical roadmap.
 
-## How it Works
+## 1. Supported Syntaxes (Accelerated)
 
-1.  **Lineage Registration**: When a Spiral hierarchy is created, the extension records mappings between base columns, formulas, and materialized columns in `spiral.sources`.
-2.  **The `spiral.sources` Registry**: This registry is used by the planner hook to determine whether a requested aggregate can be satisfied from a rollup tier or must stay on the raw table.
-3.  **Smart Segment Resolution**: When a `SELECT` query targets a base table with aggregates and a time range:
-    *   The system checks the `spiral.changelog` for "dirty" regions (data changed but not yet materialized).
-    *   **Multi-Tenant Isolation**: When scope values are available, dirty regions are filtered by the query's specific scope (for example, `tenant_id`).
-    *   It decomposes the requested time range into "Clean" segments (mapped to the highest possible rollup tier) and "Dirty/Fragmented" segments (mapped to the raw table).
-4.  **Subquery Replacement**: The planner can replace the raw table reference with an `RTE_SUBQUERY` that unions eligible rollup segments with raw fallback segments.
+| Category | Syntax Example | Mathematical Principle | Status |
+| :--- | :--- | :--- | :--- |
+| **Simple Aggregates** | `SUM(col)`, `AVG(col)`, `COUNT(*)` | Associativity / Chan-Merge | ✅ Supported |
+| **Complex Stats** | `spiral_stats(col)`, `spiral_sketch(col)` | Online Moments / T-Digest | ✅ Supported |
+| **OHLCV** | `first(col, t)`, `max(col)`, `min(col)` | Order-dependent / Min-Max | ✅ Supported |
+| **Linear Lifting** | `SUM(price * 2 + 10)` | Distributive Property | ✅ Supported |
+| **Timestamp Ranges** | `t >= 'A' AND t < 'B'` | Set Intersection | ✅ Supported |
+| **Complex Ranges** | `t > 'A' AND t <= 'B'` | Discrete Interval Mapping | ✅ Supported |
+| **Scope Filters** | `WHERE tenant_id = 123` | Spatial Partitioning | ✅ Supported |
+| **Join Propagation** | `JOIN b ON a.tid = b.tid WHERE a.tid = 1` | Transitive Equality | ✅ Supported |
+| **Logical Unions** | `WHERE t < '1h' OR t > '5h'` | **Convex Hull** Bounding | ✅ Supported |
+| **IN Clauses** | `WHERE tenant_id IN (1, 2, 3)` | Set Membership | ✅ Supported |
 
-## Current Scope
+---
 
-- The planner hook is designed for selected aggregate/time-range query shapes.
-- **Supported Aggregates**: `SUM`, `COUNT`, `MIN`, `MAX`, and `AVG`.
-- **State-Based Merging**: To ensure mathematical correctness across mixed segments (e.g., combining pre-aggregated 1h buckets with raw 1s rows), Spiral uses a JSONB state approach. Raw data is converted into statistical summaries that are then merged using custom aggregates like `spiral_avg` and `spiral_count`.
-- **Intelligent Range Detection**: Unbounded queries now automatically probe both rollup views and `spiral.changelog` to determine the active data range.
-- `DISTINCT`, ordered aggregates, filtered aggregates, and more complex expressions currently fall back to standard PostgreSQL planning.
-- Dirty or unsupported regions fall back to the raw table.
+## 2. Fallback Scenarios (Standard Execution)
 
-## Example
+The following syntaxes currently trigger a fallback to the raw base table to maintain 100% accuracy:
 
-If you have a table `metrics` with a 1-day rollup, and you query:
-```sql
-SELECT sum(val) FROM metrics WHERE t >= '2026-04-01' AND t < '2026-04-10';
-```
-Spiral may rewrite this (if the query shape is supported and the relevant segments are clean) to something conceptually similar to:
-```sql
-SELECT sum(val_sum) FROM metrics_1d WHERE t >= '2026-04-01' AND t < '2026-04-10';
-```
+| Syntax Pattern | Reason for Fallback |
+| :--- | :--- |
+| `SUM(col_a * col_b)` | **Non-Linear**: Requires cross-moments (Co-variance) not yet in `StatsState`. |
+| `DISTINCT col` | Requires global set tracking (HLL) not yet integrated into rollups. |
+| `HAVING SUM(col) > 100` | Planner currently prioritizes `WHERE` clause analysis. |
+| `WINDOW` functions | Requires specific frame-aware aggregation logic. |
 
-## Monitoring
+---
 
-You can see all available accelerated sources by querying the `spiral.available_sources` view:
-```sql
-SELECT * FROM spiral.available_sources;
-```
+## 3. Mathematical Roadmap (TODO)
+
+### Priority: High (Efficiency & Coverage)
+- [ ] **Transitive Inequality Propagation**:
+    - *Example*: `JOIN b ON a.t = b.t WHERE a.t > '2026-01-01'`
+    - *Reasoning*: If timestamps are joined, the range constraint on `a` mathematically applies to `b`. Implementing this will accelerate large time-series joins by $100\times$.
+- [ ] **Canonical Normalization Pass**:
+    - *Example*: Convert `col = 1 OR col = 2` into a unified `SetConstraint`.
+    - *Reasoning*: Reduces technical debt by allowing the visitor to reason about properties rather than syntax variations.
+
+### Priority: Medium (Functional Expansion)
+- [ ] **Non-Linear Cross-Moments**:
+    - *Example*: Support `SUM(price * volume)` by storing $\sum(x \cdot y)$ in the rollup.
+    - *Reasoning*: Essential for financial metrics like VWAP (Volume Weighted Average Price).
+- [ ] **Hyper-box Containment Operators**:
+    - *Example*: `zorder_col <@ box(p1, p2)`
+    - *Reasoning*: Moving beyond `BETWEEN` to true geometric skip-scans for Z-order curves.
+
+### Priority: Low (Niche Features)
+- [ ] **Filter-Clause Lifting**:
+    - *Example*: `SUM(val) FILTER (WHERE val > 0)`
+    - *Reasoning*: Requires storing partial moments based on value-ranges (Histogram-based rollups).
+
+---
+
+## Logic Policy: "First, Do No Harm"
+Spiral follows a **Strict Accuracy** policy. If the AST Visitor cannot prove that a rollup scan will yield the identical result to a raw scan (after applying the remaining PostgreSQL filters), it will **always** fallback to standard execution. We prefer $100ms$ of correct data over $1ms$ of incorrect data.
