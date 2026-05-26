@@ -447,7 +447,6 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
     })
     .execute()
 }
-
 #[derive(Clone, Default)]
 struct QueryConstraints {
     start: Option<i64>,
@@ -473,6 +472,12 @@ enum AstOpportunity {
         varno: i32,
         col: String,
         val: serde_json::Value,
+        node: *mut pg_sys::Node,
+    },
+    ScopeSet {
+        varno: i32,
+        col: String,
+        vals: Vec<serde_json::Value>,
         node: *mut pg_sys::Node,
     },
     EqualTimeColumns {
@@ -501,6 +506,19 @@ unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Opti
 
             let left = pg_sys::list_nth(args, 0) as *mut pg_sys::Node;
             let right = pg_sys::list_nth(args, 1) as *mut pg_sys::Node;
+
+            // Canonical Normalization: Swap operands to ensure Var is on the left
+            let (mut left, mut right, mut opname) = (left, right, opname.into_owned());
+            if (*left).type_ == pg_sys::NodeTag::T_Const && (*right).type_ != pg_sys::NodeTag::T_Const {
+                std::mem::swap(&mut left, &mut right);
+                opname = match opname.as_str() {
+                    ">" => "<".to_string(),
+                    ">=" => "<=".to_string(),
+                    "<" => ">".to_string(),
+                    "<=" => ">=".to_string(),
+                    other => other.to_string(),
+                };
+            }
 
             let mut var_node = left;
             if (*left).type_ == pg_sys::NodeTag::T_FuncExpr {
@@ -591,6 +609,56 @@ unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Opti
                 }
             }
         }
+        pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+            let sao = node as *mut pg_sys::ScalarArrayOpExpr;
+            let opname_ptr = pg_sys::get_opname((*sao).opno);
+            if opname_ptr.is_null() { return None; }
+            let opname = CStr::from_ptr(opname_ptr).to_string_lossy();
+            
+            // Handle only col = ANY(...) which is the canonical form for IN
+            if opname == "=" && (*sao).useOr {
+                let args = (*sao).args;
+                if !args.is_null() && (*args).length == 2 {
+                    let left = pg_sys::list_nth(args, 0) as *mut pg_sys::Node;
+                    let right = pg_sys::list_nth(args, 1) as *mut pg_sys::Node;
+
+                    if (*left).type_ == pg_sys::NodeTag::T_Var && (*right).type_ == pg_sys::NodeTag::T_Const {
+                        let var = left as *mut pg_sys::Var;
+                        let varno = (*var).varno as i32;
+                        let rte = pg_sys::list_nth(rtable, varno - 1) as *mut pg_sys::RangeTblEntry;
+                        let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                        if !varname_ptr.is_null() {
+                            let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
+                            let con = right as *mut pg_sys::Const;
+                            
+                            // Extract values from array const (Normalizing different array OIDs)
+                            let mut vals = Vec::new();
+                            if !(*con).constisnull {
+                                // Simplified extraction for common types
+                                match (*con).consttype {
+                                    pg_sys::INT4ARRAYOID => {
+                                        let array = Array::<i32>::from_datum((*con).constvalue, false);
+                                        if let Some(arr) = array {
+                                            for v in arr { if let Some(v) = v { vals.push(serde_json::Value::Number(v.into())); } }
+                                        }
+                                    }
+                                    pg_sys::TEXTARRAYOID => {
+                                        let array = Array::<String>::from_datum((*con).constvalue, false);
+                                        if let Some(arr) = array {
+                                            for v in arr { if let Some(v) = v { vals.push(serde_json::Value::String(v)); } }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !vals.is_empty() {
+                                return Some(AstOpportunity::ScopeSet { varno, col: varname.into_owned(), vals, node });
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
     None
@@ -642,6 +710,15 @@ impl AstVisitor {
                     } => {
                         let qc = self.constraints.entry(varno).or_default();
                         qc.scopes.insert(col, (val, node));
+                    }
+                    AstOpportunity::ScopeSet {
+                        varno,
+                        col,
+                        vals,
+                        node,
+                    } => {
+                        let qc = self.constraints.entry(varno).or_default();
+                        qc.in_clauses.insert(col, (vals, node));
                     }
                     AstOpportunity::EqualTimeColumns { v1, v2 } => {
                         self.equalities.push((v1, v2));
@@ -718,6 +795,41 @@ impl AstVisitor {
                     qc.start = new_start;
                     qc.end = new_end;
                     changed = true;
+                }
+
+                // Propagate scopes and in_clauses
+                let sc1 = self.constraints.get(&v1).map(|qc| qc.scopes.clone());
+                let sc2 = self.constraints.get(&v2).map(|qc| qc.scopes.clone());
+                if let (Some(sc1), Some(sc2)) = (sc1, sc2) {
+                    for (col, val) in sc1 {
+                        if !self.constraints.get(&v2).unwrap().scopes.contains_key(&col) {
+                            self.constraints.entry(v2).or_default().scopes.insert(col, val);
+                            changed = true;
+                        }
+                    }
+                    for (col, val) in sc2 {
+                        if !self.constraints.get(&v1).unwrap().scopes.contains_key(&col) {
+                            self.constraints.entry(v1).or_default().scopes.insert(col, val);
+                            changed = true;
+                        }
+                    }
+                }
+                
+                let in1 = self.constraints.get(&v1).map(|qc| qc.in_clauses.clone());
+                let in2 = self.constraints.get(&v2).map(|qc| qc.in_clauses.clone());
+                if let (Some(in1), Some(in2)) = (in1, in2) {
+                    for (col, vals) in in1 {
+                        if !self.constraints.get(&v2).unwrap().in_clauses.contains_key(&col) {
+                            self.constraints.entry(v2).or_default().in_clauses.insert(col, vals);
+                            changed = true;
+                        }
+                    }
+                    for (col, vals) in in2 {
+                        if !self.constraints.get(&v1).unwrap().in_clauses.contains_key(&col) {
+                            self.constraints.entry(v1).or_default().in_clauses.insert(col, vals);
+                            changed = true;
+                        }
+                    }
                 }
             }
             if !changed {
