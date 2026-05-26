@@ -700,6 +700,12 @@ struct SpiralScanState {
     current_offset_in_page: u32,
     phsw: pg_sys::ParallelBlockTableScanWorkerData,
     read_stream: *mut pg_sys::ReadStream,
+
+    // Bitmap scan state
+    tbm_res: pg_sys::TBMIterateResult,
+    offsets: [pg_sys::OffsetNumber; 1024], // Max tuples per page
+    noffsets: i32,
+    curr_offset_idx: i32,
 }
 
 #[repr(C)]
@@ -776,6 +782,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     (*state).scan_first_blk = scan_first_blk;
     (*state).scan_last_blk = scan_last_blk;
     (*state).current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+    (*state).curr_offset_idx = 0;
+    (*state).noffsets = 0;
 
     if pscan.is_null() {
         // Sequential scan: use relation stream with callback
@@ -948,7 +956,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
             let state = &mut *(*spiral_scan).state;
             state.current_blkno = state.scan_first_blk;
             state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+            state.curr_offset_idx = 0;
+            state.noffsets = 0;
+
             if !state.read_stream.is_null() {
+
                 pg_sys::read_stream_reset(state.read_stream);
             }
         }
@@ -1143,13 +1155,78 @@ pub unsafe extern "C-unwind" fn spiral_index_validate_scan(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_scan_bitmap_next_tuple(
-    _scan: pg_sys::TableScanDesc,
-    _slot: *mut pg_sys::TupleTableSlot,
-    _recheck: *mut bool,
-    _lossy_pages: *mut u64,
-    _exact_pages: *mut u64,
+    scan: pg_sys::TableScanDesc,
+    slot: *mut pg_sys::TupleTableSlot,
+    recheck: *mut bool,
+    lossy_pages: *mut u64,
+    exact_pages: *mut u64,
 ) -> bool {
-    false
+    if scan.is_null() || slot.is_null() {
+        return false;
+    }
+
+    let spiral_scan = scan as *mut SpiralScanDescData;
+    let state = &mut *(*spiral_scan).state;
+    let rel = (*scan).rs_rd;
+
+    // Use the iterator from the scan descriptor
+    let tbm_iterator = &mut (*scan).st.rs_tbmiterator;
+
+    loop {
+        // 1. Move to next offset if we have some left in the current page
+        if state.curr_offset_idx < state.noffsets {
+            let posid = if state.tbm_res.lossy {
+                (state.curr_offset_idx + 1) as u16
+            } else {
+                state.offsets[state.curr_offset_idx as usize]
+            };
+            state.curr_offset_idx += 1;
+
+            let tid = pg_sys::ItemPointerData {
+                ip_blkid: pg_sys::BlockIdData {
+                    bi_hi: (state.tbm_res.blockno >> 16) as u16,
+                    bi_lo: (state.tbm_res.blockno & 0xffff) as u16,
+                },
+                ip_posid: posid,
+            };
+
+            // Fetch and reconstruct the tuple
+            if spiral_tuple_fetch_row_version(
+                rel,
+                &tid as *const _ as *mut _,
+                std::ptr::null_mut(),
+                slot,
+            ) {
+                if !recheck.is_null() {
+                    *recheck = state.tbm_res.recheck || state.tbm_res.lossy;
+                }
+                return true;
+            }
+            continue;
+        }
+
+        // 2. No more offsets in current page, get next page from bitmap
+        if !pg_sys::tbm_iterate(tbm_iterator, &mut state.tbm_res) {
+            return false;
+        }
+
+        state.curr_offset_idx = 0;
+        if state.tbm_res.lossy {
+            state.noffsets = crate::storage::DATA_PER_PAGE as i32;
+            if !lossy_pages.is_null() {
+                *lossy_pages += 1;
+            }
+        } else {
+            state.noffsets = pg_sys::tbm_extract_page_tuple(
+                &mut state.tbm_res,
+                state.offsets.as_mut_ptr(),
+                state.offsets.len() as u32,
+            );
+            if !exact_pages.is_null() {
+                *exact_pages += 1;
+            }
+        }
+    }
 }
 
 #[pg_guard]

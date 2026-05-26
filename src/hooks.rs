@@ -1204,6 +1204,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         &col_types,
                                         &scope_vals,
                                         &in_vals,
+                                        qc_opt.and_then(|qc| qc.z_box.map(|(b, _)| b)),
                                     );
 
                                     let new_query = parse_sql_to_query(&union_sql);
@@ -1243,7 +1244,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                             if let Some(node) = qc.end_node {
                                                 neutralize_op_expr(node);
                                             }
-                                            for (_, (_, node)) in &qc.scopes {
+                                            for (_, node) in qc.scopes.values() {
                                                 neutralize_op_expr(*node);
                                             }
                                         }
@@ -2798,7 +2799,7 @@ fn construct_union_sql_hierarchical(
                     .join(", ")
             )
         };
-        let zorder_pred = if is_rollup && !scope_vals.is_empty() {
+        let mut zorder_pred = if is_rollup && !scope_vals.is_empty() {
             let min_t = src_segs.iter().map(|s| s._t_start).min().unwrap_or(0);
             let max_t = src_segs.iter().map(|s| s._t_end).max().unwrap_or(0);
             let lo = crate::spiral_zorder(
@@ -2809,6 +2810,7 @@ fn construct_union_sql_hierarchical(
                 max_t,
                 scope_vals.iter().map(|(_, v)| Some(v.clone())).collect(),
             );
+
             format!(
                 " AND spiral_zorder(spiral(t), ARRAY[{}]::text[]) BETWEEN {} AND {}",
                 scope_vals
@@ -2822,6 +2824,34 @@ fn construct_union_sql_hierarchical(
         } else {
             String::new()
         };
+
+        // If a box is present, generate Z-order slice ranges
+        if let Some(b) = z_box {
+            let ranges = crate::zorder::generate_z_ranges_2d(
+                b.low.x as u64,
+                b.low.y as u64,
+                b.high.x as u64,
+                b.high.y as u64,
+            );
+            if !ranges.is_empty() {
+                let mut range_clauses = Vec::new();
+                for (start, end) in ranges.iter().take(100) {
+                    // Limit to 100 ranges to avoid SQL bloat
+                    range_clauses.push(format!(
+                        "spiral_zorder(spiral(t), ARRAY[{}]::text[]) BETWEEN {} AND {}",
+                        scope_vals
+                            .iter()
+                            .map(|(_, v)| format!("'{}'", v.replace('\'', "''")))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        start,
+                        end
+                    ));
+                }
+                zorder_pred = format!(" AND ({})", range_clauses.join(" OR "));
+            }
+        }
+
         let scope_pred = scope_vals
             .iter()
             .filter(|(col, _)| is_rollup && rollup_cols.contains(col))
