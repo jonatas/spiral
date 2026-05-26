@@ -52,17 +52,18 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
             let s = s.trim();
 
             // Calendar word suffixes (check before single-char suffixes)
-            if s.ends_with("month") || s.ends_with("mon") {
+            if s.ends_with("month") || s.ends_with("mon") || s.ends_with("mo") {
                 let n: i32 = s
                     .trim_end_matches("month")
                     .trim_end_matches("mon")
+                    .trim_end_matches("mo")
                     .parse()
                     .unwrap_or(0);
                 if n <= 0 {
                     return None;
                 }
                 return Some(Frame {
-                    name: format!("{}mon", n),
+                    name: format!("{}mo", n),
                     seconds: n * 2_592_000,
                     calendar_field: Some("month".to_string()),
                 });
@@ -99,7 +100,7 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
                 let n = stripped.parse::<i32>().unwrap_or(0);
                 (
                     n * 2_592_000,
-                    format!("{}mon", n),
+                    format!("{}mo", n),
                     Some("month".to_string()),
                 )
             } else if let Some(stripped) = s.strip_suffix('Q') {
@@ -397,7 +398,7 @@ mod tests {
         let frames = parse_frames("1h,1d,1M");
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[2].seconds, 2_592_000);
-        assert_eq!(frames[2].name, "1mon");
+        assert_eq!(frames[2].name, "1mo");
         assert_eq!(frames[2].calendar_field.as_deref(), Some("month"));
     }
 
@@ -406,10 +407,12 @@ mod tests {
         let frames = parse_frames("1h,1d,1mon");
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[2].seconds, 2_592_000);
+        assert_eq!(frames[2].name, "1mo");
         assert_eq!(frames[2].calendar_field.as_deref(), Some("month"));
 
         let frames2 = parse_frames("1h,1d,1month");
         assert_eq!(frames2.len(), 3);
+        assert_eq!(frames2[2].name, "1mo");
         assert_eq!(frames2[2].calendar_field.as_deref(), Some("month"));
     }
 

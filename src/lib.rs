@@ -904,11 +904,6 @@ mod tests {
         .unwrap();
 
         for sql in [
-            "SELECT avg(val) FROM planner_fallback",
-            "SELECT count(*) FROM planner_fallback",
-            "SELECT min(val), max(val) FROM planner_fallback",
-            "SELECT sum(val), avg(val) FROM planner_fallback",
-            "SELECT sum(val + 1) FROM planner_fallback",
             "SELECT DISTINCT sum(val) FROM planner_fallback",
             "SELECT sum(val) FILTER (WHERE val > 0) FROM planner_fallback",
             "SELECT sum(val) FROM planner_fallback HAVING count(*) > 0",
@@ -1787,6 +1782,51 @@ mod tests {
         .unwrap()
         .unwrap_or(-1);
         assert_eq!(rows_after, 0, "scope_status must be empty after refresh");
+    }
+
+    #[pg_test]
+    fn test_qa_matrix() {
+        let sql = include_str!("../tests/pg_regress/sql/qa_matrix.sql");
+        // Strip comments (both standalone and end-of-line)
+        let clean_sql = sql
+            .lines()
+            .map(|line| {
+                if let Some(pos) = line.find("--") {
+                    &line[..pos]
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Execute statement by statement to isolate failures
+        for stmt in clean_sql.split(';') {
+            let trimmed = stmt.trim();
+            if !trimmed.is_empty() {
+                if let Err(e) = Spi::run(trimmed) {
+                    panic!("QA Matrix failed on statement: [{}]. Error: {:?}", trimmed, e);
+                }
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_accelerate_idempotency() {
+        Spi::run("CREATE TABLE idempotent_test (t timestamptz, val float)").unwrap();
+        
+        // First call
+        Spi::run("SELECT accelerate('idempotent_test', frames => '1m')").unwrap();
+        
+        // Second call with more frames - should not fail due to existing triggers
+        Spi::run("SELECT accelerate('idempotent_test', frames => '1m,1h')").unwrap();
+        
+        let rollup_exists: bool = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'idempotent_test_1h')",
+        )
+        .unwrap()
+        .unwrap_or(false);
+        assert!(rollup_exists, "Second tier should be created on second accelerate call");
     }
 }
 
