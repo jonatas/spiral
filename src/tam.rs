@@ -356,10 +356,14 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
                 let state = pg_sys::GenericXLogStart(rel);
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
-                
-                let page = pg_sys::GenericXLogRegisterBuffer(state, buffer, pg_sys::GENERIC_XLOG_FULL_IMAGE as i32);
+
+                let page = pg_sys::GenericXLogRegisterBuffer(
+                    state,
+                    buffer,
+                    pg_sys::GENERIC_XLOG_FULL_IMAGE as i32,
+                );
                 crate::storage::initialize_spiral_page(page, tenant_scale as i32);
-                
+
                 pg_sys::GenericXLogFinish(state);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                 pg_sys::ReleaseBuffer(buffer);

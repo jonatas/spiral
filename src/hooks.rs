@@ -1776,7 +1776,7 @@ pub fn generate_hierarchy_internal(
     scope_columns: Vec<String>,
     custom_cols: Vec<(String, String, Option<String>)>,
     anchor_col: String,
-    offset_cols: Vec<String>,
+    _offset_cols: Vec<String>,
 ) {
     notice!(
         "Spiral: Entering generate_hierarchy_internal for '{}', frames='{}'",
@@ -2401,7 +2401,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 }
                 let args = (*agg).args;
                 let num_args = if args.is_null() { 0 } else { (*args).length };
-                if (fn_name == "first" || fn_name == "last") {
+                if fn_name == "first" || fn_name == "last" {
                     if num_args != 2 {
                         return false;
                     }
