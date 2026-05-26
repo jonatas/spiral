@@ -2463,7 +2463,45 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
         ));
     }
 
-    let success = crate::refresh_incremental(base_name, where_clause.clone(), 0);
+    let success = if is_root && scope_filter.is_none() {
+        // Full refresh: iterate each distinct scope for per-scope MERGE queries.
+        // Each MERGE is scoped to one scope_values bucket — no cross-scope fan-out in the JOIN.
+        let distinct_scopes: Vec<String> = Spi::connect(|client| {
+            Ok::<Vec<String>, spi::Error>(
+                client
+                    .select(
+                        &format!(
+                            "SELECT DISTINCT scope_values::text FROM spiral.changelog \
+                             WHERE base_view = '{}'",
+                            real_base.replace('\'', "''")
+                        ),
+                        None,
+                        &[],
+                    )?
+                    .map(|r| {
+                        r.get::<String>(1)
+                            .unwrap()
+                            .unwrap_or_else(|| "{}".to_string())
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+
+        if distinct_scopes.is_empty() {
+            crate::refresh_incremental(base_name, None, 0, None)
+        } else {
+            let mut any_ok = false;
+            for scope in distinct_scopes {
+                let ok = crate::refresh_incremental(base_name, None, 0, Some(scope));
+                any_ok = any_ok || ok;
+            }
+            any_ok
+        }
+    } else {
+        // Partial refresh (where_clause provided) or non-root tier: legacy path.
+        crate::refresh_incremental(base_name, where_clause.clone(), 0, None)
+    };
 
     if success && is_root {
         let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
@@ -2474,6 +2512,47 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     }
 
     success
+}
+
+/// Refresh a single scope_values bucket for a base view.
+/// Exposed via `spiral_refresh_scope(view, scope_json)` so parallel callers
+/// (e.g. via pg_background) can dispatch N concurrent scope refreshes.
+pub fn reactive_refresh_by_scope(base_name: &str, scope_json: String) {
+    let metadata = catalog::get_metadata(base_name);
+    let is_root = metadata
+        .as_ref()
+        .map(|m| m.parent_view == m.base_view || m.parent_view == "BASE")
+        .unwrap_or(false);
+    let real_base = metadata
+        .as_ref()
+        .map(|m| m.base_view.clone())
+        .unwrap_or_else(|| base_name.to_string());
+
+    if !is_root {
+        let _ = crate::refresh_incremental(base_name, None, 0, Some(scope_json));
+        return;
+    }
+
+    let safe_base = real_base.replace('\'', "''");
+    let safe_sj = scope_json.replace('\'', "''");
+
+    let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
+    let _ = Spi::run(&format!(
+        "CREATE TEMP TABLE refreshing_changelog AS \
+         SELECT ctid as old_ctid FROM spiral.changelog \
+         WHERE base_view = '{}' AND scope_values = '{}'::jsonb",
+        safe_base, safe_sj
+    ));
+
+    let success = crate::refresh_incremental(base_name, None, 0, Some(scope_json));
+
+    if success {
+        let _ = Spi::run(
+            "DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)",
+        );
+    }
+
+    let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
 }
 
 #[pg_extern]
