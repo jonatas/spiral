@@ -189,8 +189,9 @@ pub unsafe extern "C-unwind" fn spiral_tuple_tid_valid(
     let blkno = pg_sys::ItemPointerGetBlockNumber(tid);
     let posid = pg_sys::ItemPointerGetOffsetNumber(tid);
 
-    let nblocks = unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
-    
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+
     blkno < nblocks && posid >= 1 && posid <= crate::storage::DATA_PER_PAGE as u16
 }
 
@@ -273,7 +274,8 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
         let tupdesc = (*rel).rd_att;
         for i in 0..(*tupdesc).natts {
             let attr = pg_sys::TupleDescAttr(tupdesc, i as i32);
-            *attr_widths.add(i as usize) = pg_sys::get_typavgwidth((*attr).atttypid, (*attr).atttypmod);
+            *attr_widths.add(i as usize) =
+                pg_sys::get_typavgwidth((*attr).atttypid, (*attr).atttypmod);
         }
     }
 }
@@ -327,7 +329,9 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
         let mut tenant_scale = 1024;
         let rel_oid = (*rel).rd_id;
 
-        unsafe { pg_sys::RelationGetSmgr(rel); }
+        unsafe {
+            pg_sys::RelationGetSmgr(rel);
+        }
 
         let relname_ptr = pg_sys::get_rel_name(rel_oid);
         if !relname_ptr.is_null() {
@@ -370,7 +374,6 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
         }
     }
 }
-
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_insert_speculative(
@@ -532,7 +535,8 @@ pub unsafe extern "C-unwind" fn spiral_parallelscan_reinitialize(
 pub unsafe extern "C-unwind" fn spiral_index_fetch_begin(
     rel: pg_sys::Relation,
 ) -> *mut pg_sys::IndexFetchTableData {
-    let data = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexFetchTableData>()) as *mut pg_sys::IndexFetchTableData;
+    let data = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexFetchTableData>())
+        as *mut pg_sys::IndexFetchTableData;
     (*data).rel = rel;
     data
 }
@@ -856,7 +860,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
 
             if val != 0.0 {
                 let items_before = (offset_in_page - crate::storage::HEADER_SIZE as u32) / 8;
-                let idx = (pg_sys::BufferGetBlockNumber(buffer) as i64 * crate::storage::DATA_PER_PAGE as i64)
+                let idx = (pg_sys::BufferGetBlockNumber(buffer) as i64
+                    * crate::storage::DATA_PER_PAGE as i64)
                     + items_before as i64;
 
                 let t = idx / state.tenant_scale;
@@ -874,7 +879,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                     *values.add(2) = val.into_datum().unwrap();
                     *isnull.add(2) = false;
 
-                    pg_sys::ItemPointerSet(&mut (*slot).tts_tid, pg_sys::BufferGetBlockNumber(buffer), (items_before + 1) as u16);
+                    pg_sys::ItemPointerSet(
+                        &mut (*slot).tts_tid,
+                        pg_sys::BufferGetBlockNumber(buffer),
+                        (items_before + 1) as u16,
+                    );
                     pg_sys::ExecStoreVirtualTuple(slot);
                 }
 
@@ -1057,39 +1066,55 @@ pub unsafe extern "C-unwind" fn spiral_index_build_range_scan(
     scan: pg_sys::TableScanDesc,
 ) -> f64 {
     let mut reltuples = 0.0;
-    
+
     let estate = pg_sys::CreateExecutorState();
     let slot = pg_sys::table_slot_create(table_rel, std::ptr::null_mut());
-    
+
     let my_scan = if scan.is_null() {
-        pg_sys::table_beginscan_strat(table_rel, pg_sys::GetActiveSnapshot(), 0, std::ptr::null_mut(), true, _allow_sync)
+        pg_sys::table_beginscan_strat(
+            table_rel,
+            pg_sys::GetActiveSnapshot(),
+            0,
+            std::ptr::null_mut(),
+            true,
+            _allow_sync,
+        )
     } else {
         scan
     };
-    
+
     let num_keys = (*index_info).ii_NumIndexKeyAttrs as usize;
-    let values = pg_sys::palloc0(std::mem::size_of::<pg_sys::Datum>() * num_keys) as *mut pg_sys::Datum;
+    let values =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::Datum>() * num_keys) as *mut pg_sys::Datum;
     let isnull = pg_sys::palloc0(std::mem::size_of::<bool>() * num_keys) as *mut bool;
-    
-    while pg_sys::table_scan_getnextslot(my_scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+
+    while pg_sys::table_scan_getnextslot(my_scan, pg_sys::ScanDirection::ForwardScanDirection, slot)
+    {
         pg_sys::FormIndexDatum(index_info, slot, estate, values, isnull);
-        
+
         if let Some(cb) = callback {
-            cb(index_rel, &mut (*slot).tts_tid, values, isnull, true, callback_state);
+            cb(
+                index_rel,
+                &mut (*slot).tts_tid,
+                values,
+                isnull,
+                true,
+                callback_state,
+            );
         }
         reltuples += 1.0;
     }
-    
+
     pg_sys::pfree(values as *mut std::ffi::c_void);
     pg_sys::pfree(isnull as *mut std::ffi::c_void);
-    
+
     if scan.is_null() {
         pg_sys::table_endscan(my_scan);
     }
-    
+
     pg_sys::ExecDropSingleTupleTableSlot(slot);
     pg_sys::FreeExecutorState(estate);
-    
+
     reltuples
 }
 
@@ -1204,15 +1229,15 @@ mod tests {
             client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
             client.update("CREATE TABLE tam_index_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
             client.update("INSERT INTO tam_index_test (t, tenant_id, value) VALUES (1, 1, 10.0), (2, 2, 20.0), (3, 3, 30.0);", None, &[])?;
-            
+
             // Should now work!
             client.update("CREATE INDEX idx_tam_value ON tam_index_test(value);", None, &[])?;
-            
+
             // Verify index usage
             client.update("SET enable_seqscan = off;", None, &[])?;
             let val = Spi::get_one::<f64>("SELECT value FROM tam_index_test WHERE value = 20.0").unwrap().unwrap();
             assert_eq!(val, 20.0);
-            
+
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
@@ -1222,9 +1247,9 @@ mod tests {
         Spi::connect_mut(|client| {
             client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
             client.update("CREATE TABLE tam_parallel_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
-            
+
             // Insert enough data to justify parallel scan (though we'll force it)
-            client.update("INSERT INTO tam_parallel_test (t, tenant_id, value) 
+            client.update("INSERT INTO tam_parallel_test (t, tenant_id, value)
                            SELECT i, 1, i::double precision FROM generate_series(1, 1000) i;", None, &[])?;
 
             // Force parallel scan (PG18 uses debug_parallel_query)
@@ -1234,7 +1259,7 @@ mod tests {
 
             let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_parallel_test").unwrap().unwrap();
             assert_eq!(count, 1000);
-            
+
             Ok::<(), spi::Error>(())
         }).unwrap();
     }

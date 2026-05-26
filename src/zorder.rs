@@ -1,5 +1,5 @@
-use pgrx::prelude::*;
 use pgrx::datum::AnyNumeric;
+use pgrx::prelude::*;
 
 /// FNV-1a 64-bit hash — stable, documented, no external dependency.
 #[inline]
@@ -94,10 +94,14 @@ pub fn hilbert_encode(mut x: u64, mut y: u64) -> u128 {
         let rx = (x & n) > 0;
         let ry = (y & n) > 0;
         d += (n as u128 * n as u128) * ((3 * rx as u64) ^ ry as u64) as u128;
-        
-        if rx { x ^= n; }
-        if ry { y ^= n; }
-        
+
+        if rx {
+            x ^= n;
+        }
+        if ry {
+            y ^= n;
+        }
+
         rot(n, &mut x, &mut y, rx, ry);
     }
     d

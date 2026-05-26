@@ -98,11 +98,7 @@ pub fn parse_frames(frames_str: &str) -> Vec<Frame> {
             // Single-char and numeric suffixes
             let (seconds, name, cal) = if let Some(stripped) = s.strip_suffix('M') {
                 let n = stripped.parse::<i32>().unwrap_or(0);
-                (
-                    n * 2_592_000,
-                    format!("{}mo", n),
-                    Some("month".to_string()),
-                )
+                (n * 2_592_000, format!("{}mo", n), Some("month".to_string()))
             } else if let Some(stripped) = s.strip_suffix('Q') {
                 let n = stripped.parse::<i32>().unwrap_or(0);
                 (

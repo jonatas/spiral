@@ -585,7 +585,7 @@ mod zorder_tests {
 
     #[test]
     fn test_zorder_large_timestamp_does_not_wrap() {
-        let t_over_u32 = u32::MAX as i64 + 1; 
+        let t_over_u32 = u32::MAX as i64 + 1;
         assert_ne!(
             spiral_zorder_int_array_core(t_over_u32, vec![0]),
             spiral_zorder_int_array_core(0, vec![0])
@@ -631,7 +631,8 @@ mod zorder_tests {
     #[test]
     fn test_zorder_monotone_for_fixed_string_dimension() {
         let tenant = Some("42".to_string());
-        let timestamps: Vec<i64> = vec![0, 1, 100, 1000, 86400, 2_000_000, i32::MAX as i64, i64::MAX];
+        let timestamps: Vec<i64> =
+            vec![0, 1, 100, 1000, 86400, 2_000_000, i32::MAX as i64, i64::MAX];
         let zorders: Vec<u128> = timestamps
             .iter()
             .map(|&t| spiral_zorder_core(t, vec![tenant.clone()]))

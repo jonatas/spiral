@@ -28,8 +28,12 @@ impl Default for StatsState {
 
 impl StatsState {
     pub fn add(&mut self, val: f64) {
-        if val < self.min { self.min = val; }
-        if val > self.max { self.max = val; }
+        if val < self.min {
+            self.min = val;
+        }
+        if val > self.max {
+            self.max = val;
+        }
         let n1 = self.n;
         self.n += 1.0;
         let delta = val - self.m1;
@@ -45,10 +49,19 @@ impl StatsState {
     }
 
     pub fn merge(&mut self, other: &Self) {
-        if other.n == 0.0 { return; }
-        if self.n == 0.0 { *self = *other; return; }
-        if other.min < self.min { self.min = other.min; }
-        if other.max > self.max { self.max = other.max; }
+        if other.n == 0.0 {
+            return;
+        }
+        if self.n == 0.0 {
+            *self = *other;
+            return;
+        }
+        if other.min < self.min {
+            self.min = other.min;
+        }
+        if other.max > self.max {
+            self.max = other.max;
+        }
         let combined_n = self.n + other.n;
         let delta = other.m1 - self.m1;
         let delta2 = delta * delta;
@@ -56,19 +69,51 @@ impl StatsState {
         let delta4 = delta3 * delta;
         let m1 = (self.n * self.m1 + other.n * other.m1) / combined_n;
         let m2 = self.m2 + other.m2 + delta2 * self.n * other.n / combined_n;
-        let m3 = self.m3 + other.m3 + delta3 * self.n * other.n * (self.n - other.n) / (combined_n * combined_n)
+        let m3 = self.m3
+            + other.m3
+            + delta3 * self.n * other.n * (self.n - other.n) / (combined_n * combined_n)
             + 3.0 * delta * (self.n * other.m2 - other.n * self.m2) / combined_n;
-        let m4 = self.m4 + other.m4 + delta4 * self.n * other.n * (self.n * self.n - self.n * other.n + other.n * other.n) / (combined_n * combined_n * combined_n)
-            + 6.0 * delta2 * (self.n * self.n * other.m2 + other.n * other.n * self.m2) / (combined_n * combined_n)
+        let m4 = self.m4
+            + other.m4
+            + delta4 * self.n * other.n * (self.n * self.n - self.n * other.n + other.n * other.n)
+                / (combined_n * combined_n * combined_n)
+            + 6.0 * delta2 * (self.n * self.n * other.m2 + other.n * other.n * self.m2)
+                / (combined_n * combined_n)
             + 4.0 * delta * (self.n * other.m3 - other.n * self.m3) / combined_n;
-        self.n = combined_n; self.m1 = m1; self.m2 = m2; self.m3 = m3; self.m4 = m4;
+        self.n = combined_n;
+        self.m1 = m1;
+        self.m2 = m2;
+        self.m3 = m3;
+        self.m4 = m4;
     }
 
-    pub fn mean(&self) -> f64 { self.m1 }
-    pub fn variance(&self) -> f64 { if self.n > 1.0 { self.m2 / (self.n - 1.0) } else { 0.0 } }
-    pub fn stddev(&self) -> f64 { self.variance().sqrt() }
-    pub fn skewness(&self) -> f64 { if self.m2 > 0.0 { (self.n.sqrt() * self.m3) / self.m2.powf(1.5) } else { 0.0 } }
-    pub fn kurtosis(&self) -> f64 { if self.m2 > 0.0 { (self.n * self.m4) / (self.m2 * self.m2) - 3.0 } else { 0.0 } }
+    pub fn mean(&self) -> f64 {
+        self.m1
+    }
+    pub fn variance(&self) -> f64 {
+        if self.n > 1.0 {
+            self.m2 / (self.n - 1.0)
+        } else {
+            0.0
+        }
+    }
+    pub fn stddev(&self) -> f64 {
+        self.variance().sqrt()
+    }
+    pub fn skewness(&self) -> f64 {
+        if self.m2 > 0.0 {
+            (self.n.sqrt() * self.m3) / self.m2.powf(1.5)
+        } else {
+            0.0
+        }
+    }
+    pub fn kurtosis(&self) -> f64 {
+        if self.m2 > 0.0 {
+            (self.n * self.m4) / (self.m2 * self.m2) - 3.0
+        } else {
+            0.0
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -82,42 +127,81 @@ pub struct SketchState {
 
 impl Default for SketchState {
     fn default() -> Self {
-        SketchState { centroids: Vec::new(), count: 0.0, sum: 0.0, min: f64::MAX, max: f64::MIN }
+        SketchState {
+            centroids: Vec::new(),
+            count: 0.0,
+            sum: 0.0,
+            min: f64::MAX,
+            max: f64::MIN,
+        }
     }
 }
 
 impl SketchState {
     pub fn add(&mut self, val: f64) {
-        self.count += 1.0; self.sum += val;
-        if val < self.min { self.min = val; }
-        if val > self.max { self.max = val; }
+        self.count += 1.0;
+        self.sum += val;
+        if val < self.min {
+            self.min = val;
+        }
+        if val > self.max {
+            self.max = val;
+        }
         let mut found = false;
         for c in &mut self.centroids {
-            if (c.0 - val).abs() < 1e-9 { c.1 += 1.0; found = true; break; }
+            if (c.0 - val).abs() < 1e-9 {
+                c.1 += 1.0;
+                found = true;
+                break;
+            }
         }
-        if !found { self.centroids.push((val, 1.0)); }
-        if self.centroids.len() > 200 { self.compress(); }
+        if !found {
+            self.centroids.push((val, 1.0));
+        }
+        if self.centroids.len() > 200 {
+            self.compress();
+        }
     }
     pub fn merge(&mut self, other: &Self) {
-        if other.count == 0.0 { return; }
-        if self.count == 0.0 { *self = other.clone(); return; }
+        if other.count == 0.0 {
+            return;
+        }
+        if self.count == 0.0 {
+            *self = other.clone();
+            return;
+        }
         self.count += other.count;
         self.sum += other.sum;
-        if other.min < self.min { self.min = other.min; }
-        if other.max > self.max { self.max = other.max; }
+        if other.min < self.min {
+            self.min = other.min;
+        }
+        if other.max > self.max {
+            self.max = other.max;
+        }
         for c2 in &other.centroids {
             let mut found = false;
             for c1 in &mut self.centroids {
-                if (c1.0 - c2.0).abs() < 1e-9 { c1.1 += c2.1; found = true; break; }
+                if (c1.0 - c2.0).abs() < 1e-9 {
+                    c1.1 += c2.1;
+                    found = true;
+                    break;
+                }
             }
-            if !found { self.centroids.push(*c2); }
+            if !found {
+                self.centroids.push(*c2);
+            }
         }
-        if self.centroids.len() > 200 { self.compress(); }
+        if self.centroids.len() > 200 {
+            self.compress();
+        }
     }
     fn compress(&mut self) {
-        self.centroids.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        self.centroids
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let mut new_centroids = Vec::new();
-        if self.centroids.is_empty() { return; }
+        if self.centroids.is_empty() {
+            return;
+        }
         let mut current = self.centroids[0];
         for next in self.centroids.iter().skip(1) {
             if new_centroids.len() < 100 {
@@ -139,16 +223,24 @@ impl SketchState {
         self.centroids = new_centroids;
     }
     pub fn quantile(&self, q: f64) -> f64 {
-        if self.centroids.is_empty() { return 0.0; }
-        if q <= 0.0 { return self.min; }
-        if q >= 1.0 { return self.max; }
+        if self.centroids.is_empty() {
+            return 0.0;
+        }
+        if q <= 0.0 {
+            return self.min;
+        }
+        if q >= 1.0 {
+            return self.max;
+        }
         let mut sorted = self.centroids.clone();
         sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let target_count = q * self.count;
         let mut current_count = 0.0;
         for i in 0..sorted.len() {
             let next_count = current_count + sorted[i].1;
-            if next_count >= target_count { return sorted[i].0; }
+            if next_count >= target_count {
+                return sorted[i].0;
+            }
             current_count = next_count;
         }
         self.max
@@ -169,26 +261,60 @@ pub struct OHLCVState {
 
 impl Default for OHLCVState {
     fn default() -> Self {
-        OHLCVState { open: 0.0, open_t: i64::MAX, high: f64::MIN, low: f64::MAX, close: 0.0, close_t: i64::MIN, volume: 0.0, count: 0.0 }
+        OHLCVState {
+            open: 0.0,
+            open_t: i64::MAX,
+            high: f64::MIN,
+            low: f64::MAX,
+            close: 0.0,
+            close_t: i64::MIN,
+            volume: 0.0,
+            count: 0.0,
+        }
     }
 }
 
 impl OHLCVState {
     pub fn add(&mut self, val: f64, t: i64) {
-        if t < self.open_t { self.open = val; self.open_t = t; }
-        if t >= self.close_t { self.close = val; self.close_t = t; }
-        if val > self.high { self.high = val; }
-        if val < self.low { self.low = val; }
+        if t < self.open_t {
+            self.open = val;
+            self.open_t = t;
+        }
+        if t >= self.close_t {
+            self.close = val;
+            self.close_t = t;
+        }
+        if val > self.high {
+            self.high = val;
+        }
+        if val < self.low {
+            self.low = val;
+        }
         self.volume += val;
         self.count += 1.0;
     }
     pub fn merge(&mut self, other: &Self) {
-        if other.count == 0.0 { return; }
-        if self.count == 0.0 { *self = *other; return; }
-        if other.open_t < self.open_t { self.open = other.open; self.open_t = other.open_t; }
-        if other.close_t >= self.close_t { self.close = other.close; self.close_t = other.close_t; }
-        if other.high > self.high { self.high = other.high; }
-        if other.low < self.low { self.low = other.low; }
+        if other.count == 0.0 {
+            return;
+        }
+        if self.count == 0.0 {
+            *self = *other;
+            return;
+        }
+        if other.open_t < self.open_t {
+            self.open = other.open;
+            self.open_t = other.open_t;
+        }
+        if other.close_t >= self.close_t {
+            self.close = other.close;
+            self.close_t = other.close_t;
+        }
+        if other.high > self.high {
+            self.high = other.high;
+        }
+        if other.low < self.low {
+            self.low = other.low;
+        }
         self.volume += other.volume;
         self.count += other.count;
     }
@@ -196,87 +322,160 @@ impl OHLCVState {
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
-    let mut s = state.map(|j| serde_json::from_value::<StatsState>(j.0).unwrap()).unwrap_or_default();
+    let mut s = state
+        .map(|j| serde_json::from_value::<StatsState>(j.0).unwrap())
+        .unwrap_or_default();
     s.add(val);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB {
-    let mut s1 = state.map(|j| serde_json::from_value::<StatsState>(j.0).unwrap()).unwrap_or_default();
-    let s2 = other.map(|j| serde_json::from_value::<StatsState>(j.0).unwrap()).unwrap_or_default();
+    let mut s1 = state
+        .map(|j| serde_json::from_value::<StatsState>(j.0).unwrap())
+        .unwrap_or_default();
+    let s2 = other
+        .map(|j| serde_json::from_value::<StatsState>(j.0).unwrap())
+        .unwrap_or_default();
     s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_mean(state: pgrx::JsonB) -> f64 { serde_json::from_value::<StatsState>(state.0).unwrap().mean() }
+pub fn spiral_stats_mean(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<StatsState>(state.0)
+        .unwrap()
+        .mean()
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_count_final(state: pgrx::JsonB) -> i64 { serde_json::from_value::<StatsState>(state.0).unwrap().n as i64 }
+pub fn spiral_stats_count_final(state: pgrx::JsonB) -> i64 {
+    serde_json::from_value::<StatsState>(state.0).unwrap().n as i64
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_sum_final(state: pgrx::JsonB) -> f64 { let s = serde_json::from_value::<StatsState>(state.0).unwrap(); s.m1 * s.n }
+pub fn spiral_stats_sum_final(state: pgrx::JsonB) -> f64 {
+    let s = serde_json::from_value::<StatsState>(state.0).unwrap();
+    s.m1 * s.n
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_min_final(state: pgrx::JsonB) -> f64 { serde_json::from_value::<StatsState>(state.0).unwrap().min }
+pub fn spiral_stats_min_final(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<StatsState>(state.0).unwrap().min
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_max_final(state: pgrx::JsonB) -> f64 { serde_json::from_value::<StatsState>(state.0).unwrap().max }
+pub fn spiral_stats_max_final(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<StatsState>(state.0).unwrap().max
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_variance(state: pgrx::JsonB) -> f64 { serde_json::from_value::<StatsState>(state.0).unwrap().variance() }
+pub fn spiral_stats_variance(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<StatsState>(state.0)
+        .unwrap()
+        .variance()
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_stddev(state: pgrx::JsonB) -> f64 { serde_json::from_value::<StatsState>(state.0).unwrap().stddev() }
+pub fn spiral_stats_stddev(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<StatsState>(state.0)
+        .unwrap()
+        .stddev()
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_skewness(state: pgrx::JsonB) -> f64 { serde_json::from_value::<StatsState>(state.0).unwrap().skewness() }
+pub fn spiral_stats_skewness(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<StatsState>(state.0)
+        .unwrap()
+        .skewness()
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 { serde_json::from_value::<StatsState>(state.0).unwrap().kurtosis() }
+pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<StatsState>(state.0)
+        .unwrap()
+        .kurtosis()
+}
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
-    let mut s = state.map(|j| serde_json::from_value::<SketchState>(j.0).unwrap()).unwrap_or_default();
+    let mut s = state
+        .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
+        .unwrap_or_default();
     s.add(val);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_sketch_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB {
-    let mut s1 = state.map(|j| serde_json::from_value::<SketchState>(j.0).unwrap()).unwrap_or_default();
-    let s2 = other.map(|j| serde_json::from_value::<SketchState>(j.0).unwrap()).unwrap_or_default();
+pub fn spiral_sketch_combine(
+    state: Option<pgrx::JsonB>,
+    other: Option<pgrx::JsonB>,
+) -> pgrx::JsonB {
+    let mut s1 = state
+        .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
+        .unwrap_or_default();
+    let s2 = other
+        .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
+        .unwrap_or_default();
     s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 { serde_json::from_value::<SketchState>(state.0).unwrap().quantile(q) }
+pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
+    serde_json::from_value::<SketchState>(state.0)
+        .unwrap()
+        .quantile(q)
+}
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_tdigest_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB { spiral_sketch_accum(state, val) }
+pub fn spiral_tdigest_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
+    spiral_sketch_accum(state, val)
+}
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_tdigest_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB { spiral_sketch_combine(state, other) }
+pub fn spiral_tdigest_combine(
+    state: Option<pgrx::JsonB>,
+    other: Option<pgrx::JsonB>,
+) -> pgrx::JsonB {
+    spiral_sketch_combine(state, other)
+}
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_accum(state: Option<pgrx::JsonB>, val: f64, t: i64) -> pgrx::JsonB {
-    let mut s = state.map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap()).unwrap_or_default();
+    let mut s = state
+        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .unwrap_or_default();
     s.add(val, t);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB {
-    let mut s1 = state.map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap()).unwrap_or_default();
-    let s2 = other.map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap()).unwrap_or_default();
+    let mut s1 = state
+        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .unwrap_or_default();
+    let s2 = other
+        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .unwrap_or_default();
     s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_open(state: pgrx::JsonB) -> f64 { serde_json::from_value::<OHLCVState>(state.0).unwrap().open }
+pub fn spiral_ohlcv_open(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0).unwrap().open
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_high(state: pgrx::JsonB) -> f64 { serde_json::from_value::<OHLCVState>(state.0).unwrap().high }
+pub fn spiral_ohlcv_high(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0).unwrap().high
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_low(state: pgrx::JsonB) -> f64 { serde_json::from_value::<OHLCVState>(state.0).unwrap().low }
+pub fn spiral_ohlcv_low(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0).unwrap().low
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_close(state: pgrx::JsonB) -> f64 { serde_json::from_value::<OHLCVState>(state.0).unwrap().close }
+pub fn spiral_ohlcv_close(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0).unwrap().close
+}
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_volume(state: pgrx::JsonB) -> f64 { serde_json::from_value::<OHLCVState>(state.0).unwrap().volume }
+pub fn spiral_ohlcv_volume(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0)
+        .unwrap()
+        .volume
+}
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_to_array(state: pgrx::JsonB) -> Vec<f64> {
@@ -285,7 +484,9 @@ pub fn spiral_ohlcv_to_array(state: pgrx::JsonB) -> Vec<f64> {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_to_json(state: pgrx::JsonB) -> pgrx::JsonB { state }
+pub fn spiral_ohlcv_to_json(state: pgrx::JsonB) -> pgrx::JsonB {
+    state
+}
 
 extension_sql!(
     r#"
@@ -316,9 +517,20 @@ extension_sql!(
     "#,
     name = "create_spiral_stats_aggregates",
     requires = [
-        spiral_stats_accum, spiral_stats_combine, spiral_stats_mean, spiral_stats_count_final, spiral_stats_sum_final,
-        spiral_stats_min_final, spiral_stats_max_final,
-        spiral_sketch_accum, spiral_sketch_combine, spiral_tdigest_accum, spiral_tdigest_combine,
-        spiral_ohlcv_accum, spiral_ohlcv_combine, spiral_ohlcv_to_array, spiral_ohlcv_to_json
+        spiral_stats_accum,
+        spiral_stats_combine,
+        spiral_stats_mean,
+        spiral_stats_count_final,
+        spiral_stats_sum_final,
+        spiral_stats_min_final,
+        spiral_stats_max_final,
+        spiral_sketch_accum,
+        spiral_sketch_combine,
+        spiral_tdigest_accum,
+        spiral_tdigest_combine,
+        spiral_ohlcv_accum,
+        spiral_ohlcv_combine,
+        spiral_ohlcv_to_array,
+        spiral_ohlcv_to_json
     ]
 );

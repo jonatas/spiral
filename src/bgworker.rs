@@ -93,7 +93,10 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     )?
                     .map(|row| {
                         let bv = row.get::<String>(1).unwrap().unwrap_or_default();
-                        let sv = row.get::<String>(2).unwrap().unwrap_or_else(|| "{}".to_string());
+                        let sv = row
+                            .get::<String>(2)
+                            .unwrap()
+                            .unwrap_or_else(|| "{}".to_string());
                         (bv, sv)
                     })
                     .collect();
@@ -128,7 +131,9 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     if debug_logging {
                         debug2!(
                             "Spiral Worker (Slot {}): refreshing scope '{}' for '{}'",
-                            slot, scope_json, base_view
+                            slot,
+                            scope_json,
+                            base_view
                         );
                     }
 
