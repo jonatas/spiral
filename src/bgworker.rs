@@ -3,6 +3,9 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::ffi::CStr;
 
+// Namespace for scope-level advisory locks (FNV of "spiral:scope").
+const SCOPE_LOCK_NS: i32 = 0x5350_5343_u32 as i32;
+
 #[pg_guard]
 #[no_mangle]
 pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
@@ -52,16 +55,14 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
 
         BackgroundWorker::transaction(|| {
             let _ = Spi::connect(|client| {
-                let enabled = crate::WORKER_ENABLED.get();
-                if !enabled {
+                if !crate::WORKER_ENABLED.get() {
                     return Ok::<(), spi::Error>(());
                 }
 
-                let debug_logging = crate::WORKER_DEBUG.get();
-
                 let table_exists = !client
                     .select(
-                        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1",
+                        "SELECT 1 FROM information_schema.tables \
+                         WHERE table_schema = 'spiral' AND table_name = 'changelog' LIMIT 1",
                         Some(1),
                         &[],
                     )?
@@ -70,65 +71,84 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     return Ok::<(), spi::Error>(());
                 }
 
-                // Find all root materialized views (parent_view = 'BASE')
-                let tuple_table = client.select(
-                    "SELECT view_name FROM spiral.metadata WHERE parent_view = 'BASE'",
-                    None,
-                    &[],
-                )?;
+                let debug_logging = crate::WORKER_DEBUG.get();
+                let batch_size = crate::WORKER_BATCH_SIZE.get();
 
-                for row in tuple_table {
-                    if let Ok(Some(view_name)) = row.get::<String>(1) {
-                        // Avoid contention: try to acquire a transaction-level advisory lock for this specific view
-                        // We use a constant namespace 0x41535050 = 1095983184 and the hashtext of the view name.
-                        let got_view_lock: bool = client
-                            .select(
-                                &format!(
-                                    "SELECT pg_try_advisory_xact_lock(1095983184, hashtext('{}'))",
-                                    view_name.replace("'", "''")
-                                ),
-                                Some(1),
-                                &[],
-                            )?
-                            .first()
-                            .get_one::<bool>()
-                            .unwrap_or(Some(false))
-                            .unwrap_or(false);
+                // Scope-affinity scheduling:
+                // Claim (base_view, scope_values) pairs ordered by oldest t_start first
+                // (highest lag processed first). Each pair is protected by a transaction-level
+                // advisory lock so concurrent workers process disjoint scopes.
+                let scopes: Vec<(String, String)> = client
+                    .select(
+                        &format!(
+                            "SELECT DISTINCT ON (base_view, scope_values) \
+                                base_view, scope_values::text \
+                             FROM spiral.changelog \
+                             ORDER BY base_view, scope_values, t_start ASC \
+                             LIMIT {}",
+                            batch_size * 4 // fetch extras so workers can skip locked ones
+                        ),
+                        None,
+                        &[],
+                    )?
+                    .map(|row| {
+                        let bv = row.get::<String>(1).unwrap().unwrap_or_default();
+                        let sv = row.get::<String>(2).unwrap().unwrap_or_else(|| "{}".to_string());
+                        (bv, sv)
+                    })
+                    .collect();
 
-                        if !got_view_lock {
-                            continue; // Another worker is processing this view
-                        }
-
-                        // Only refresh if there are dirty buckets
-                        let has_dirty: bool = client
-                            .select(
-                                &format!(
-                                    "SELECT 1 FROM spiral.changelog WHERE base_view = '{}' LIMIT 1",
-                                    view_name.replace("'", "''")
-                                ),
-                                Some(1),
-                                &[],
-                            )
-                            .map(|t| !t.is_empty())
-                            .unwrap_or(false);
-
-                        if has_dirty {
-                            if debug_logging {
-                                debug2!(
-                                    "Spiral Worker (Slot {}): Auto-refreshing root view '{}'",
-                                    slot,
-                                    view_name
-                                );
-                            } else {
-                                info!(
-                                    "Spiral Worker (Slot {}): Auto-refreshing root view '{}'",
-                                    slot, view_name
-                                );
-                            }
-                            let _ = Spi::run(&format!("SELECT spiral_refresh('{}')", view_name));
-                        }
+                let mut processed = 0i32;
+                for (base_view, scope_json) in &scopes {
+                    if processed >= batch_size {
+                        break;
                     }
+
+                    let lock_key = format!("{}:{}", base_view, scope_json);
+                    let lock_hash = crate::fnv1a_64(lock_key.as_bytes()) as i32;
+
+                    let got_lock: bool = client
+                        .select(
+                            &format!(
+                                "SELECT pg_try_advisory_xact_lock({}, {})",
+                                SCOPE_LOCK_NS, lock_hash
+                            ),
+                            Some(1),
+                            &[],
+                        )?
+                        .first()
+                        .get_one::<bool>()
+                        .unwrap_or(Some(false))
+                        .unwrap_or(false);
+
+                    if !got_lock {
+                        continue; // another worker owns this scope
+                    }
+
+                    if debug_logging {
+                        debug2!(
+                            "Spiral Worker (Slot {}): refreshing scope '{}' for '{}'",
+                            slot, scope_json, base_view
+                        );
+                    }
+
+                    let safe_bv = base_view.replace('\'', "''");
+                    let safe_sv = scope_json.replace('\'', "''");
+                    let _ = Spi::run(&format!(
+                        "SELECT spiral_refresh_scope('{}', '{}')",
+                        safe_bv, safe_sv
+                    ));
+
+                    processed += 1;
                 }
+
+                if processed > 0 && !debug_logging {
+                    info!(
+                        "Spiral Worker (Slot {}): processed {} scope(s)",
+                        slot, processed
+                    );
+                }
+
                 Ok::<(), spi::Error>(())
             });
         });

@@ -3,8 +3,8 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::cell::Cell;
 use std::ffi::CStr;
-use std::panic::AssertUnwindSafe;
 use std::os::raw::{c_char, c_int};
+use std::panic::AssertUnwindSafe;
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
 static mut PREV_PLANNER_HOOK: pg_sys::planner_hook_type = None;
@@ -1059,11 +1059,7 @@ pub fn accelerate(
     initial_load: default!(bool, true),
 ) {
     let frames_str = frames.unwrap_or(rollup::DEFAULT_FRAMES);
-    let scope_columns: Vec<String> = tenant
-        .unwrap_or_default()
-        .into_iter()
-        .flatten()
-        .collect();
+    let scope_columns: Vec<String> = tenant.unwrap_or_default().into_iter().flatten().collect();
 
     let (anchor_col, offset_cols, col_types_map) = Spi::connect(|client| {
         let q = format!(
@@ -1094,11 +1090,14 @@ pub fn accelerate(
         };
 
         let offsets: Vec<String> = tstz_cols.into_iter().filter(|c| c != &anchor).collect();
-        Ok::<(String, Vec<String>, std::collections::HashMap<String, pg_sys::Oid>), spi::Error>((
-            anchor,
-            offsets,
-            type_map,
-        ))
+        Ok::<
+            (
+                String,
+                Vec<String>,
+                std::collections::HashMap<String, pg_sys::Oid>,
+            ),
+            spi::Error,
+        >((anchor, offsets, type_map))
     })
     .unwrap_or_else(|e| {
         error!(
@@ -1203,7 +1202,7 @@ pub fn refresh(relation: &str) {
     }
 
     // Capture IDs to be refreshed
-    let mut dirty_ranges = catalog::get_dirty_ranges(relation, 0, 2147483647, None);
+    let dirty_ranges = catalog::get_dirty_ranges(relation, 0, 2147483647, None);
     if dirty_ranges.is_empty() {
         notice!("Spiral: hierarchy for '{}' is already up to date", relation);
         return;
@@ -1212,14 +1211,18 @@ pub fn refresh(relation: &str) {
     // For simplicity in the manual refresh API, we just refresh all dirty ranges.
     // In a production scenario, this would be done in chunks.
     for (ts, te) in dirty_ranges {
-        notice!("Spiral: refreshing range [{}, {}) for '{}'", ts, te, relation);
+        notice!(
+            "Spiral: refreshing range [{}, {}) for '{}'",
+            ts,
+            te,
+            relation
+        );
         // This is a placeholder for the actual refresh logic which is currently
         // mostly inside the bgworker's loop. I should extract it.
     }
 }
 
-pub fn create_reconstruction_view(
-rel_name: &str) {
+pub fn create_reconstruction_view(rel_name: &str) {
     let create_view_sql: Option<String> = Spi::connect(|client| {
         let mut metadata_res = client.select(
             &format!(
@@ -1611,8 +1614,7 @@ pub fn generate_hierarchy_internal(
             }
             Err(e) => error!(
                 "Spiral: failed to create rollup tier '{}': {:?}",
-                child_name,
-                e
+                child_name, e
             ),
         }
     }
@@ -1770,8 +1772,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
             sketch_merge_oid,
         );
     }
-    }
-
+}
 
 pub(crate) unsafe fn extract_supported_query_columns(
     query: *mut pg_sys::Query,
@@ -1917,7 +1918,12 @@ pub(crate) unsafe fn extract_supported_query_columns(
             continue;
         }
 
-        if !walk_expr((*tle).expr as *mut pg_sys::Node, base_table, rtable, &mut cols) {
+        if !walk_expr(
+            (*tle).expr as *mut pg_sys::Node,
+            base_table,
+            rtable,
+            &mut cols,
+        ) {
             return None;
         }
     }
@@ -2216,7 +2222,7 @@ fn construct_union_sql_hierarchical(
                             rows = client.select(&sql, Some(1), &[])?;
                         }
 
-                        for row in rows {
+                        if let Some(row) = rows.next() {
                             let formula = row.get::<String>(1)?.unwrap_or_default();
                             let mat_col = row.get::<String>(2)?.unwrap_or_default();
                             return Ok((formula, mat_col));

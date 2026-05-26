@@ -367,20 +367,33 @@ Built with ❤️ using `pgrx` and `ta-statistics`.
 
 ## 📦 Releasing
 
-Spiral uses GitHub Actions to automate the release process. When a new version is tagged and pushed, a GitHub Release is automatically created with pre-built binaries for Linux and macOS.
+Spiral's CI is manual-only to keep GitHub Actions usage predictable. Normal commits and pushes do not start CI.
 
-### Automated Release
-1. Tag the release: `git tag v0.1.0`
-2. Push the tag: `git push origin v0.1.0`
+### Release Flow
+1. Run the full local check: `./scripts/check-all.sh`
+2. Create the release tag: `git tag v0.1.0`
+3. Push your branch and tag:
+   ```bash
+   git push origin main
+   git push origin v0.1.0
+   ```
+4. Request CI explicitly for the tag:
+   ```bash
+   gh workflow run ci.yml --ref v0.1.0
+   ```
 
-The `.github/workflows/release.yml` will:
+You can do the same from GitHub Actions by opening the `CI` workflow, clicking `Run workflow`, and selecting the release tag as the ref.
+
+When `ci.yml` is run for a `v*` tag and all jobs pass, the same workflow will:
 - Build the extension for PostgreSQL 18 on Ubuntu and macOS.
 - Bundle the extension files (`.so`/`.dylib`, `.control`, and `.sql`) into tarballs.
 - Create a GitHub Release and upload the tarballs.
 - Update the Homebrew formula in `Formula/spiral.rb`.
 
-### Local Release
-You can also package the extension locally using the provided script:
+Pushing a tag by itself does not publish a release. Release publication only happens after you manually dispatch `ci.yml` for that tag and the workflow completes successfully.
+
+### Local Packaging
+You can also package the extension locally using:
 ```bash
 ./scripts/release.sh
 ```
