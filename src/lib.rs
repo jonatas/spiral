@@ -19,6 +19,7 @@ pub static WORKER_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static WORKER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
 pub static WORKER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10);
+pub static ENABLE_PLANNER_HOOK: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
@@ -69,6 +70,15 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         1,
         1000,
         GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"spiral.enable_planner_hook",
+        c"Enable or disable the Spiral planner hook",
+        c"When false, standard PostgreSQL planning path is used without Spiral-specific optimizations.",
+        &ENABLE_PLANNER_HOOK,
+        GucContext::Userset,
         GucFlags::default(),
     );
 }

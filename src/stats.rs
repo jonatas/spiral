@@ -162,6 +162,19 @@ pub fn spiral_stats_mean(state: pgrx::JsonB) -> f64 {
 }
 
 #[pg_extern(immutable, parallel_safe)]
+pub fn spiral_stats_count_final(state: pgrx::JsonB) -> i64 {
+    serde_json::from_value::<StatsState>(state.0)
+        .unwrap()
+        .n as i64
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_stats_sum_final(state: pgrx::JsonB) -> f64 {
+    let s = serde_json::from_value::<StatsState>(state.0).unwrap();
+    s.m1 * s.n
+}
+
+#[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_variance(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0)
         .unwrap()
@@ -351,11 +364,38 @@ extension_sql!(
         COMBINEFUNC = spiral_tdigest_combine,
         PARALLEL = SAFE
     );
+
+    CREATE AGGREGATE spiral_avg(jsonb) (
+        SFUNC = spiral_stats_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_stats_mean,
+        COMBINEFUNC = spiral_stats_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_count(jsonb) (
+        SFUNC = spiral_stats_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_stats_count_final,
+        COMBINEFUNC = spiral_stats_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_sum(jsonb) (
+        SFUNC = spiral_stats_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_stats_sum_final,
+        COMBINEFUNC = spiral_stats_combine,
+        PARALLEL = SAFE
+    );
     "#,
     name = "create_spiral_stats_aggregates",
     requires = [
         spiral_stats_accum,
         spiral_stats_combine,
+        spiral_stats_mean,
+        spiral_stats_count_final,
+        spiral_stats_sum_final,
         spiral_sketch_accum,
         spiral_sketch_combine,
         spiral_tdigest_accum,

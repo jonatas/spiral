@@ -179,10 +179,19 @@ pub unsafe extern "C-unwind" fn spiral_tuple_satisfies_snapshot(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_tid_valid(
-    _scan: pg_sys::TableScanDesc,
-    _tid: pg_sys::ItemPointer,
+    scan: pg_sys::TableScanDesc,
+    tid: pg_sys::ItemPointer,
 ) -> bool {
-    false
+    if scan.is_null() || tid.is_null() {
+        return false;
+    }
+    let rel = (*scan).rs_rd;
+    let blkno = pg_sys::ItemPointerGetBlockNumber(tid);
+    let posid = pg_sys::ItemPointerGetOffsetNumber(tid);
+
+    let nblocks = unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    
+    blkno < nblocks && posid >= 1 && posid <= crate::storage::DATA_PER_PAGE as u16
 }
 
 #[pg_guard]
@@ -233,13 +242,15 @@ pub unsafe extern "C-unwind" fn spiral_relation_size(
     if rel.is_null() {
         return 0;
     }
-    pg_sys::table_block_relation_size(rel, fork_number)
+    let smgr = pg_sys::RelationGetSmgr(rel);
+    let nblocks = pg_sys::smgrnblocks(smgr, fork_number);
+    (nblocks as u64) * (pg_sys::BLCKSZ as u64)
 }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
     rel: pg_sys::Relation,
-    _attr_widths: *mut i32,
+    attr_widths: *mut i32,
     pages: *mut pg_sys::BlockNumber,
     tuples: *mut f64,
     allvisfrac: *mut f64,
@@ -247,15 +258,24 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
     if rel.is_null() {
         return;
     }
-    pg_sys::table_block_relation_estimate_size(
-        rel,
-        std::ptr::null_mut(),
-        pages,
-        tuples,
-        allvisfrac,
-        0,
-        (crate::storage::DATA_PER_PAGE * std::mem::size_of::<f64>()) as pg_sys::Size,
-    );
+
+    let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+    *pages = nblocks;
+
+    // Each block is full (mathematically mapped)
+    *tuples = (nblocks as f64) * (crate::storage::DATA_PER_PAGE as f64);
+
+    if !allvisfrac.is_null() {
+        *allvisfrac = 1.0; // Everything is always visible in Spiral
+    }
+
+    if !attr_widths.is_null() {
+        let tupdesc = (*rel).rd_att;
+        for i in 0..(*tupdesc).natts {
+            let attr = pg_sys::TupleDescAttr(tupdesc, i as i32);
+            *attr_widths.add(i as usize) = pg_sys::get_typavgwidth((*attr).atttypid, (*attr).atttypmod);
+        }
+    }
 }
 
 #[pg_guard]
@@ -282,7 +302,7 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
             continue;
         }
         let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-        notice!("Spiral: found column '{}'", name);
+        warning!("Spiral: found column '{}'", name);
         let is_null = *(*slot).tts_isnull.add(i as usize);
         if is_null {
             continue;
@@ -304,9 +324,11 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
     }
 
     if let (Some(t), Some(tid), Some(v)) = (t_val, tenant_id, value) {
-        notice!("Spiral: insert (t={}, tid={}, v={})", t, tid, v);
         let mut tenant_scale = 1024;
         let rel_oid = (*rel).rd_id;
+
+        unsafe { pg_sys::RelationGetSmgr(rel); }
+
         let relname_ptr = pg_sys::get_rel_name(rel_oid);
         if !relname_ptr.is_null() {
             let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
@@ -322,8 +344,8 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
             let logical_offset = (t_rel * tenant_scale * 8) + (tid as i64 * 8);
             let (blkno, page_offset) = crate::storage::logical_to_physical_offset(logical_offset);
 
-            let mut nblocks =
-                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            let smgr = pg_sys::RelationGetSmgr(rel);
+            let mut nblocks = pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
             while nblocks <= blkno {
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
@@ -337,6 +359,7 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
 
             let buffer = pg_sys::ReadBuffer(rel, blkno);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+
             let page = pg_sys::BufferGetPage(buffer);
             let ptr = (page as *mut u8).add(page_offset as usize);
             *(ptr as *mut f64) = v;
@@ -347,6 +370,7 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
         }
     }
 }
+
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_insert_speculative(
@@ -412,6 +436,7 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
         return pg_sys::TM_Result::TM_Ok;
     }
 
+    // TODO: Re-implement WAL durability using GenericXLog or similar.
     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
     let page = pg_sys::BufferGetPage(buffer);
 
@@ -481,49 +506,68 @@ pub unsafe extern "C-unwind" fn spiral_finish_bulk_insert(_rel: pg_sys::Relation
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_parallelscan_estimate(
-    _rel: pg_sys::Relation,
+    rel: pg_sys::Relation,
 ) -> pg_sys::Size {
-    0
+    pg_sys::table_block_parallelscan_estimate(rel)
 }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_parallelscan_initialize(
-    _rel: pg_sys::Relation,
-    _pscan: pg_sys::ParallelTableScanDesc,
+    rel: pg_sys::Relation,
+    pscan: pg_sys::ParallelTableScanDesc,
 ) -> pg_sys::Size {
-    0
+    pg_sys::table_block_parallelscan_initialize(rel, pscan);
+    std::mem::size_of::<pg_sys::ParallelBlockTableScanDescData>()
 }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_parallelscan_reinitialize(
-    _rel: pg_sys::Relation,
-    _pscan: pg_sys::ParallelTableScanDesc,
+    rel: pg_sys::Relation,
+    pscan: pg_sys::ParallelTableScanDesc,
 ) {
+    pg_sys::table_block_parallelscan_reinitialize(rel, pscan);
 }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_index_fetch_begin(
-    _rel: pg_sys::Relation,
+    rel: pg_sys::Relation,
 ) -> *mut pg_sys::IndexFetchTableData {
-    std::ptr::null_mut()
+    let data = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexFetchTableData>()) as *mut pg_sys::IndexFetchTableData;
+    (*data).rel = rel;
+    data
 }
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_index_fetch_reset(_data: *mut pg_sys::IndexFetchTableData) {}
 
 #[pg_guard]
-pub unsafe extern "C-unwind" fn spiral_index_fetch_end(_data: *mut pg_sys::IndexFetchTableData) {}
+pub unsafe extern "C-unwind" fn spiral_index_fetch_end(data: *mut pg_sys::IndexFetchTableData) {
+    if !data.is_null() {
+        pg_sys::pfree(data as *mut std::ffi::c_void);
+    }
+}
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_index_fetch_tuple(
-    _scan: *mut pg_sys::IndexFetchTableData,
-    _tid: pg_sys::ItemPointer,
-    _snapshot: pg_sys::Snapshot,
-    _slot: *mut pg_sys::TupleTableSlot,
-    _call_again: *mut bool,
-    _all_dead: *mut bool,
+    data: *mut pg_sys::IndexFetchTableData,
+    tid: pg_sys::ItemPointer,
+    snapshot: pg_sys::Snapshot,
+    slot: *mut pg_sys::TupleTableSlot,
+    call_again: *mut bool,
+    all_dead: *mut bool,
 ) -> bool {
-    false
+    if data.is_null() || tid.is_null() || slot.is_null() {
+        return false;
+    }
+
+    if !call_again.is_null() {
+        *call_again = false;
+    }
+    if !all_dead.is_null() {
+        *all_dead = false;
+    }
+
+    spiral_tuple_fetch_row_version((*data).rel, tid, snapshot, slot)
 }
 
 #[pg_guard]
@@ -637,6 +681,8 @@ struct SpiralScanState {
     /// Exclusive upper page bound for the query's time range.
     scan_last_blk: pg_sys::BlockNumber,
     current_offset_in_page: u32,
+    phsw: pg_sys::ParallelBlockTableScanWorkerData,
+    read_stream: *mut pg_sys::ReadStream,
 }
 
 #[repr(C)]
@@ -645,11 +691,26 @@ struct SpiralScanDescData {
     state: *mut SpiralScanState,
 }
 
+unsafe extern "C-unwind" fn spiral_read_stream_next_block(
+    _stream: *mut pg_sys::ReadStream,
+    callback_private: *mut std::ffi::c_void,
+    _per_buffer_data: *mut std::ffi::c_void,
+) -> pg_sys::BlockNumber {
+    let state = callback_private as *mut SpiralScanState;
+    if (*state).current_blkno < (*state).scan_last_blk {
+        let blk = (*state).current_blkno;
+        (*state).current_blkno += 1;
+        blk
+    } else {
+        pg_sys::InvalidBlockNumber
+    }
+}
+
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_scan_begin(
     rel: pg_sys::Relation,
     snapshot: pg_sys::Snapshot,
-    nkeys: i32,
+    nkeys: ::core::ffi::c_int,
     key: *mut pg_sys::ScanKeyData,
     pscan: pg_sys::ParallelTableScanDesc,
     flags: u32,
@@ -675,14 +736,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
         }
     }
 
-    unsafe {
-        pg_sys::RelationGetSmgr(rel);
-    }
-    let total_blks = if !unsafe { (*rel).rd_smgr.is_null() } {
-        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) }
-    } else {
-        0
-    };
+    let smgr = pg_sys::RelationGetSmgr(rel);
+    let total_blks = pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
+
     // Consume the time range set by the planner hook (None → full scan).
     let time_range = crate::SCAN_TIME_RANGE.with(|r| r.take());
     let (scan_first_blk, scan_last_blk) = if let Some((ts, te)) = time_range {
@@ -704,7 +760,29 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     (*state).scan_last_blk = scan_last_blk;
     (*state).current_offset_in_page = crate::storage::HEADER_SIZE as u32;
 
+    if pscan.is_null() {
+        // Sequential scan: use relation stream with callback
+        let stream = pg_sys::read_stream_begin_relation(
+            pg_sys::READ_STREAM_SEQUENTIAL as i32,
+            std::ptr::null_mut(),
+            rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+            Some(spiral_read_stream_next_block),
+            state as *mut std::ffi::c_void,
+            0,
+        );
+        (*state).read_stream = stream;
+    }
+
     (*spiral_scan).state = state;
+
+    if !pscan.is_null() {
+        pg_sys::table_block_parallelscan_startblock_init(
+            rel,
+            &mut (*state).phsw as *mut pg_sys::ParallelBlockTableScanWorkerData,
+            pscan as *mut pg_sys::ParallelBlockTableScanDescData,
+        );
+    }
 
     &mut (*spiral_scan).base as pg_sys::TableScanDesc
 }
@@ -726,28 +804,50 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
 
     let state = &mut *(*spiral_scan).state;
     let rel = (*scan).rs_rd;
+    let pscan = (*scan).rs_parallel;
 
     let blk_limit = state.scan_last_blk.min(state.total_blks);
-    while state.current_blkno < blk_limit {
-        let buffer = pg_sys::ReadBuffer(rel, state.current_blkno);
+
+    loop {
+        let buffer = if !state.read_stream.is_null() {
+            pg_sys::read_stream_next_buffer(state.read_stream, std::ptr::null_mut())
+        } else if !pscan.is_null() {
+            if state.current_offset_in_page == crate::storage::HEADER_SIZE as u32 {
+                state.current_blkno = pg_sys::table_block_parallelscan_nextpage(
+                    rel,
+                    &mut state.phsw as *mut pg_sys::ParallelBlockTableScanWorkerData,
+                    pscan as *mut pg_sys::ParallelBlockTableScanDescData,
+                );
+                if state.current_blkno == pg_sys::InvalidBlockNumber {
+                    return false;
+                }
+            }
+            pg_sys::ReadBuffer(rel, state.current_blkno)
+        } else {
+            if state.current_blkno >= blk_limit {
+                return false;
+            }
+            pg_sys::ReadBuffer(rel, state.current_blkno)
+        };
+
         if buffer == 0 {
-            // InvalidBuffer is 0
-            state.current_blkno += 1;
-            continue;
+            return false;
         }
 
         pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
-
         let page = pg_sys::BufferGetPage(buffer);
+
         if !crate::storage::is_valid_spiral_page(page) {
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
             pg_sys::ReleaseBuffer(buffer);
-            state.current_blkno += 1;
+            if state.read_stream.is_null() && pscan.is_null() {
+                state.current_blkno += 1;
+            }
             state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
             continue;
         }
-        let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
 
+        let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
         while state.current_offset_in_page + 8 <= upper_bound {
             let ptr = (page as *const u8).add(state.current_offset_in_page as usize);
             let val = *(ptr as *const f64);
@@ -756,14 +856,13 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
 
             if val != 0.0 {
                 let items_before = (offset_in_page - crate::storage::HEADER_SIZE as u32) / 8;
-                let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64)
+                let idx = (pg_sys::BufferGetBlockNumber(buffer) as i64 * crate::storage::DATA_PER_PAGE as i64)
                     + items_before as i64;
 
                 let t = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
                 pg_sys::ExecClearTuple(slot);
-
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
@@ -775,14 +874,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                     *values.add(2) = val.into_datum().unwrap();
                     *isnull.add(2) = false;
 
-                    // Set TID (ItemPointer) so Postgres knows where to find/delete this row.
-                    // posid is 1-based, so add 1 to our 0-based offset.
-                    pg_sys::ItemPointerSet(
-                        &mut (*slot).tts_tid,
-                        state.current_blkno,
-                        (items_before + 1) as u16,
-                    );
-
+                    pg_sys::ItemPointerSet(&mut (*slot).tts_tid, pg_sys::BufferGetBlockNumber(buffer), (items_before + 1) as u16);
                     pg_sys::ExecStoreVirtualTuple(slot);
                 }
 
@@ -795,10 +887,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
         pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
         pg_sys::ReleaseBuffer(buffer);
 
-        state.current_blkno += 1;
+        if state.read_stream.is_null() && pscan.is_null() {
+            state.current_blkno += 1;
+        }
         state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
     }
-    false
 }
 
 #[pg_guard]
@@ -806,6 +899,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_end(scan: pg_sys::TableScanDesc) {
     if !scan.is_null() {
         let spiral_scan = scan as *mut SpiralScanDescData;
         if !(*spiral_scan).state.is_null() {
+            let state = &mut *(*spiral_scan).state;
+            if !state.read_stream.is_null() {
+                pg_sys::read_stream_end(state.read_stream);
+                state.read_stream = std::ptr::null_mut();
+            }
             pg_sys::pfree((*spiral_scan).state as *mut std::ffi::c_void);
             (*spiral_scan).state = std::ptr::null_mut();
         }
@@ -828,6 +926,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
             let state = &mut *(*spiral_scan).state;
             state.current_blkno = state.scan_first_blk;
             state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+            if !state.read_stream.is_null() {
+                pg_sys::read_stream_reset(state.read_stream);
+            }
         }
     }
 }
@@ -943,19 +1044,53 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
 #[allow(clippy::too_many_arguments)]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_index_build_range_scan(
-    _table_rel: pg_sys::Relation,
-    _index_rel: pg_sys::Relation,
-    _index_info: *mut pg_sys::IndexInfo,
+    table_rel: pg_sys::Relation,
+    index_rel: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
     _allow_sync: bool,
     _anyvisible: bool,
     _progress: bool,
     _start_blockno: pg_sys::BlockNumber,
     _numblocks: pg_sys::BlockNumber,
-    _callback: pg_sys::IndexBuildCallback,
-    _callback_state: *mut std::ffi::c_void,
-    _scan: pg_sys::TableScanDesc,
+    callback: pg_sys::IndexBuildCallback,
+    callback_state: *mut std::ffi::c_void,
+    scan: pg_sys::TableScanDesc,
 ) -> f64 {
-    0.0
+    let mut reltuples = 0.0;
+    
+    let estate = pg_sys::CreateExecutorState();
+    let slot = pg_sys::table_slot_create(table_rel, std::ptr::null_mut());
+    
+    let my_scan = if scan.is_null() {
+        pg_sys::table_beginscan_strat(table_rel, pg_sys::GetActiveSnapshot(), 0, std::ptr::null_mut(), true, _allow_sync)
+    } else {
+        scan
+    };
+    
+    let num_keys = (*index_info).ii_NumIndexKeyAttrs as usize;
+    let values = pg_sys::palloc0(std::mem::size_of::<pg_sys::Datum>() * num_keys) as *mut pg_sys::Datum;
+    let isnull = pg_sys::palloc0(std::mem::size_of::<bool>() * num_keys) as *mut bool;
+    
+    while pg_sys::table_scan_getnextslot(my_scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+        pg_sys::FormIndexDatum(index_info, slot, estate, values, isnull);
+        
+        if let Some(cb) = callback {
+            cb(index_rel, &mut (*slot).tts_tid, values, isnull, true, callback_state);
+        }
+        reltuples += 1.0;
+    }
+    
+    pg_sys::pfree(values as *mut std::ffi::c_void);
+    pg_sys::pfree(isnull as *mut std::ffi::c_void);
+    
+    if scan.is_null() {
+        pg_sys::table_endscan(my_scan);
+    }
+    
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
+    pg_sys::FreeExecutorState(estate);
+    
+    reltuples
 }
 
 #[pg_guard]
@@ -1059,6 +1194,47 @@ mod tests {
             let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_truncate_test").unwrap().unwrap();
             assert_eq!(count, 0);
 
+            Ok::<(), spi::Error>(())
+        }).unwrap();
+    }
+
+    #[pg_test]
+    fn test_tam_create_index() {
+        Spi::connect_mut(|client| {
+            client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
+            client.update("CREATE TABLE tam_index_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
+            client.update("INSERT INTO tam_index_test (t, tenant_id, value) VALUES (1, 1, 10.0), (2, 2, 20.0), (3, 3, 30.0);", None, &[])?;
+            
+            // Should now work!
+            client.update("CREATE INDEX idx_tam_value ON tam_index_test(value);", None, &[])?;
+            
+            // Verify index usage
+            client.update("SET enable_seqscan = off;", None, &[])?;
+            let val = Spi::get_one::<f64>("SELECT value FROM tam_index_test WHERE value = 20.0").unwrap().unwrap();
+            assert_eq!(val, 20.0);
+            
+            Ok::<(), spi::Error>(())
+        }).unwrap();
+    }
+
+    #[pg_test]
+    fn test_tam_parallel_scan() {
+        Spi::connect_mut(|client| {
+            client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
+            client.update("CREATE TABLE tam_parallel_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
+            
+            // Insert enough data to justify parallel scan (though we'll force it)
+            client.update("INSERT INTO tam_parallel_test (t, tenant_id, value) 
+                           SELECT i, 1, i::double precision FROM generate_series(1, 1000) i;", None, &[])?;
+
+            // Force parallel scan (PG18 uses debug_parallel_query)
+            client.update("SET debug_parallel_query = on;", None, &[])?;
+            client.update("SET max_parallel_workers_per_gather = 2;", None, &[])?;
+            client.update("SET min_parallel_table_scan_size = 0;", None, &[])?;
+
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_parallel_test").unwrap().unwrap();
+            assert_eq!(count, 1000);
+            
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
