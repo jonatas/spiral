@@ -60,6 +60,10 @@ struct StorageStats {
     projected_heap_size_kb: i64,
     compression_ratio: f64,
     kickoff_epoch: i64,
+    #[serde(default)]
+    data_per_page: i64,
+    #[serde(default)]
+    page_size: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -113,56 +117,157 @@ where
     }
 }
 
+const HEAP_BYTES_PER_ROW: f64 = 48.0;
+const HEAP_ROWS_PER_PAGE: f64 = 8192.0 / HEAP_BYTES_PER_ROW; // ~170
+const XOR_BLOCK_BYTES_PER_ROW: f64 = 128.0 / 61.0; // 8B first_val + 60×2B deltas
+
 #[component]
 fn Dashboard(stats: Signal<StorageStats>) -> impl IntoView {
+    let row_count_exp = RwSignal::new(6.0_f64); // 10^6 = 1M default
+
+    let spiral_bpr = move || {
+        let s = stats.get();
+        if s.total_rows_capacity > 0 && s.spiral_size_kb > 0 {
+            (s.spiral_size_kb * 1024) as f64 / s.total_rows_capacity as f64
+        } else {
+            8.0
+        }
+    };
+
+    let spiral_rows_per_page = move || {
+        let s = stats.get();
+        if s.data_per_page > 0 { s.data_per_page as f64 } else { 1018.0 }
+    };
+
     view! {
         <div class="dashboard">
-            <div class="inspector-title">"Efficiency Report"</div>
-            <div class="stats-grid">
-                <div class="stat-mini">
-                    <div class="stat-label">"ACTUAL SIZE"</div>
-                    <div class="stat-value">{move || format!("{} KB", stats.get().spiral_size_kb)}</div>
+            <div class="inspector-title">"Storage Compression Analysis"</div>
+
+            // --- Bytes per row bars ---
+            <div style="margin: 10px 0 4px 0;">
+                <div class="stat-label" style="margin-bottom: 6px; font-size: 0.55rem; letter-spacing: 1px;">"BYTES PER ROW"</div>
+                <div class="cmp-bar-row">
+                    <span class="cmp-bar-label">"Heap"</span>
+                    <div class="cmp-bar-outer">
+                        <div class="cmp-bar-inner cmp-heap" style="width:100%;"></div>
+                    </div>
+                    <span class="cmp-bar-val">"48 B"</span>
                 </div>
-                <div class="stat-mini">
-                    <div class="stat-label">"STANDARD PG"</div>
-                    <div class="stat-value">{move || format!("{} KB", stats.get().projected_heap_size_kb)}</div>
+                <div class="cmp-bar-row">
+                    <span class="cmp-bar-label">"Spiral"</span>
+                    <div class="cmp-bar-outer">
+                        <div class="cmp-bar-inner cmp-spiral" style={move || {
+                            format!("width:{:.1}%;", (spiral_bpr() / HEAP_BYTES_PER_ROW * 100.0).min(100.0))
+                        }}></div>
+                    </div>
+                    <span class="cmp-bar-val">{move || format!("{:.1} B", spiral_bpr())}</span>
                 </div>
-                <div class="stat-mini">
-                    <div class="stat-label">"SAVINGS"</div>
-                    <div class="stat-value" style="color: #4ade80;">
-                        {move || {
-                            let s = stats.get();
-                            if s.projected_heap_size_kb > 0 {
-                                format!("{:.1}%", (1.0 - (s.spiral_size_kb as f64 / s.projected_heap_size_kb as f64)) * 100.0)
-                            } else {
-                                "0%".to_string()
-                            }
-                        }}
+                <div class="cmp-bar-row">
+                    <span class="cmp-bar-label">"XOR-Blk"</span>
+                    <div class="cmp-bar-outer">
+                        <div class="cmp-bar-inner cmp-xor" style={format!(
+                            "width:{:.1}%;", XOR_BLOCK_BYTES_PER_ROW / HEAP_BYTES_PER_ROW * 100.0
+                        )}></div>
+                    </div>
+                    <span class="cmp-bar-val">"~2.1 B"</span>
+                </div>
+            </div>
+
+            // --- IO Tax ---
+            <div style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,0.08);">
+                <div class="stat-label" style="margin-bottom: 6px; font-size: 0.55rem; letter-spacing: 1px;">"IO TAX — PAGES PER 1,000 ROWS"</div>
+                <div class="stats-grid">
+                    <div class="stat-mini">
+                        <div class="stat-label">"HEAP"</div>
+                        <div class="stat-value" style="color: #f87171;">
+                            {format!("{:.0}", (1000.0_f64 / HEAP_ROWS_PER_PAGE).ceil())}
+                        </div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">"SPIRAL"</div>
+                        <div class="stat-value" style="color: #4ade80;">
+                            {move || format!("{:.2}", 1000.0_f64 / spiral_rows_per_page())}
+                        </div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">"SPEEDUP"</div>
+                        <div class="stat-value" style="color: #818cf8;">
+                            {move || format!("{:.0}x", spiral_rows_per_page() / HEAP_ROWS_PER_PAGE)}
+                        </div>
                     </div>
                 </div>
             </div>
 
-            <div class="projection">
-                <div class="stat-label">"PROJECTION (1 BILLION ROWS)"</div>
+            // --- Savings Calculator ---
+            <div style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,0.08);">
+                <div class="stat-label" style="margin-bottom: 6px; font-size: 0.55rem; letter-spacing: 1px;">"SAVINGS CALCULATOR"</div>
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                    <input
+                        type="range" min="3" max="12" step="0.05"
+                        style="flex:1; accent-color: var(--primary-color); cursor:pointer;"
+                        on:input=move |ev| {
+                            let val: f64 = event_target_value(&ev).parse().unwrap_or(6.0);
+                            row_count_exp.set(val);
+                        }
+                        prop:value=move || row_count_exp.get().to_string()
+                    />
+                    <span style="font-family:'JetBrains Mono'; font-size:0.7rem; color:var(--primary-color); min-width:65px; text-align:right;">
+                        {move || {
+                            let n = 10.0_f64.powf(row_count_exp.get());
+                            if n >= 1_000_000_000.0 { format!("{:.1}B rows", n / 1_000_000_000.0) }
+                            else if n >= 1_000_000.0 { format!("{:.0}M rows", n / 1_000_000.0) }
+                            else { format!("{:.0}K rows", n / 1_000.0) }
+                        }}
+                    </span>
+                </div>
                 <div class="stats-grid">
                     <div class="stat-mini">
-                        <div class="stat-label">"SPIRAL"</div>
-                        <div class="stat-value">{move || {
-                            let s = stats.get();
-                            if s.total_rows_capacity > 0 {
-                                let gb = (s.spiral_size_kb as f64 / s.total_rows_capacity as f64) * 1_000_000_000.0 / (1024.0 * 1024.0);
-                                format!("~{:.1} GB", gb)
-                            } else { "—".to_string() }
+                        <div class="stat-label">"HEAP"</div>
+                        <div class="stat-value" style="color:#f87171;">{move || {
+                            let gb = 10.0_f64.powf(row_count_exp.get()) * HEAP_BYTES_PER_ROW / (1024.0 * 1024.0 * 1024.0);
+                            if gb < 1.0 { format!("{:.0} MB", gb * 1024.0) } else { format!("{:.1} GB", gb) }
                         }}</div>
                     </div>
                     <div class="stat-mini">
-                        <div class="stat-label">"STANDARD"</div>
+                        <div class="stat-label">"SPIRAL"</div>
+                        <div class="stat-value" style="color:#4ade80;">{move || {
+                            let gb = 10.0_f64.powf(row_count_exp.get()) * spiral_bpr() / (1024.0 * 1024.0 * 1024.0);
+                            if gb < 1.0 { format!("{:.0} MB", gb * 1024.0) } else { format!("{:.1} GB", gb) }
+                        }}</div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">"SAVED"</div>
+                        <div class="stat-value" style="color:#4ade80;">{move || {
+                            let pct = (1.0 - spiral_bpr() / HEAP_BYTES_PER_ROW) * 100.0;
+                            format!("{:.1}%", pct)
+                        }}</div>
+                    </div>
+                </div>
+            </div>
+
+            // --- 1B Projection ---
+            <div class="projection">
+                <div class="stat-label">"PROJECTION — 1 BILLION ROWS"</div>
+                <div class="stats-grid">
+                    <div class="stat-mini">
+                        <div class="stat-label">"HEAP"</div>
+                        <div class="stat-value" style="color:#f87171;">{move || {
+                            let gb = 1_000_000_000.0 * HEAP_BYTES_PER_ROW / (1024.0 * 1024.0 * 1024.0);
+                            format!("~{:.0} GB", gb)
+                        }}</div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">"SPIRAL"</div>
                         <div class="stat-value">{move || {
-                            let s = stats.get();
-                            if s.total_rows_capacity > 0 {
-                                let gb = (s.projected_heap_size_kb as f64 / s.total_rows_capacity as f64) * 1_000_000_000.0 / (1024.0 * 1024.0);
-                                format!("~{:.1} GB", gb)
-                            } else { "—".to_string() }
+                            let gb = 1_000_000_000.0 * spiral_bpr() / (1024.0 * 1024.0 * 1024.0);
+                            format!("~{:.1} GB", gb)
+                        }}</div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">"XOR-BLK"</div>
+                        <div class="stat-value" style="color:#818cf8;">{move || {
+                            let gb = 1_000_000_000.0 * XOR_BLOCK_BYTES_PER_ROW / (1024.0 * 1024.0 * 1024.0);
+                            format!("~{:.1} GB", gb)
                         }}</div>
                     </div>
                 </div>
@@ -220,8 +325,9 @@ fn App() -> impl IntoView {
         })
         .unwrap_or_else(|| "localhost".to_string());
 
-    let ws_url = Arc::new(format!("ws://{}:3001/ws", hostname));
-    let api_base = Arc::new(format!("http://{}:3001", hostname));
+    let server_port = option_env!("VORTEX_SERVER_PORT").unwrap_or("3001");
+    let ws_url = Arc::new(format!("ws://{}:{}/ws", hostname, server_port));
+    let api_base = Arc::new(format!("http://{}:{}", hostname, server_port));
 
     // Handle WebSocket
     let ws_url_clone = Arc::clone(&ws_url);

@@ -38,14 +38,17 @@ fn spiral_metadata_table_exists() -> bool {
     }
     let exists = Spi::connect(|client| {
         Ok::<bool, spi::Error>(
-            !client.select(
-                "SELECT 1 FROM information_schema.tables \
+            !client
+                .select(
+                    "SELECT 1 FROM information_schema.tables \
                  WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1",
-                Some(1),
-                &[],
-            )?.is_empty()
+                    Some(1),
+                    &[],
+                )?
+                .is_empty(),
         )
-    }).unwrap_or(false);
+    })
+    .unwrap_or(false);
     METADATA_TABLE_EXISTS.with(|c| c.set(Some(exists)));
     exists
 }
@@ -62,14 +65,19 @@ pub fn get_hierarchy(base_table: &str) -> Vec<String> {
     let views = Spi::connect(|client| {
         let mut v = Vec::new();
         let table = client.select(
-            &format!("SELECT view_name FROM spiral.metadata WHERE base_view = '{}'",
-                     base_table.replace("'", "''")),
-            None, &[])?;
+            &format!(
+                "SELECT view_name FROM spiral.metadata WHERE base_view = '{}'",
+                base_table.replace("'", "''")
+            ),
+            None,
+            &[],
+        )?;
         for row in table {
             v.push(row.get::<String>(1)?.unwrap_or_default());
         }
         Ok::<Vec<String>, spi::Error>(v)
-    }).unwrap_or_default();
+    })
+    .unwrap_or_default();
     HIERARCHY_CACHE.with(|c| c.borrow_mut().insert(base_table.to_string(), views.clone()));
     views
 }

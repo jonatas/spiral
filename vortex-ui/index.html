@@ -196,6 +196,45 @@
                 font-weight: bold;
             }
 
+            .cmp-bar-row {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-bottom: 4px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 0.6rem;
+            }
+
+            .cmp-bar-label {
+                width: 48px;
+                color: var(--gray-color);
+                flex-shrink: 0;
+            }
+
+            .cmp-bar-outer {
+                flex: 1;
+                height: 8px;
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 4px;
+                overflow: hidden;
+            }
+
+            .cmp-bar-inner {
+                height: 100%;
+                border-radius: 4px;
+                transition: width 0.4s ease;
+            }
+
+            .cmp-heap { background: #f87171; }
+            .cmp-spiral { background: #4ade80; }
+            .cmp-xor { background: #818cf8; }
+
+            .cmp-bar-val {
+                width: 38px;
+                text-align: right;
+                color: var(--text-color);
+            }
+
             .projection {
                 margin-top: 15px;
                 padding-top: 10px;

@@ -224,7 +224,8 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = "0.0.0.0:3001".parse::<SocketAddr>().unwrap();
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    let addr = format!("0.0.0.0:{}", port).parse::<SocketAddr>().unwrap();
     tracing::info!("Vortex Server starting on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -347,19 +348,34 @@ async fn ensure_changelog_event_ids(pool: &Pool<Postgres>) -> Result<(), sqlx::E
     sqlx::query("ALTER TABLE spiral.changelog ADD COLUMN IF NOT EXISTS event_id BIGINT")
         .execute(pool)
         .await?;
-    sqlx::query(
-        "ALTER TABLE spiral.changelog
-         ALTER COLUMN event_id SET DEFAULT nextval('spiral.changelog_event_id_seq')",
+
+    // Skip SET DEFAULT if event_id is already an identity column — ALTER fails on identity columns.
+    let is_identity: bool = sqlx::query_scalar(
+        "SELECT attidentity != '' FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'spiral' AND c.relname = 'changelog' AND a.attname = 'event_id'",
     )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "UPDATE spiral.changelog
-         SET event_id = nextval('spiral.changelog_event_id_seq')
-         WHERE event_id IS NULL",
-    )
-    .execute(pool)
-    .await?;
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(false);
+
+    if !is_identity {
+        sqlx::query(
+            "ALTER TABLE spiral.changelog
+             ALTER COLUMN event_id SET DEFAULT nextval('spiral.changelog_event_id_seq')",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE spiral.changelog
+             SET event_id = nextval('spiral.changelog_event_id_seq')
+             WHERE event_id IS NULL",
+        )
+        .execute(pool)
+        .await?;
+    }
+
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_spiral_changelog_event_id
          ON spiral.changelog (event_id)",
