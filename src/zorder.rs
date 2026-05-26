@@ -1,5 +1,8 @@
 use pgrx::prelude::*;
+use pgrx::datum::AnyNumeric;
 
+/// FNV-1a 64-bit hash — stable, documented, no external dependency.
+#[inline]
 pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -11,8 +14,7 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Spreads 64 bits into 128 bits (every other bit is 0).
-fn spread_64(x: u64) -> u128 {
+pub fn spread_64(x: u64) -> u128 {
     let mut res: u128 = x as u128;
     res = (res | (res << 32)) & 0x00000000FFFFFFFF00000000FFFFFFFF_u128;
     res = (res | (res << 16)) & 0x0000FFFF0000FFFF0000FFFF0000FFFF_u128;
@@ -23,8 +25,7 @@ fn spread_64(x: u64) -> u128 {
     res
 }
 
-/// Interleaves two 64-bit values into a 128-bit Morton code.
-fn interleave_64(x: u64, y: u64) -> u128 {
+pub fn interleave_64(x: u64, y: u64) -> u128 {
     spread_64(x) | (spread_64(y) << 1)
 }
 
@@ -40,9 +41,9 @@ pub fn spiral_zorder_core(t: i64, dimensions: Vec<Option<String>>) -> u128 {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> pgrx::datum::AnyNumeric {
+pub fn spiral_zorder(t: i64, dimensions: Vec<Option<String>>) -> AnyNumeric {
     let val = spiral_zorder_core(t, dimensions);
-    pgrx::datum::AnyNumeric::try_from(val.to_string().as_str()).expect("valid numeric")
+    AnyNumeric::try_from(val.to_string().as_str()).expect("valid numeric")
 }
 
 pub fn spiral_zorder_int_array_core(t: i64, dimensions: Vec<i32>) -> u128 {
@@ -55,33 +56,69 @@ pub fn spiral_zorder_int_array_core(t: i64, dimensions: Vec<i32>) -> u128 {
 }
 
 #[pg_extern(immutable, parallel_safe, name = "spiral_zorder")]
-pub fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> pgrx::datum::AnyNumeric {
+pub fn spiral_zorder_int_array(t: i64, dimensions: Vec<i32>) -> AnyNumeric {
     let val = spiral_zorder_int_array_core(t, dimensions);
-    pgrx::datum::AnyNumeric::try_from(val.to_string().as_str()).expect("valid numeric")
+    AnyNumeric::try_from(val.to_string().as_str()).expect("valid numeric")
 }
 
-pub fn zorder_3d_core(x: i64, y: i32, z: i32) -> u128 {
+pub fn zorder_3d_core(x: i64, y: i64, z: i64) -> u128 {
     let mut res = 0u128;
     for i in 0..42 {
         res |= ((x as u128 >> i) & 1) << (3 * i);
-        res |= (((y as u128) >> i) & 1) << (3 * i + 1);
-        res |= (((z as u128) >> i) & 1) << (3 * i + 2);
+        res |= ((y as u128 >> i) & 1) << (3 * i + 1);
+        res |= ((z as u128 >> i) & 1) << (3 * i + 2);
     }
     res
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_zorder_3d(x: i64, y: i32, z: i32) -> pgrx::datum::AnyNumeric {
+pub fn spiral_zorder_3d(x: i64, y: i64, z: i64) -> AnyNumeric {
     let val = zorder_3d_core(x, y, z);
-    pgrx::datum::AnyNumeric::try_from(val.to_string().as_str()).expect("valid numeric")
+    AnyNumeric::try_from(val.to_string().as_str()).expect("valid numeric")
+}
+
+fn rot(n: u64, x: &mut u64, y: &mut u64, rx: bool, ry: bool) {
+    if !ry {
+        if rx {
+            *x = n - 1 - *x;
+            *y = n - 1 - *y;
+        }
+        std::mem::swap(x, y);
+    }
+}
+
+pub fn hilbert_encode(mut x: u64, mut y: u64) -> u128 {
+    let mut d = 0u128;
+    for s in (0..64).rev() {
+        let n = 1u64 << s;
+        let rx = (x & n) > 0;
+        let ry = (y & n) > 0;
+        d += (n as u128 * n as u128) * ((3 * rx as u64) ^ ry as u64) as u128;
+        
+        if rx { x ^= n; }
+        if ry { y ^= n; }
+        
+        rot(n, &mut x, &mut y, rx, ry);
+    }
+    d
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_hilbert_2d(x: i32, y: i32) -> i32 {
-    let mut res = 0i32;
-    for i in 0..15 {
-        res |= ((x >> i) & 1) << (2 * i);
-        res |= ((y >> i) & 1) << (2 * i + 1);
+pub fn spiral_hilbert_2d(x: i64, y: i64) -> AnyNumeric {
+    let d = hilbert_encode(x as u64, y as u64);
+    AnyNumeric::try_from(d.to_string().as_str()).expect("valid numeric")
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+
+    #[pg_test]
+    fn test_hilbert_2d_locality() {
+        assert_eq!(hilbert_encode(0, 0), 0);
+        assert_eq!(hilbert_encode(0, 1), 1);
+        assert_eq!(hilbert_encode(1, 1), 2);
+        assert_eq!(hilbert_encode(1, 0), 3);
     }
-    res
 }
