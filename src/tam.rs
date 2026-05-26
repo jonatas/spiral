@@ -322,7 +322,8 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
             let logical_offset = (t_rel * tenant_scale * 8) + (tid as i64 * 8);
             let (blkno, page_offset) = crate::storage::logical_to_physical_offset(logical_offset);
 
-            let mut nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            let mut nblocks =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
             while nblocks <= blkno {
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
@@ -442,7 +443,16 @@ pub unsafe extern "C-unwind" fn spiral_tuple_update(
     _update_indexes: *mut pg_sys::TU_UpdateIndexes::Type,
 ) -> pg_sys::TM_Result::Type {
     // 1. Delete old
-    spiral_tuple_delete(rel, otid, cid, std::ptr::null_mut(), std::ptr::null_mut(), true, std::ptr::null_mut(), false);
+    spiral_tuple_delete(
+        rel,
+        otid,
+        cid,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        true,
+        std::ptr::null_mut(),
+        false,
+    );
 
     // 2. Insert new
     spiral_slot_insert(rel, slot, cid, 0, std::ptr::null_mut());
@@ -540,7 +550,8 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
     unsafe {
         pg_sys::RelationGetSmgr(rel);
         if !(*rel).rd_smgr.is_null() {
-            n_pages = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            n_pages =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
         }
     }
 
@@ -766,7 +777,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
 
                     // Set TID (ItemPointer) so Postgres knows where to find/delete this row.
                     // posid is 1-based, so add 1 to our 0-based offset.
-                    pg_sys::ItemPointerSet(&mut (*slot).tts_tid, state.current_blkno, (items_before + 1) as u16);
+                    pg_sys::ItemPointerSet(
+                        &mut (*slot).tts_tid,
+                        state.current_blkno,
+                        (items_before + 1) as u16,
+                    );
 
                     pg_sys::ExecStoreVirtualTuple(slot);
                 }
@@ -867,7 +882,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
 
         pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
         let page = pg_sys::BufferGetPage(buffer);
-        
+
         if !crate::storage::is_valid_spiral_page(page) {
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
             pg_sys::ReleaseBuffer(buffer);
@@ -883,7 +898,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
             state.current_offset_in_page += 8;
 
             if val != 0.0 {
-                let items_before = (state.current_offset_in_page - 8 - crate::storage::HEADER_SIZE as u32) / 8;
+                let items_before =
+                    (state.current_offset_in_page - 8 - crate::storage::HEADER_SIZE as u32) / 8;
                 let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64)
                     + items_before as i64;
 
@@ -918,7 +934,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
         pg_sys::ReleaseBuffer(buffer);
         state.current_blkno += 1;
         state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
-        
+
         return false;
     }
     false
@@ -991,18 +1007,18 @@ mod tests {
             client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
             client.update("CREATE TABLE tam_delete_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
             client.update("INSERT INTO tam_delete_test (t, tenant_id, value) VALUES (1, 1, 42.0), (2, 2, 84.0);", None, &[])?;
-            
+
             let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_delete_test").unwrap().unwrap();
             assert_eq!(count, 2);
 
             client.update("DELETE FROM tam_delete_test WHERE t = 1;", None, &[])?;
-            
+
             let count_after = Spi::get_one::<i64>("SELECT count(*) FROM tam_delete_test").unwrap().unwrap();
             assert_eq!(count_after, 1);
-            
+
             let val = Spi::get_one::<f64>("SELECT value FROM tam_delete_test").unwrap().unwrap();
             assert_eq!(val, 84.0);
-            
+
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
@@ -1013,7 +1029,7 @@ mod tests {
             client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
             client.update("CREATE TABLE tam_update_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
             client.update("INSERT INTO tam_update_test (t, tenant_id, value) VALUES (1, 1, 10.0);", None, &[])?;
-            
+
             // Update value only (same TID)
             client.update("UPDATE tam_update_test SET value = 20.0 WHERE t = 1;", None, &[])?;
             let val = Spi::get_one::<f64>("SELECT value FROM tam_update_test").unwrap().unwrap();
@@ -1023,10 +1039,10 @@ mod tests {
             client.update("UPDATE tam_update_test SET t = 2 WHERE t = 1;", None, &[])?;
             let t_new = Spi::get_one::<i64>("SELECT t FROM tam_update_test").unwrap().unwrap();
             assert_eq!(t_new, 2);
-            
+
             let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_update_test").unwrap().unwrap();
             assert_eq!(count, 1);
-            
+
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
@@ -1037,12 +1053,12 @@ mod tests {
             client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
             client.update("CREATE TABLE tam_truncate_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
             client.update("INSERT INTO tam_truncate_test (t, tenant_id, value) VALUES (1, 1, 10.0), (2, 2, 20.0);", None, &[])?;
-            
+
             client.update("TRUNCATE tam_truncate_test;", None, &[])?;
-            
+
             let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_truncate_test").unwrap().unwrap();
             assert_eq!(count, 0);
-            
+
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
@@ -1055,7 +1071,7 @@ mod tests {
             client.update("INSERT INTO tam_test_functional (t, tenant_id, value) VALUES (1, 1, 42.0);", None, &[])?;
             let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_test_functional").unwrap().unwrap();
             assert_eq!(count, 1);
-            
+
             let val = Spi::get_one::<f64>("SELECT value FROM tam_test_functional LIMIT 1").unwrap().unwrap();
             assert_eq!(val, 42.0);
             Ok::<(), spi::Error>(())
@@ -1068,13 +1084,13 @@ mod tests {
             client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
             client.update("CREATE TABLE tam_analyze_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
             client.update("INSERT INTO tam_analyze_test (t, tenant_id, value) VALUES (0, 0, 10.0), (0, 1, 20.0), (0, 2, 30.0);", None, &[])?;
-            
+
             client.update("ANALYZE tam_analyze_test;", None, &[])?;
-            
+
             // Check pg_stats to verify that ANALYZE successfully scanned the columns
             let row_count = Spi::get_one::<i64>("SELECT count(*) FROM pg_stats WHERE tablename = 'tam_analyze_test'").unwrap().unwrap();
             assert!(row_count > 0);
-            
+
             Ok::<(), spi::Error>(())
         }).unwrap();
     }

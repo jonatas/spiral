@@ -32,4 +32,4 @@ URL="https://github.com/spiral-database/spiral/archive/refs/tags/v${VERSION}.tar
 
 ./scripts/update-homebrew.sh "${VERSION}" "${URL}" "${SHA256}"
 
-echo "Version bump complete. Ready to tag and push."
+echo "Version bump complete. Ready to tag, push, and request CI manually."
