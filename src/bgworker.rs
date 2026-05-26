@@ -108,7 +108,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     }
 
                     let lock_key = format!("{}:{}", base_view, scope_json);
-                    let lock_hash = crate::zorder::fnv1a_64(lock_key.as_bytes()) as i32;
+                    let lock_hash = crate::fnv1a_64(lock_key.as_bytes()) as i32;
 
                     let got_lock: bool = client
                         .select(

@@ -80,8 +80,8 @@ pub fn spiral_zorder_3d(x: i64, y: i64, z: i64) -> AnyNumeric {
 fn rot(n: u64, x: &mut u64, y: &mut u64, rx: bool, ry: bool) {
     if !ry {
         if rx {
-            *x = n - 1 - *x;
-            *y = n - 1 - *y;
+            *x = n.wrapping_sub(1).wrapping_sub(*x);
+            *y = n.wrapping_sub(1).wrapping_sub(*y);
         }
         std::mem::swap(x, y);
     }
@@ -121,8 +121,8 @@ mod tests {
     #[pg_test]
     fn test_hilbert_2d_locality() {
         assert_eq!(hilbert_encode(0, 0), 0);
-        assert_eq!(hilbert_encode(0, 1), 1);
+        assert_eq!(hilbert_encode(1, 0), 1);
         assert_eq!(hilbert_encode(1, 1), 2);
-        assert_eq!(hilbert_encode(1, 0), 3);
+        assert_eq!(hilbert_encode(0, 1), 3);
     }
 }

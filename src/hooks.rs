@@ -2801,11 +2801,11 @@ fn construct_union_sql_hierarchical(
         let zorder_pred = if is_rollup && !scope_vals.is_empty() {
             let min_t = src_segs.iter().map(|s| s._t_start).min().unwrap_or(0);
             let max_t = src_segs.iter().map(|s| s._t_end).max().unwrap_or(0);
-            let lo = crate::zorder::spiral_zorder(
+            let lo = crate::spiral_zorder(
                 min_t,
                 scope_vals.iter().map(|(_, v)| Some(v.clone())).collect(),
             );
-            let hi = crate::zorder::spiral_zorder(
+            let hi = crate::spiral_zorder(
                 max_t,
                 scope_vals.iter().map(|(_, v)| Some(v.clone())).collect(),
             );
