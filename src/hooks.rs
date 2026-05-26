@@ -187,7 +187,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 (*into).options = process_options((*into).options);
             }
 
-            warning!(
+            notice!(
                 "Spiral: Utility hook caught CREATE relation '{}', query_str length={}",
                 name,
                 query_str.len()
@@ -198,7 +198,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 || !extracted_cardinality.is_empty()
                 || !extracted_time_column.is_empty()
             {
-                warning!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
+                notice!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
                         pstmt,
@@ -222,7 +222,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                         qc,
                     );
                 }
-                warning!("Spiral: standard_ProcessUtility returned, processing hierarchy...");
+                notice!("Spiral: standard_ProcessUtility returned, processing hierarchy...");
                 // Make new table visible to subsequent catalog queries
                 unsafe {
                     pg_sys::CommandCounterIncrement();
@@ -377,7 +377,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 install_changelog_triggers(&name, &extracted_frames);
 
                 // 5. Generate the entire hierarchy automatically
-                warning!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
+                notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
                 generate_hierarchy_internal(
                     &name,
                     &frames_str,
@@ -387,7 +387,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     offset_cols,
                 );
 
-                warning!("Spiral: Successfully registered hierarchy for '{}'", name);
+                notice!("Spiral: Successfully registered hierarchy for '{}'", name);
 
                 // 6. Ensure background worker is running for this database
                 unsafe {
@@ -396,7 +396,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
                 return;
             } else {
-                warning!(
+                notice!(
                     "Spiral: No magic comments in '{}', following standard path.",
                     name
                 );
@@ -431,7 +431,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
     .catch_others(|e| {
         // Bad magic comment or SPI failure during hierarchy setup. Table was already
         // created by standard_ProcessUtility above; only Spiral acceleration is skipped.
-        warning!(
+        notice!(
             "Spiral: error during CREATE TABLE hook processing — hierarchy setup skipped. \
              The table was created but Spiral acceleration is NOT configured. \
              Fix the magic comment directives and recreate the table to enable acceleration. \
@@ -658,7 +658,6 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
     cursor_options: c_int,
     bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
-    warning!("Spiral: called planner_hook");
     if IN_HOOK.with(|h| h.get()) || crate::SKIP_ACCELERATION.with(|s| s.get()) || !crate::ENABLE_PLANNER_HOOK.get() {
         return if let Some(prev_hook) = PREV_PLANNER_HOOK {
             prev_hook(parse, query_string, cursor_options, bound_params)
@@ -692,7 +691,6 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                         let hierarchy = catalog::get_hierarchy(&base_table);
 
                         if !hierarchy.is_empty() {
-                            warning!("Spiral: found hierarchy for '{}'", base_table);
                             let offset_cols = catalog::get_offset_columns(&base_table);
                             let metadata_obj = catalog::get_metadata(&base_table);
 
@@ -704,7 +702,6 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                 .or_else(|| get_actual_data_range(&base_table, &hierarchy));
 
                             if let Some((ts, te)) = time_range {
-                                warning!("Spiral: detected time range [{}, {})", ts, te);
                                 // Publish time range so the TAM scan can skip pages outside [ts, te].
                                 crate::SCAN_TIME_RANGE.with(|r| r.set(Some((ts, te))));
                                 // Build scope_values JsonB from qc.scopes if they match view's scope_columns
@@ -741,10 +738,6 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                     tz_offset,
                                     max_frame_secs,
                                 );
-                                warning!("Spiral: resolved {} segments", segments.len());
-                                for (si, seg) in segments.iter().enumerate() {
-                                    warning!("  Segment {}: source='{}'", si, seg.source);
-                                }
 
                                 if !segments.is_empty()
                                     && (segments.len() > 1 || segments[0].source != base_table)
@@ -843,7 +836,6 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         &col_types,
                                         &scope_vals,
                                     );
-                                    warning!("Spiral: generated union_sql: {}", union_sql);
                                     let new_query = parse_sql_to_query(&union_sql);
                                     if !new_query.is_null() {
                                         (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
@@ -851,8 +843,28 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         (*rte).relid = pg_sys::InvalidOid;
                                         (*rte).perminfoindex = 0;
 
+                                        // Build column formulas map for the rewriter
+                                        let mut column_formulas = std::collections::HashMap::new();
+                                        Spi::connect(|client| {
+                                            let q = format!(
+                                                "SELECT base_column, formula FROM spiral.sources \
+                                                 WHERE view_name = (SELECT view_name FROM spiral.metadata \
+                                                                    WHERE base_view = '{}' AND frame_seconds > 0 \
+                                                                    LIMIT 1)",
+                                                base_table.replace("'", "''")
+                                            );
+                                            if let Ok(res) = client.select(&q, None, &[]) {
+                                                for row in res {
+                                                    if let (Ok(Some(bc)), Ok(Some(f))) = (row.get::<String>(1), row.get::<String>(2)) {
+                                                        column_formulas.insert(bc, f);
+                                                    }
+                                                }
+                                            }
+                                            Ok::<(), spi::Error>(())
+                                        }).unwrap_or(());
+
                                         // Rewrite top-level aggregates to their merge equivalents
-                                        rewrite_query_aggregates(query);
+                                        rewrite_query_aggregates(query, &column_formulas);
 
                                         // Neutralize consumed constraints from the outer query to avoid double verification.
                                         if let Some(qc) = constraint_map.get(&varno) {
@@ -868,7 +880,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         }
 
                                         // Notice fires only after acceleration confirmed.
-                                        warning!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
+                                        notice!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
                                         continue; // Accelerated, move to next RTE
                                     }
                                 }
@@ -1163,7 +1175,7 @@ pub fn accelerate(
         for col_dir in cols.into_iter().flatten() {
             let parts: Vec<&str> = col_dir.split_whitespace().collect();
             if parts.len() < 2 {
-                warning!("Spiral: invalid column directive '{}', skipping", col_dir);
+                notice!("Spiral: invalid column directive '{}', skipping", col_dir);
                 continue;
             }
             let col_name = parts[0];
@@ -1175,7 +1187,7 @@ pub fn accelerate(
             };
 
             if !col_types_map.contains_key(col_name) {
-                warning!(
+                notice!(
                     "Spiral: column '{}' not found in relation '{}', skipping",
                     col_name,
                     relation
@@ -1241,7 +1253,7 @@ pub fn accelerate(
         let _ = Spi::run(&bootstrap_sql);
     }
 
-    warning!("Spiral: Successfully accelerated relation '{}'", relation);
+    notice!("Spiral: Successfully accelerated relation '{}'", relation);
 }
 
 #[pg_extern]
@@ -1249,21 +1261,21 @@ pub fn refresh(relation: &str) {
     catalog::unify_changelog(relation);
     let hierarchy = catalog::get_hierarchy(relation);
     if hierarchy.is_empty() {
-        warning!("Spiral: no hierarchy found for '{}'", relation);
+        notice!("Spiral: no hierarchy found for '{}'", relation);
         return;
     }
 
     // Capture IDs to be refreshed
     let dirty_ranges = catalog::get_dirty_ranges(relation, 0, 2147483647, None);
     if dirty_ranges.is_empty() {
-        warning!("Spiral: hierarchy for '{}' is already up to date", relation);
+        notice!("Spiral: hierarchy for '{}' is already up to date", relation);
         return;
     }
 
     // For simplicity in the manual refresh API, we just refresh all dirty ranges.
     // In a production scenario, this would be done in chunks.
     for (ts, te) in dirty_ranges {
-        warning!("Spiral: refreshing range [{}, {}) for '{}'", ts, te, relation);
+        notice!("Spiral: refreshing range [{}, {}) for '{}'", ts, te, relation);
         // This is a placeholder for the actual refresh logic which is currently
         // mostly inside the bgworker's loop. I should extract it.
     }
@@ -1324,8 +1336,23 @@ pub fn create_reconstruction_view(rel_name: &str) {
                 }
             }
 
+            // Check if this column is an ohlcv consolidated state
+            let formula_res = client.select(&format!("SELECT formula FROM spiral.sources WHERE view_name = '{}' AND mat_column = '{}'", rel_name.replace("'", "''"), col.replace("'", "''")), Some(1), &[]);
+            let mut formula = String::new();
+            if let Ok(f) = formula_res {
+                if !f.is_empty() {
+                    formula = f.first().get::<String>(1).unwrap().unwrap_or_default();
+                }
+            }
+
             if col == "t" {
                 select_parts.push(format!("t AS \"{}\"", time_col));
+            } else if formula == "ohlcv" {
+                select_parts.push(format!("spiral_ohlcv_open(\"{}\") as \"{}_o\"", col, col));
+                select_parts.push(format!("spiral_ohlcv_high(\"{}\") as \"{}_h\"", col, col));
+                select_parts.push(format!("spiral_ohlcv_low(\"{}\") as \"{}_l\"", col, col));
+                select_parts.push(format!("spiral_ohlcv_close(\"{}\") as \"{}_c\"", col, col));
+                select_parts.push(format!("spiral_ohlcv_volume(\"{}\") as \"{}_v\"", col, col));
             } else if offset_cols.contains(&col) && !is_tstz {
                 select_parts.push(format!(
                     "t + make_interval(secs => \"{}\"::double precision) AS \"{}\"",
@@ -1398,7 +1425,7 @@ pub fn generate_hierarchy_internal(
     anchor_col: String,
     offset_cols: Vec<String>,
 ) {
-    warning!(
+    notice!(
         "Spiral: Entering generate_hierarchy_internal for '{}', frames='{}'",
         base_name,
         frames_str
@@ -1460,7 +1487,7 @@ pub fn generate_hierarchy_internal(
                 } else if formula_lower.contains("ohlc") {
                     let mat = alias.clone().unwrap_or_else(|| format!("{}_ohlcv", col));
                     if seen_cols.insert(mat.clone()) {
-                        select_parts.push(format!("first(\"{}\", spiral(t)) as \"{}_o\", max(\"{}\") as \"{}_h\", min(\"{}\") as \"{}_l\", last(\"{}\", spiral(t)) as \"{}_c\", sum(\"{}\") as \"{}_v\"", col, mat, col, mat, col, mat, col, mat, col, mat));
+                        select_parts.push(format!("spiral_ohlcv(\"{}\", spiral(t)) as \"{}\"", col, mat));
                         sources.push(rollup::SourceDef {
                             base_column: col.clone(),
                             formula: "ohlcv".to_string(),
@@ -1601,8 +1628,10 @@ pub fn generate_hierarchy_internal(
                         src.mat_column, src.mat_column
                     ));
                 } else if src.formula == "ohlcv" {
-                    let c = &src.mat_column;
-                    select_parts.push(format!("first(\"{}_o\", spiral(t)) as \"{}_o\", max(\"{}_h\") as \"{}_h\", min(\"{}_l\") as \"{}_l\", last(\"{}_c\", spiral(t)) as \"{}_c\", sum(\"{}_v\") as \"{}_v\"", c, c, c, c, c, c, c, c, c, c));
+                    select_parts.push(format!(
+                        "spiral_ohlcv_merge(\"{}\") as \"{}\"",
+                        src.mat_column, src.mat_column
+                    ));
                 } else if src.formula == "range_max_end" || src.formula == "range_merge" {
                     select_parts.push(format!(
                         "max(\"{}\") as \"{}\"",
@@ -1780,6 +1809,8 @@ fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
             | "max"
             | "count"
             | "avg"
+            | "first"
+            | "last"
             | "spiral_stats"
             | "spiral_tdigest"
             | "spiral_sketch"
@@ -1789,7 +1820,10 @@ fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
     )
 }
 
-pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
+pub(crate) unsafe fn rewrite_query_aggregates(
+    query: *mut pg_sys::Query,
+    column_formulas: &std::collections::HashMap<String, String>,
+) {
     if !(*query).hasAggs {
         return;
     }
@@ -1799,45 +1833,26 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
     }
 
     // Pre-fetch merge function OIDs to avoid Spi calls during traversal
-    let stats_merge_oid = Spi::get_one::<pg_sys::Oid>(
-        "SELECT oid FROM pg_proc WHERE proname = 'spiral_stats_merge' AND pronargs = 1",
-    )
-    .unwrap_or(None);
-    let tdigest_merge_oid = Spi::get_one::<pg_sys::Oid>(
-        "SELECT oid FROM pg_proc WHERE proname = 'spiral_tdigest_merge' AND pronargs = 1",
-    )
-    .unwrap_or(None);
-    let sketch_merge_oid = Spi::get_one::<pg_sys::Oid>(
-        "SELECT oid FROM pg_proc WHERE proname = 'spiral_sketch_merge' AND pronargs = 1",
-    )
-    .unwrap_or(None);
+    let stats_merge_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_stats_merge' AND pronargs = 1").unwrap_or(None);
+    let tdigest_merge_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_tdigest_merge' AND pronargs = 1").unwrap_or(None);
+    let sketch_merge_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_sketch_merge' AND pronargs = 1").unwrap_or(None);
+    let avg_merge_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_avg' AND pronargs = 1").unwrap_or(None);
+    let count_merge_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_count' AND pronargs = 1").unwrap_or(None);
+    let sum_merge_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_sum' AND pronargs = 1").unwrap_or(None);
 
-    let avg_merge_oid = Spi::get_one::<pg_sys::Oid>(
-        "SELECT oid FROM pg_proc WHERE proname = 'spiral_avg' AND pronargs = 1",
-    )
-    .unwrap_or(None);
-    warning!("Spiral: avg_merge_oid={:?}", avg_merge_oid);
-
-    let count_merge_oid = Spi::get_one::<pg_sys::Oid>(
-        "SELECT oid FROM pg_proc WHERE proname = 'spiral_count' AND pronargs = 1",
-    )
-    .unwrap_or(None);
-    warning!("Spiral: count_merge_oid={:?}", count_merge_oid);
-
-    let sum_merge_oid = Spi::get_one::<pg_sys::Oid>(
-        "SELECT oid FROM pg_proc WHERE proname = 'spiral_sum' AND pronargs = 1",
-    )
-    .unwrap_or(None);
-    warning!("Spiral: sum_merge_oid={:?}", sum_merge_oid);
+    // OHLCV merge aggregates
+    let ohlcv_merge_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_ohlcv_merge' AND pronargs = 1").unwrap_or(None);
+    let open_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_open' AND pronargs = 1").unwrap_or(None);
+    let high_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_high' AND pronargs = 1").unwrap_or(None);
+    let low_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_low' AND pronargs = 1").unwrap_or(None);
+    let close_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_close' AND pronargs = 1").unwrap_or(None);
+    let volume_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_volume' AND pronargs = 1").unwrap_or(None);
 
     unsafe fn walk_and_rewrite(
         node: *mut pg_sys::Node,
-        stats_oid: Option<pg_sys::Oid>,
-        tdigest_oid: Option<pg_sys::Oid>,
-        sketch_oid: Option<pg_sys::Oid>,
-        avg_oid: Option<pg_sys::Oid>,
-        count_oid: Option<pg_sys::Oid>,
-        sum_oid: Option<pg_sys::Oid>,
+        column_formulas: &std::collections::HashMap<String, String>,
+        rtable: *mut pg_sys::List,
+        oids: &[Option<pg_sys::Oid>], // [stats, tdigest, sketch, avg, count, sum, ohlcv, open, high, low, close, volume]
     ) {
         if node.is_null() {
             return;
@@ -1848,28 +1863,84 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
             let agg_fn_ptr = pg_sys::get_func_name((*agg).aggfnoid);
             if !agg_fn_ptr.is_null() {
                 let agg_fn = CStr::from_ptr(agg_fn_ptr).to_string_lossy().to_lowercase();
-                warning!("Spiral: rewrite_query_aggregates checking '{}'", agg_fn);
-                let new_oid = match agg_fn.as_ref() {
-                    "spiral_stats" => stats_oid,
-                    "spiral_tdigest" => tdigest_oid,
-                    "spiral_sketch" => sketch_oid,
-                    "avg" => {
-                        warning!("Spiral: mapping AVG to {:?}", avg_oid);
-                        avg_oid
+                
+                // Identify the column and its formula
+                let mut formula = "sum".to_string();
+                let mut is_json_target = false;
+                if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
+                    let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
+                    let expr = (*arg).expr as *mut pg_sys::Node;
+                    if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
+                        let var = expr as *mut pg_sys::Var;
+                        if (*var).varno > 0 && (*var).varno as usize <= (*rtable).length as usize {
+                            let rte = pg_sys::list_nth(rtable, (*var).varno as i32 - 1) as *mut pg_sys::RangeTblEntry;
+                            let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                            if !varname.is_null() {
+                                let name = CStr::from_ptr(varname).to_string_lossy();
+                                if let Some(f) = column_formulas.get(name.as_ref()) {
+                                    formula = f.clone();
+                                }
+                            }
+                        }
+                        if (*var).vartype == pg_sys::JSONBOID {
+                            is_json_target = true;
+                        }
                     }
-                    "count" => {
-                        warning!("Spiral: mapping COUNT to {:?}", count_oid);
-                        count_oid
+                }
+
+                let new_oid = if formula == "ohlcv" {
+                    match agg_fn.as_ref() {
+                        "first" => oids[7], // open
+                        "last" => oids[10], // close
+                        "max" => oids[8],  // high
+                        "min" => oids[9],  // low
+                        "sum" => oids[11], // volume
+                        "spiral_ohlcv" | "spiral_ohlcv_merge" => oids[6], // ohlcv_merge
+                        _ => None,
                     }
-                    "sum" => {
-                        warning!("Spiral: mapping SUM to {:?}", sum_oid);
-                        sum_oid
+                } else if formula == "stats" {
+                    match agg_fn.as_ref() {
+                        "avg" => oids[3],
+                        "count" => oids[4],
+                        "sum" => oids[5],
+                        "spiral_stats" | "spiral_stats_merge" => oids[0],
+                        _ => None,
                     }
-                    _ => None,
+                } else if formula == "tdigest" || formula == "sketch" {
+                    let is_td = formula == "tdigest";
+                    match agg_fn.as_ref() {
+                        "spiral_tdigest" | "spiral_tdigest_merge" if is_td => oids[1],
+                        "spiral_sketch" | "spiral_sketch_merge" if !is_td => oids[2],
+                        _ => None,
+                    }
+                } else {
+                    match agg_fn.as_ref() {
+                        "avg" if is_json_target => oids[3],
+                        "count" if is_json_target => oids[4],
+                        "sum" if is_json_target => oids[5],
+                        _ => None,
+                    }
                 };
+
                 if let Some(oid) = new_oid {
-                    warning!("Spiral: updated aggfnoid to {}", oid);
                     (*agg).aggfnoid = oid;
+
+                    // If we changed to a state-based aggregate, we must update the argument Var
+                    // to expect JSONB from the subquery.
+                    if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
+                        let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
+                        let expr = (*arg).expr as *mut pg_sys::Node;
+                        if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
+                            let var = expr as *mut pg_sys::Var;
+                            (*var).vartype = pg_sys::JSONBOID;
+                            (*var).vartypmod = -1;
+                        }
+                        
+                        // If it was first/last, it had 2 arguments. We must truncate to 1 (the jsonb state).
+                        if agg_fn == "first" || agg_fn == "last" {
+                            (*agg).args = pg_sys::lappend(std::ptr::null_mut(), arg as *mut _);
+                        }
+                    }
                 }
             }
         } else if (*node).type_ == pg_sys::NodeTag::T_FuncExpr {
@@ -1879,28 +1950,28 @@ pub(crate) unsafe fn rewrite_query_aggregates(query: *mut pg_sys::Query) {
                 for i in 0..(*args).length {
                     walk_and_rewrite(
                         pg_sys::list_nth(args, i) as *mut pg_sys::Node,
-                        stats_oid,
-                        tdigest_oid,
-                        sketch_oid,
-                        avg_oid,
-                        count_oid,
-                        sum_oid,
+                        column_formulas,
+                        rtable,
+                        oids,
                     );
                 }
             }
         }
     }
 
+    let oids = [
+        stats_merge_oid, tdigest_merge_oid, sketch_merge_oid, 
+        avg_merge_oid, count_merge_oid, sum_merge_oid,
+        ohlcv_merge_oid, open_oid, high_oid, low_oid, close_oid, volume_oid
+    ];
+
     for i in 0..(*target_list).length {
         let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
         walk_and_rewrite(
             (*tle).expr as *mut pg_sys::Node,
-            stats_merge_oid,
-            tdigest_merge_oid,
-            sketch_merge_oid,
-            avg_merge_oid,
-            count_merge_oid,
-            sum_merge_oid,
+            column_formulas,
+            (*query).rtable,
+            &oids,
         );
     }
 }
@@ -1910,9 +1981,8 @@ pub(crate) unsafe fn extract_supported_query_columns(
     rtable: *mut pg_sys::List,
     base_table: &str,
 ) -> Option<Vec<(String, Option<String>)>> {
-    warning!("Spiral: extract_supported_query_columns for '{}', hasAggs={}", base_table, (*query).hasAggs);
     if !(*query).hasAggs {
-        warning!("Spiral: query has no aggregates");
+        notice!("Spiral: query has no aggregates");
         return None;
     }
 
@@ -1920,13 +1990,13 @@ pub(crate) unsafe fn extract_supported_query_columns(
         || !(*query).distinctClause.is_null()
         || !(*query).windowClause.is_null()
     {
-        warning!("Spiral: query has HAVING, DISTINCT, or WINDOW clause");
+        notice!("Spiral: query has HAVING, DISTINCT, or WINDOW clause");
         return None;
     }
 
     let target_list = (*query).targetList;
     if target_list.is_null() {
-        warning!("Spiral: query target list is null");
+        notice!("Spiral: query target list is null");
         return None;
     }
 
@@ -1953,12 +2023,12 @@ pub(crate) unsafe fn extract_supported_query_columns(
 
                 let relname_ptr = pg_sys::get_rel_name((*rte).relid);
                 if relname_ptr.is_null() {
-                    warning!("Spiral: walk_expr relname is null");
+                    notice!("Spiral: walk_expr relname is null");
                     return false;
                 }
                 let relname = CStr::from_ptr(relname_ptr).to_string_lossy();
                 if relname.as_ref() != base_table {
-                    warning!("Spiral: walk_expr relname mismatch: '{}' != '{}'", relname, base_table);
+                    notice!("Spiral: walk_expr relname mismatch: '{}' != '{}'", relname, base_table);
                     return false;
                 }
 
@@ -1977,7 +2047,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
                     || !(*agg).aggfilter.is_null()
                     || (*agg).aggstar
                 {
-                    warning!("Spiral: walk_expr found DISTINCT, ORDER BY, FILTER, or * in aggregate");
+                    notice!("Spiral: walk_expr found DISTINCT, ORDER BY, FILTER, or * in aggregate");
                     return false;
                 }
 
@@ -1986,17 +2056,23 @@ pub(crate) unsafe fn extract_supported_query_columns(
                     return false;
                 }
                 let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
-                warning!("Spiral: walk_expr checking aggregate '{}'", fn_name);
                 if !is_supported_rollup_aggregate(&fn_name) {
-                    warning!("Spiral: walk_expr found unsupported aggregate function '{}'", fn_name);
+                    notice!("Spiral: walk_expr found unsupported aggregate function '{}'", fn_name);
                     return false;
                 }
 
                 let args = (*agg).args;
                 let num_args = if args.is_null() { 0 } else { (*args).length };
-                warning!("Spiral: walk_expr aggregate '{}' has {} args", fn_name, num_args);
-                if num_args != 1 {
-                    warning!("Spiral: walk_expr found aggregate with 0 or >1 arguments");
+                notice!("Spiral: walk_expr aggregate '{}' has {} args", fn_name, num_args);
+                
+                let is_order_dependent = fn_name.to_lowercase() == "first" || fn_name.to_lowercase() == "last";
+                if is_order_dependent {
+                    if num_args != 2 {
+                        notice!("Spiral: walk_expr found order-dependent aggregate '{}' with {} arguments (expected 2)", fn_name, num_args);
+                        return false;
+                    }
+                } else if num_args != 1 {
+                    notice!("Spiral: walk_expr found aggregate '{}' with {} arguments (expected 1)", fn_name, num_args);
                     return false;
                 }
 
@@ -2014,12 +2090,12 @@ pub(crate) unsafe fn extract_supported_query_columns(
 
                 let relname_ptr = pg_sys::get_rel_name((*rte).relid);
                 if relname_ptr.is_null() {
-                    warning!("Spiral: walk_expr relname is null");
+                    notice!("Spiral: walk_expr relname is null");
                     return false;
                 }
                 let relname = CStr::from_ptr(relname_ptr).to_string_lossy();
                 if relname.as_ref() != base_table {
-                    warning!("Spiral: walk_expr relname mismatch: '{}' != '{}'", relname, base_table);
+                    notice!("Spiral: walk_expr relname mismatch: '{}' != '{}'", relname, base_table);
                     return false;
                 }
 
@@ -2029,7 +2105,6 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 }
 
                 let col_name = CStr::from_ptr(varname).to_string_lossy().into_owned();
-                warning!("Spiral: walk_expr found aggregate column '{}'", col_name);
                 cols.push((col_name, Some(fn_name)));
                 true
             }
@@ -2205,37 +2280,41 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
     let agg_lower = agg_fn.to_lowercase();
     let is_json_agg = matches!(
         agg_lower.as_str(),
-        "spiral_stats" | "spiral_tdigest" | "spiral_sketch"
+        "spiral_stats" | "spiral_tdigest" | "spiral_sketch" | "spiral_ohlcv"
     );
 
-    // Common aggregates that can be fulfilled by the 'stats' formula
-    let is_stats_agg = matches!(
+    // Common aggregates that can be fulfilled by state formulas
+    let is_state_derived = matches!(
         agg_lower.as_str(),
-        "sum" | "count" | "avg" | "spiral_stats"
-    );
+        "sum" | "count" | "avg" | "first" | "last" | "min" | "max"
+    ) || is_json_agg;
 
     if !is_rollup {
-        if is_json_agg || is_stats_agg {
-            let accum_fn = if is_stats_agg {
-                "spiral_stats_accum"
-            } else {
-                &format!("{}_accum", agg_lower)
+        if is_state_derived {
+            let accum_fn = match formula {
+                "stats" => "spiral_stats_accum",
+                "ohlcv" => "spiral_ohlcv_accum",
+                "tdigest" => "spiral_tdigest_accum",
+                "sketch" => "spiral_sketch_accum",
+                _ => {
+                    if is_json_agg {
+                        &format!("{}_accum", agg_lower)
+                    } else {
+                        return format!("\"{}\"", mapped_col);
+                    }
+                }
             };
-            return format!("{}(NULL, \"{}\")", accum_fn, mapped_col);
+            
+            if formula == "ohlcv" {
+                return format!("{}(NULL, \"{}\", spiral(t))", accum_fn, mapped_col);
+            } else {
+                return format!("{}(NULL, \"{}\")", accum_fn, mapped_col);
+            }
         }
-        // For non-JSON aggregates (MIN, MAX), return the raw column.
         return format!("\"{}\"", mapped_col);
     }
 
-    match (agg_lower.as_str(), formula) {
-        ("sum", "ohlcv") => format!("\"{}_v\"", mapped_col),
-        ("max", "ohlcv") => format!("\"{}_h\"", mapped_col),
-        ("min", "ohlcv") => format!("\"{}_l\"", mapped_col),
-        ("count", "stats") | ("sum", "stats") | ("avg", "stats") | ("spiral_stats", "stats") => {
-            format!("\"{}\"", mapped_col)
-        }
-        _ => format!("\"{}\"", mapped_col),
-    }
+    format!("\"{}\"", mapped_col)
 }
 
 fn format_epoch(epoch: i64) -> String {
@@ -2336,9 +2415,8 @@ fn construct_union_sql_hierarchical(
                             "spiral_stats" | "spiral_stats_merge" | "avg" => "stats",
                             "spiral_tdigest" | "spiral_tdigest_merge" => "tdigest",
                             "spiral_sketch" | "spiral_sketch_merge" => "sketch",
-                            "sum" => "sum",
-                            "min" => "min",
-                            "max" => "max",
+                            "first" | "last" => "ohlcv",
+                            "sum" | "min" | "max" => "sum", // sum/min/max could be in ohlcv too, handled by fallback
                             "count" => "stats",
                             _ => "",
                         };
@@ -2412,6 +2490,7 @@ fn construct_union_sql_hierarchical(
                     "spiral_stats"
                         | "spiral_tdigest"
                         | "spiral_sketch"
+                        | "spiral_ohlcv"
                         | "sum"
                         | "count"
                         | "avg"
@@ -2552,7 +2631,7 @@ fn build_changelog_scope_filter(
 }
 
 pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
-    warning!(
+    notice!(
         "Spiral: reactive_refresh entered for '{}', where_clause={:?}",
         base_name,
         where_clause

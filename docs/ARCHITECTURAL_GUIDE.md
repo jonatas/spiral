@@ -13,9 +13,25 @@ Spiral tests ideas for transparent hierarchical query acceleration. It is curren
 
 ## Current Limitations & Research Areas
 
-### 1. Supported Aggregates
-Current exact planner rewrite support is limited to plain `SUM` over columns that have `sum`-materialized rollup state.
-- `COUNT`, `MIN`, `MAX`, `AVG`, `TDIGEST`, and other unmapped aggregates currently trigger a fallback to raw-table planning to maintain accuracy.
+## Consolidated Aggregation States
+
+Spiral uses consolidated JSONB states for complex aggregations. This allows for $O(1)$ merging of statistics and sketches across hierarchical tiers.
+
+### OHLCV (Open-High-Low-Close-Volume)
+Previously, OHLCV was stored as five separate columns. It is now consolidated into a single `OHLCVState` JSONB column.
+
+**Heuristic Mapping**:
+The query planner automatically maps standard aggregates to the consolidated state:
+- `first(col, t)` $\rightarrow$ `spiral_open(col_ohlcv)`
+- `max(col)` $\rightarrow$ `spiral_high(col_ohlcv)`
+- `min(col)` $\rightarrow$ `spiral_low(col_ohlcv)`
+- `last(col, t)` $\rightarrow$ `spiral_close(col_ohlcv)`
+- `sum(col)` $\rightarrow$ `spiral_volume(col_ohlcv)`
+
+### Stats & Sketches
+- **Stats**: Consolidated moments (Mean, Variance, Skewness, Kurtosis).
+- **T-Digest/Sketch**: Quantile and distribution sketches.
+
 
 ### 2. Filter Push-down
 Arbitrary filters on non-scope columns are a complex research area. Currently, these filters trigger a safe fallback to standard PostgreSQL execution.

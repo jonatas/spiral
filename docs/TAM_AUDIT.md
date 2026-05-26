@@ -18,7 +18,7 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 
 | Callback | Status | Notes |
 | :--- | :--- | :--- |
-| `scan_begin` | **Implemented** | Initializes `SpiralScanState`. Supports `SCAN_TIME_RANGE` optimization and parallel scans. |
+| `scan_begin` | **Implemented** | Initializes `SpiralScanState`. Supports `SCAN_TIME_RANGE`, parallel scans, and **ReadStream prefetching**. |
 | `scan_getnextslot` | **Implemented** | Primary read path. Performs O(1) reconstruction. Assigns `tts_tid`. |
 | `scan_end` | **Implemented** | Cleans up scan state. |
 | `scan_rescan` | **Implemented** | Resets scan pointers. |
@@ -40,12 +40,12 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 
 | Callback | Status | Notes |
 | :--- | :--- | :--- |
-| `index_fetch_begin` | **Unsupported** | Returns `NULL`. Indices cannot be used to fetch rows from the TAM. |
-| `index_fetch_reset` | **Placeholder** | No-op. |
-| `index_fetch_end` | **Placeholder** | No-op. |
-| `index_fetch_tuple` | **Unsupported** | Returns `false`. |
+| `index_fetch_begin` | **Implemented** | Allocates per-scan state for index-based row retrieval. |
+| `index_fetch_reset` | **Implemented** | Resets index fetch state. |
+| `index_fetch_end` | **Implemented** | Releases index fetch state. |
+| `index_fetch_tuple` | **Implemented** | Uses TID to mathematically reconstruct rows for standard indices. |
 | `index_delete_tuples` | **Unsupported** | Returns `0`. |
-| `index_build_range_scan` | **Unsupported** | Returns `0.0`. Required for `CREATE INDEX`. |
+| `index_build_range_scan` | **Implemented** | Standard index builder. feeds reconstructed tuples to B-Tree builder. |
 | `index_validate_scan` | **Placeholder** | No-op. |
 
 ## Relation & Lifecycle Callbacks
@@ -86,5 +86,6 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 - [x] Implement `tuple_delete` and `tuple_update`.
 - [x] Implement `relation_vacuum` and `ANALYZE` support.
 - [x] Implement parallel scan support.
+- [x] Implement `index_build_range_scan` and fetch callbacks for standard indices.
 - [ ] Add `GenericXLog` support to point-in-time operations for durability.
-- [ ] Implement `index_build_range_scan` to allow standard indices on Spiral tables.
+- [ ] Implement `scan_bitmap_next_tuple` for Bitmap Scan support.

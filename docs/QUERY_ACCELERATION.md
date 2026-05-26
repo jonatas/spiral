@@ -15,10 +15,11 @@ Spiral includes an experimental planner hook that can rewrite some aggregate que
 ## Current Scope
 
 - The planner hook is designed for selected aggregate/time-range query shapes.
-- Exact aggregate rewrite support is currently limited to plain `SUM(col)` over base-table columns.
-- `COUNT`, `MIN`, `MAX`, `AVG`, `DISTINCT`, ordered aggregates, filtered aggregates, and more complex expressions fall back to standard PostgreSQL planning.
-- Dirty or unsupported regions should fall back to the raw table.
-- Support boundaries for aggregates, filters, joins, and nested queries are still an active research area.
+- **Supported Aggregates**: `SUM`, `COUNT`, `MIN`, `MAX`, and `AVG`.
+- **State-Based Merging**: To ensure mathematical correctness across mixed segments (e.g., combining pre-aggregated 1h buckets with raw 1s rows), Spiral uses a JSONB state approach. Raw data is converted into statistical summaries that are then merged using custom aggregates like `spiral_avg` and `spiral_count`.
+- **Intelligent Range Detection**: Unbounded queries now automatically probe both rollup views and `spiral.changelog` to determine the active data range.
+- `DISTINCT`, ordered aggregates, filtered aggregates, and more complex expressions currently fall back to standard PostgreSQL planning.
+- Dirty or unsupported regions fall back to the raw table.
 
 ## Example
 

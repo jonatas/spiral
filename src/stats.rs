@@ -315,6 +315,140 @@ pub fn spiral_tdigest_combine(
     spiral_sketch_combine(state1, state2)
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct OHLCVState {
+    pub open: f64,
+    pub open_t: i64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub close_t: i64,
+    pub volume: f64,
+    pub count: f64,
+}
+
+impl Default for OHLCVState {
+    fn default() -> Self {
+        OHLCVState {
+            open: 0.0,
+            open_t: i64::MAX,
+            high: f64::MIN,
+            low: f64::MAX,
+            close: 0.0,
+            close_t: i64::MIN,
+            volume: 0.0,
+            count: 0.0,
+        }
+    }
+}
+
+impl OHLCVState {
+    pub fn add(&mut self, val: f64, t: i64) {
+        if t < self.open_t {
+            self.open = val;
+            self.open_t = t;
+        }
+        if t >= self.close_t {
+            self.close = val;
+            self.close_t = t;
+        }
+        if val > self.high {
+            self.high = val;
+        }
+        if val < self.low {
+            self.low = val;
+        }
+        self.volume += val;
+        self.count += 1.0;
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        if other.count == 0.0 {
+            return;
+        }
+        if self.count == 0.0 {
+            *self = *other;
+            return;
+        }
+
+        if other.open_t < self.open_t {
+            self.open = other.open;
+            self.open_t = other.open_t;
+        }
+        if other.close_t >= self.close_t {
+            self.close = other.close;
+            self.close_t = other.close_t;
+        }
+        if other.high > self.high {
+            self.high = other.high;
+        }
+        if other.low < self.low {
+            self.low = other.low;
+        }
+        self.volume += other.volume;
+        self.count += other.count;
+    }
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_accum(state: Option<pgrx::JsonB>, val: f64, t: i64) -> pgrx::JsonB {
+    let mut s = state
+        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .unwrap_or_default();
+    s.add(val, t);
+    pgrx::JsonB(serde_json::to_value(s).unwrap())
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_combine(
+    state1: Option<pgrx::JsonB>,
+    state2: Option<pgrx::JsonB>,
+) -> pgrx::JsonB {
+    let mut s1 = state1
+        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .unwrap_or_default();
+    let s2 = state2
+        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .unwrap_or_default();
+    s1.merge(&s2);
+    pgrx::JsonB(serde_json::to_value(s1).unwrap())
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_open(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0)
+        .unwrap()
+        .open
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_high(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0)
+        .unwrap()
+        .high
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_low(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0)
+        .unwrap()
+        .low
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_close(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0)
+        .unwrap()
+        .close
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_volume(state: pgrx::JsonB) -> f64 {
+    serde_json::from_value::<OHLCVState>(state.0)
+        .unwrap()
+        .volume
+}
+
 extension_sql!(
     r#"
     CREATE OR REPLACE FUNCTION spiral_stats_mean(double precision) RETURNS double precision AS 'SELECT $1' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
@@ -388,6 +522,60 @@ extension_sql!(
         COMBINEFUNC = spiral_stats_combine,
         PARALLEL = SAFE
     );
+
+    CREATE AGGREGATE spiral_ohlcv(double precision, bigint) (
+        SFUNC = spiral_ohlcv_accum,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_ohlcv_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_ohlcv_merge(jsonb) (
+        SFUNC = spiral_ohlcv_combine,
+        STYPE = jsonb,
+        COMBINEFUNC = spiral_ohlcv_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_open(jsonb) (
+        SFUNC = spiral_ohlcv_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_ohlcv_open,
+        COMBINEFUNC = spiral_ohlcv_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_high(jsonb) (
+        SFUNC = spiral_ohlcv_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_ohlcv_high,
+        COMBINEFUNC = spiral_ohlcv_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_low(jsonb) (
+        SFUNC = spiral_ohlcv_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_ohlcv_low,
+        COMBINEFUNC = spiral_ohlcv_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_close(jsonb) (
+        SFUNC = spiral_ohlcv_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_ohlcv_close,
+        COMBINEFUNC = spiral_ohlcv_combine,
+        PARALLEL = SAFE
+    );
+
+    CREATE AGGREGATE spiral_volume(jsonb) (
+        SFUNC = spiral_ohlcv_combine,
+        STYPE = jsonb,
+        FINALFUNC = spiral_ohlcv_volume,
+        COMBINEFUNC = spiral_ohlcv_combine,
+        PARALLEL = SAFE
+    );
     "#,
     name = "create_spiral_stats_aggregates",
     requires = [
@@ -399,7 +587,9 @@ extension_sql!(
         spiral_sketch_accum,
         spiral_sketch_combine,
         spiral_tdigest_accum,
-        spiral_tdigest_combine
+        spiral_tdigest_combine,
+        spiral_ohlcv_accum,
+        spiral_ohlcv_combine
     ]
 );
 

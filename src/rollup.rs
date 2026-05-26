@@ -292,12 +292,10 @@ pub fn derive_child_sql(
                         select_cols.push(format!("spiral_tdigest_merge(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
                     }
                 } else if src.formula == "ohlcv" {
-                    let bc = &src.base_column;
-                    let mc = &src.mat_column;
                     if !parent_is_view {
-                        select_cols.push(format!("first(\"{}\", spiral(t)) as \"{}_o\", max(\"{}\") as \"{}_h\", min(\"{}\") as \"{}_l\", last(\"{}\", spiral(t)) as \"{}_c\", sum(\"{}\") as \"{}_v\"", bc, mc, bc, mc, bc, mc, bc, mc, bc, mc));
+                        select_cols.push(format!("spiral_ohlcv(\"{}\", spiral(t)) as \"{}\"", src.base_column, src.mat_column));
                     } else {
-                        select_cols.push(format!("first(\"{}_o\", spiral(t)) as \"{}_o\", max(\"{}_h\") as \"{}_h\", min(\"{}_l\") as \"{}_l\", last(\"{}_c\", spiral(t)) as \"{}_c\", sum(\"{}_v\") as \"{}_v\"", mc, mc, mc, mc, mc, mc, mc, mc, mc, mc));
+                        select_cols.push(format!("spiral_ohlcv_merge(\"{}\") as \"{}\"", src.mat_column, src.mat_column));
                     }
                 } else if src.formula == "range_max_end" || src.formula == "range_merge" {
                     if !parent_is_view {
