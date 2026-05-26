@@ -34,16 +34,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_spiral_changelog_event_id ON spiral.change
 
 CREATE TYPE time_value_spiral AS (v double precision, t bigint);
 
-CREATE OR REPLACE FUNCTION first_spiral_sfunc(state time_value_spiral, val double precision, ts bigint) RETURNS time_value_spiral AS $$
-    BEGIN RETURN CASE WHEN state IS NULL OR ts < state.t THEN (val, ts)::time_value_spiral ELSE state END; END;
+CREATE OR REPLACE FUNCTION first_spiral_sfunc(time_value_spiral, double precision, bigint) RETURNS time_value_spiral AS $$
+    BEGIN RETURN CASE WHEN $1 IS NULL OR $3 < $1.t THEN ($2, $3)::time_value_spiral ELSE $1 END; END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
-CREATE OR REPLACE FUNCTION last_spiral_sfunc(state time_value_spiral, val double precision, ts bigint) RETURNS time_value_spiral AS $$
-    BEGIN RETURN CASE WHEN state IS NULL OR ts >= state.t THEN (val, ts)::time_value_spiral ELSE state END; END;
+CREATE OR REPLACE FUNCTION last_spiral_sfunc(time_value_spiral, double precision, bigint) RETURNS time_value_spiral AS $$
+    BEGIN RETURN CASE WHEN $1 IS NULL OR $3 >= $1.t THEN ($2, $3)::time_value_spiral ELSE $1 END; END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
-CREATE OR REPLACE FUNCTION first_spiral_final(state time_value_spiral) RETURNS double precision AS $$
-    BEGIN RETURN CASE WHEN state IS NULL THEN NULL ELSE state.v END; END;
+CREATE OR REPLACE FUNCTION first_spiral_final(time_value_spiral) RETURNS double precision AS $$
+    BEGIN RETURN CASE WHEN $1 IS NULL THEN NULL ELSE $1.v END; END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 CREATE AGGREGATE first(double precision, bigint) (
@@ -151,8 +151,8 @@ CREATE OR REPLACE FUNCTION spiral_pack_delta_zero(text, int) RETURNS void AS 'SE
 CREATE OR REPLACE FUNCTION spiral_read_main_zero(int, bigint, bigint) RETURNS double precision AS 'SELECT spiral_read_main($1, $2, $3)' LANGUAGE SQL;
 
 -- LEGACY SUPPORT
-CREATE OR REPLACE FUNCTION first_pg_sfunc(state time_value_spiral, val double precision, ts bigint) RETURNS time_value_spiral AS 'SELECT first_spiral_sfunc($1, $2, $3)' LANGUAGE SQL;
-CREATE OR REPLACE FUNCTION last_pg_sfunc(state time_value_spiral, val double precision, ts bigint) RETURNS time_value_spiral AS 'SELECT last_spiral_sfunc($1, $2, $3)' LANGUAGE SQL;
+CREATE OR REPLACE FUNCTION first_pg_sfunc(time_value_spiral, double precision, bigint) RETURNS time_value_spiral AS 'SELECT first_spiral_sfunc($1, $2, $3)' LANGUAGE SQL;
+CREATE OR REPLACE FUNCTION last_pg_sfunc(time_value_spiral, double precision, bigint) RETURNS time_value_spiral AS 'SELECT last_spiral_sfunc($1, $2, $3)' LANGUAGE SQL;
 
 -- ROBUST REGISTER WRAPPER
 CREATE OR REPLACE FUNCTION spiral_register_view(
@@ -205,9 +205,6 @@ JOIN spiral.sources s ON m.view_name = s.view_name
 ORDER BY m.base_view, m.frame_seconds;
 
 -- OBSERVABILITY
--- spiral.status: one row per base table — hierarchy health, dirty backlog,
--- and an approximate rollup lag (time since newest unprocessed data bucket).
--- lag is NULL when no unprocessed entries exist (rollup is fully current).
 CREATE OR REPLACE VIEW spiral.status AS
 WITH roots AS (
     SELECT DISTINCT base_view
@@ -226,8 +223,8 @@ dirty AS (
         COUNT(*)                                      AS dirty_entries,
         COUNT(DISTINCT scope_values)                  AS dirty_scopes,
         SUM(t_end - t_start)                          AS dirty_seconds,
-        to_timestamptz(MIN(t_start)::bigint)           AS oldest_dirty_ts,
-        to_timestamptz(MAX(t_end)::bigint)             AS newest_dirty_ts
+        to_timestamp(MIN(t_start)::double precision)           AS oldest_dirty_ts,
+        to_timestamp(MAX(t_end)::double precision)             AS newest_dirty_ts
     FROM spiral.changelog
     GROUP BY base_view
 )
@@ -248,128 +245,26 @@ LEFT JOIN tiers t ON t.base_view = r.base_view
 LEFT JOIN dirty  d ON d.base_view = r.base_view;
 
 -- Custom aggregates for mixed-segment acceleration
-CREATE AGGREGATE spiral_stats_merge(jsonb) (
-    SFUNC = spiral_stats_combine,
-    STYPE = jsonb,
-    COMBINEFUNC = spiral_stats_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_avg(jsonb) (
-    SFUNC = spiral_stats_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_stats_mean,
-    COMBINEFUNC = spiral_stats_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_count(jsonb) (
-    SFUNC = spiral_stats_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_stats_count_final,
-    COMBINEFUNC = spiral_stats_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_sum(jsonb) (
-    SFUNC = spiral_stats_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_stats_sum_final,
-    COMBINEFUNC = spiral_stats_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_sketch_merge(jsonb) (
-    SFUNC = spiral_sketch_combine,
-    STYPE = jsonb,
-    COMBINEFUNC = spiral_sketch_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_tdigest_merge(jsonb) (
-    SFUNC = spiral_tdigest_combine,
-    STYPE = jsonb,
-    COMBINEFUNC = spiral_tdigest_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_ohlcv_merge(jsonb) (
-    SFUNC = spiral_ohlcv_combine,
-    STYPE = jsonb,
-    COMBINEFUNC = spiral_ohlcv_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_open(jsonb) (
-    SFUNC = spiral_ohlcv_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_ohlcv_open,
-    COMBINEFUNC = spiral_ohlcv_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_high(jsonb) (
-    SFUNC = spiral_ohlcv_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_ohlcv_high,
-    COMBINEFUNC = spiral_ohlcv_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_low(jsonb) (
-    SFUNC = spiral_ohlcv_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_ohlcv_low,
-    COMBINEFUNC = spiral_ohlcv_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_close(jsonb) (
-    SFUNC = spiral_ohlcv_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_ohlcv_close,
-    COMBINEFUNC = spiral_ohlcv_combine,
-    PARALLEL = SAFE
-);
-
-CREATE AGGREGATE spiral_volume(jsonb) (
-    SFUNC = spiral_ohlcv_combine,
-    STYPE = jsonb,
-    FINALFUNC = spiral_ohlcv_volume,
-    COMBINEFUNC = spiral_ohlcv_combine,
-    PARALLEL = SAFE
-);
+-- (Most of these are now defined in src/stats.rs via extension_sql!)
 
 -- spiral_lag(base_view): returns the rollup lag for a single base table as
 -- an INTERVAL, or NULL if the rollup is fully current.
--- Lag = time elapsed since the newest unprocessed data bucket's end timestamp.
 CREATE OR REPLACE FUNCTION spiral_lag(base_view text) RETURNS INTERVAL AS $$
-    SELECT now() - to_timestamptz(MAX(t_end)::bigint)
+    SELECT now() - to_timestamp(MAX(t_end)::double precision)
     FROM spiral.changelog
     WHERE changelog.base_view = $1
 $$ LANGUAGE SQL STABLE PARALLEL SAFE;
 
 -- spiral.scope_status: per-(base_view, scope) lag and backlog.
--- Useful for identifying hot or lagging tenants under concurrent write load.
--- lag is NULL when the scope has no unprocessed entries.
 CREATE OR REPLACE VIEW spiral.scope_status AS
 SELECT
     base_view,
     scope_values,
-    COUNT(*)                                      AS dirty_entries,
-    SUM(t_end - t_start)                          AS dirty_seconds,
-    to_timestamptz(MIN(t_start)::bigint)           AS oldest_dirty_ts,
-    to_timestamptz(MAX(t_end)::bigint)             AS newest_dirty_ts,
-    now() - to_timestamptz(MAX(t_end)::bigint)    AS lag
-FROM spiral.changelog
-GROUP BY base_view, scope_values;
-    base_view,
-    scope_values,
     COUNT(*)                                        AS dirty_entries,
     SUM(t_end - t_start)                            AS dirty_seconds,
-    to_timestamptz(MIN(t_start)::bigint)            AS oldest_dirty_ts,
-    to_timestamptz(MAX(t_end)::bigint)              AS newest_dirty_ts,
-    now() - to_timestamptz(MAX(t_end)::bigint)      AS lag
+    to_timestamp(MIN(t_start)::double precision)    AS oldest_dirty_ts,
+    to_timestamp(MAX(t_end)::double precision)      AS newest_dirty_ts,
+    now() - to_timestamp(MAX(t_end)::double precision) AS lag
 FROM spiral.changelog
 GROUP BY base_view, scope_values
 ORDER BY lag DESC NULLS LAST;

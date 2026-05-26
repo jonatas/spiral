@@ -455,6 +455,7 @@ struct QueryConstraints {
     start_node: Option<*mut pg_sys::Node>,
     end_node: Option<*mut pg_sys::Node>,
     scopes: std::collections::HashMap<String, (serde_json::Value, *mut pg_sys::Node)>,
+    in_clauses: std::collections::HashMap<String, (Vec<serde_json::Value>, *mut pg_sys::Node)>,
 }
 
 enum AstOpportunity {
@@ -924,6 +925,25 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         })
                                         .unwrap_or_default();
 
+                                    let in_vals: Vec<(String, Vec<String>)> = qc_opt
+                                        .map(|qc| {
+                                            let mut v = Vec::new();
+                                            if let Some(m) = metadata_obj.as_ref() {
+                                                for col in &m.scope_columns {
+                                                    if let Some((vals, _node)) = qc.in_clauses.get(col) {
+                                                        let val_strs = vals.iter().map(|v| match v {
+                                                            serde_json::Value::Number(n) => n.to_string(),
+                                                            serde_json::Value::String(s) => s.clone(),
+                                                            _ => v.to_string(),
+                                                        }).collect();
+                                                        v.push((col.clone(), val_strs));
+                                                    }
+                                                }
+                                            }
+                                            v
+                                        })
+                                        .unwrap_or_default();
+
                                     let union_sql = construct_union_sql_hierarchical(
                                         &base_table,
                                         &segments,
@@ -931,7 +951,9 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         &offset_cols,
                                         &col_types,
                                         &scope_vals,
+                                        &in_vals,
                                     );
+
                                     let new_query = parse_sql_to_query(&union_sql);
                                     if !new_query.is_null() {
                                         (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
@@ -960,8 +982,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         }).unwrap_or(());
 
                                         // Rewrite top-level aggregates to their merge equivalents
-                                        rewrite_query_aggregates(query, &column_formulas);
-
+                                        rewrite_query_aggregates(query, &column_formulas, varno);
                                         // Neutralize consumed constraints from the outer query to avoid double verification.
                                         if let Some(qc) = constraint_map.get(&varno) {
                                             if let Some(node) = qc.start_node {
@@ -1568,7 +1589,7 @@ pub fn generate_hierarchy_internal(
                 } else if formula_lower.contains("ohlc") {
                     let mat = alias.clone().unwrap_or_else(|| col.clone());
                     if seen_cols.insert(mat.clone()) {
-                        select_parts.push(format!("spiral_ohlcv(\"{}\", spiral(t)) as \"{}\"", col, mat));
+                        select_parts.push(format!("spiral_ohlcv(\"{}\", spiral(\"{}\")) as \"{}\"", col, anchor_col, mat));
                         sources.push(rollup::SourceDef {
                             base_column: col.clone(),
                             formula: "ohlcv".to_string(),
@@ -1904,6 +1925,7 @@ fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
 pub(crate) unsafe fn rewrite_query_aggregates(
     query: *mut pg_sys::Query,
     column_formulas: &std::collections::HashMap<String, String>,
+    varno: i32,
 ) {
     if !(*query).hasAggs {
         return;
@@ -1929,11 +1951,18 @@ pub(crate) unsafe fn rewrite_query_aggregates(
     let close_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_close' AND pronargs = 1").unwrap_or(None);
     let volume_oid = Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_proc WHERE proname = 'spiral_volume' AND pronargs = 1").unwrap_or(None);
 
+    let oids = [
+        stats_merge_oid, tdigest_merge_oid, sketch_merge_oid, 
+        avg_merge_oid, count_merge_oid, sum_merge_oid,
+        ohlcv_merge_oid, open_oid, high_oid, low_oid, close_oid, volume_oid
+    ];
+
     unsafe fn walk_and_rewrite(
         node: *mut pg_sys::Node,
         column_formulas: &std::collections::HashMap<String, String>,
         rtable: *mut pg_sys::List,
         oids: &[Option<pg_sys::Oid>], // [stats, tdigest, sketch, avg, count, sum, ohlcv, open, high, low, close, volume]
+        varno: i32,
     ) {
         if node.is_null() {
             return;
@@ -1948,7 +1977,10 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                 // Identify the column and its formula
                 let mut formula = "sum".to_string();
                 let mut is_json_target = false;
-                if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
+                
+                if (*agg).aggstar && agg_fn == "count" {
+                    formula = "count".to_string();
+                } else if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
                     let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
                     let expr = (*arg).expr as *mut pg_sys::Node;
                     if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
@@ -1969,7 +2001,9 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                     }
                 }
 
-                let new_oid = if formula == "ohlcv" {
+                let new_oid = if (*agg).aggstar && agg_fn == "count" {
+                    oids[4] // spiral_count
+                } else if formula == "ohlcv" {
                     match agg_fn.as_ref() {
                         "first" => oids[7], // open
                         "last" => oids[10], // close
@@ -2008,13 +2042,26 @@ pub(crate) unsafe fn rewrite_query_aggregates(
 
                     // If we changed to a state-based aggregate, we must update the argument Var
                     // to expect JSONB from the subquery.
-                    if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
+                    if (*agg).aggstar {
+                        use std::os::raw::c_void;
+                        // Change count(*) to count(_spiral_count)
+                        (*agg).aggstar = false;
+                        let var = pg_sys::makeVar(varno, 2, pg_sys::INT8OID, -1, pg_sys::InvalidOid, 0); 
+                        let tle = pg_sys::makeTargetEntry(var as *mut pg_sys::Expr, 1, std::ptr::null_mut(), false);
+                        (*agg).args = pg_sys::lappend(std::ptr::null_mut(), tle as *mut c_void);
+                    } else if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
                         let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
                         let expr = (*arg).expr as *mut pg_sys::Node;
                         if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
                             let var = expr as *mut pg_sys::Var;
-                            (*var).vartype = pg_sys::JSONBOID;
-                            (*var).vartypmod = -1;
+                            // Only change type if mapping to a JSON aggregate
+                            let is_json_target_rewrite = matches!(agg_fn.as_ref(), "avg" | "count" | "sum" | "spiral_stats" | "spiral_tdigest" | "spiral_sketch" | "spiral_ohlcv")
+                                || (formula == "ohlcv" && matches!(agg_fn.as_ref(), "first" | "last"));
+                            
+                            if is_json_target_rewrite {
+                                (*var).vartype = pg_sys::JSONBOID;
+                                (*var).vartypmod = -1;
+                            }
                         }
                         
                         // If it was first/last, it had 2 arguments. We must truncate to 1 (the jsonb state).
@@ -2034,17 +2081,26 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                         column_formulas,
                         rtable,
                         oids,
+                        varno,
+                    );
+                }
+            }
+        } else if (*node).type_ == pg_sys::NodeTag::T_OpExpr {
+            let op = node as *mut pg_sys::OpExpr;
+            let args = (*op).args;
+            if !args.is_null() {
+                for i in 0..(*args).length {
+                    walk_and_rewrite(
+                        pg_sys::list_nth(args, i) as *mut pg_sys::Node,
+                        column_formulas,
+                        rtable,
+                        oids,
+                        varno,
                     );
                 }
             }
         }
     }
-
-    let oids = [
-        stats_merge_oid, tdigest_merge_oid, sketch_merge_oid, 
-        avg_merge_oid, count_merge_oid, sum_merge_oid,
-        ohlcv_merge_oid, open_oid, high_oid, low_oid, close_oid, volume_oid
-    ];
 
     for i in 0..(*target_list).length {
         let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
@@ -2053,6 +2109,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
             column_formulas,
             (*query).rtable,
             &oids,
+            varno,
         );
     }
 }
@@ -2126,27 +2183,34 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 if !(*agg).aggdistinct.is_null()
                     || !(*agg).aggorder.is_null()
                     || !(*agg).aggfilter.is_null()
-                    || (*agg).aggstar
                 {
-                    notice!("Spiral: walk_expr found DISTINCT, ORDER BY, FILTER, or * in aggregate");
+                    notice!("Spiral: walk_expr found DISTINCT, ORDER BY, or FILTER in aggregate");
                     return false;
                 }
+
 
                 let agg_fn = pg_sys::get_func_name((*agg).aggfnoid);
                 if agg_fn.is_null() {
                     return false;
                 }
-                let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().into_owned();
+                let fn_name = CStr::from_ptr(agg_fn).to_string_lossy().to_lowercase();
                 if !is_supported_rollup_aggregate(&fn_name) {
                     notice!("Spiral: walk_expr found unsupported aggregate function '{}'", fn_name);
                     return false;
                 }
 
+                if (*agg).aggstar {
+                    if fn_name == "count" {
+                        cols.push(("*".to_string(), Some("count".to_string())));
+                        return true;
+                    }
+                    return false;
+                }
+
                 let args = (*agg).args;
                 let num_args = if args.is_null() { 0 } else { (*args).length };
-                notice!("Spiral: walk_expr aggregate '{}' has {} args", fn_name, num_args);
                 
-                let is_order_dependent = fn_name.to_lowercase() == "first" || fn_name.to_lowercase() == "last";
+                let is_order_dependent = fn_name == "first" || fn_name == "last";
                 if is_order_dependent {
                     if num_args != 2 {
                         notice!("Spiral: walk_expr found order-dependent aggregate '{}' with {} arguments (expected 2)", fn_name, num_args);
@@ -2157,36 +2221,16 @@ pub(crate) unsafe fn extract_supported_query_columns(
                     return false;
                 }
 
-                let arg = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
-                let arg_expr = (*arg).expr as *mut pg_sys::Node;
-                if arg_expr.is_null() || (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
+                // Recurse into first argument
+                let target_entry = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
+                if !walk_expr((*target_entry).expr as *mut pg_sys::Node, base_table, rtable, cols) {
                     return false;
                 }
 
-                let var = arg_expr as *mut pg_sys::Var;
-                let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
-                if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
-                    return false;
+                // Associate the aggregate function name with the column
+                if let Some((_col, agg_name)) = cols.last_mut() {
+                    *agg_name = Some(fn_name);
                 }
-
-                let relname_ptr = pg_sys::get_rel_name((*rte).relid);
-                if relname_ptr.is_null() {
-                    notice!("Spiral: walk_expr relname is null");
-                    return false;
-                }
-                let relname = CStr::from_ptr(relname_ptr).to_string_lossy();
-                if relname.as_ref() != base_table {
-                    notice!("Spiral: walk_expr relname mismatch: '{}' != '{}'", relname, base_table);
-                    return false;
-                }
-
-                let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                if varname.is_null() {
-                    return false;
-                }
-
-                let col_name = CStr::from_ptr(varname).to_string_lossy().into_owned();
-                cols.push((col_name, Some(fn_name)));
                 true
             }
             pg_sys::NodeTag::T_FuncExpr => {
@@ -2206,8 +2250,29 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 }
                 true
             }
+            pg_sys::NodeTag::T_OpExpr => {
+                let op = node as *mut pg_sys::OpExpr;
+                if (*op).args.is_null() {
+                    return true;
+                }
+                for i in 0..(*(*op).args).length {
+                    if !walk_expr(
+                        pg_sys::list_nth((*op).args, i) as *mut pg_sys::Node,
+                        base_table,
+                        rtable,
+                        cols,
+                    ) {
+                        notice!("Spiral: walk_expr failed on OpExpr argument {}", i);
+                        return false;
+                    }
+                }
+                true
+            }
             pg_sys::NodeTag::T_Const => true,
-            _ => false,
+            _ => {
+                notice!("Spiral: walk_expr found unsupported node type {:?}", (*node).type_);
+                false
+            }
         }
     }
 
@@ -2432,6 +2497,7 @@ fn construct_union_sql_hierarchical(
     offset_cols: &[catalog::OffsetColumn],
     col_types: &std::collections::HashMap<String, String>,
     scope_vals: &[(String, String)],
+    in_vals: &[(String, Vec<String>)],
 ) -> String {
     let mut sources: Vec<String> = segments.iter().map(|s| s.source.clone()).collect();
     sources.sort();
@@ -2654,14 +2720,43 @@ fn construct_union_sql_hierarchical(
         } else {
             String::new()
         };
+        let scope_pred = scope_vals
+            .iter()
+            .filter(|(col, _)| is_rollup && rollup_cols.contains(col))
+            .map(|(col, val)| {
+                format!(
+                    " AND \"{}\" = '{}'",
+                    col.replace("\"", "\"\""),
+                    val.replace("'", "''")
+                )
+            })
+            .collect::<String>();
+
+        let in_pred = in_vals
+            .iter()
+            .filter(|(col, _)| is_rollup && rollup_cols.contains(col))
+            .map(|(col, vals)| {
+                format!(
+                    " AND \"{}\" IN ({})",
+                    col.replace("\"", "\"\""),
+                    vals.iter()
+                        .map(|v| format!("'{}'", v.replace('\'', "''")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<String>();
 
         select_parts.push(format!(
-            "SELECT {} FROM {} WHERE {}{}",
+            "SELECT {} FROM {} WHERE {}{}{}{}",
             inner_select.join(", "),
             src,
             time_pred,
-            zorder_pred
+            zorder_pred,
+            scope_pred,
+            in_pred
         ));
+
     }
 
     if select_parts.is_empty() {
