@@ -448,7 +448,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
     .execute()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct QueryConstraints {
     start: Option<i64>,
     end: Option<i64>,
@@ -513,7 +513,7 @@ unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Opti
             {
                 let var = var_node as *mut pg_sys::Var;
                 let varno = (*var).varno as i32;
-                let rte = pg_sys::list_nth(rtable, varno as usize - 1) as *mut pg_sys::RangeTblEntry;
+                let rte = pg_sys::list_nth(rtable, varno - 1) as *mut pg_sys::RangeTblEntry;
                 let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
                 if varname_ptr.is_null() {
                     return None;
@@ -572,10 +572,10 @@ unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Opti
             {
                 let v1 = left as *mut pg_sys::Var;
                 let v2 = right as *mut pg_sys::Var;
-                let rte1 = pg_sys::list_nth(rtable, (*v1).varno as usize - 1)
-                    as *mut pg_sys::RangeTblEntry;
-                let rte2 = pg_sys::list_nth(rtable, (*v2).varno as usize - 1)
-                    as *mut pg_sys::RangeTblEntry;
+                let varno1 = (*v1).varno as i32;
+                let varno2 = (*v2).varno as i32;
+                let rte1 = pg_sys::list_nth(rtable, varno1 - 1) as *mut pg_sys::RangeTblEntry;
+                let rte2 = pg_sys::list_nth(rtable, varno2 - 1) as *mut pg_sys::RangeTblEntry;
                 let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
                 let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
                 if !n1.is_null()
@@ -584,8 +584,8 @@ unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Opti
                     && CStr::from_ptr(n2).to_string_lossy() == "t"
                 {
                     return Some(AstOpportunity::EqualTimeColumns {
-                        v1: (*v1).varno as i32,
-                        v2: (*v2).varno as i32,
+                        v1: varno1,
+                        v2: varno2,
                     });
                 }
             }
@@ -595,13 +595,144 @@ unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Opti
     None
 }
 
+#[derive(Clone, Copy)]
+struct VisitorContext {
+    in_and_chain: bool,
+}
+
+struct AstVisitor {
+    rtable: *mut pg_sys::List,
+    constraints: std::collections::HashMap<i32, QueryConstraints>,
+    equalities: Vec<(i32, i32)>,
+}
+
+impl AstVisitor {
+    fn new(rtable: *mut pg_sys::List) -> Self {
+        Self {
+            rtable,
+            constraints: std::collections::HashMap::new(),
+            equalities: Vec::new(),
+        }
+    }
+
+    unsafe fn walk(&mut self, node: *mut pg_sys::Node, context: VisitorContext) {
+        if node.is_null() {
+            return;
+        }
+
+        if context.in_and_chain {
+            if let Some(opp) = match_node(node, self.rtable) {
+                match opp {
+                    AstOpportunity::TimeStart { varno, ts, node } => {
+                        let qc = self.constraints.entry(varno).or_default();
+                        qc.start = Some(ts);
+                        qc.start_node = Some(node);
+                    }
+                    AstOpportunity::TimeEnd { varno, ts, node } => {
+                        let qc = self.constraints.entry(varno).or_default();
+                        qc.end = Some(ts);
+                        qc.end_node = Some(node);
+                    }
+                    AstOpportunity::ScopeEquality {
+                        varno,
+                        col,
+                        val,
+                        node,
+                    } => {
+                        let qc = self.constraints.entry(varno).or_default();
+                        qc.scopes.insert(col, (val, node));
+                    }
+                    AstOpportunity::EqualTimeColumns { v1, v2 } => {
+                        self.equalities.push((v1, v2));
+                    }
+                }
+                return;
+            }
+        }
+
+        match (*node).type_ {
+            pg_sys::NodeTag::T_FromExpr => {
+                let from = node as *mut pg_sys::FromExpr;
+                self.walk((*from).quals, context);
+                if !(*from).fromlist.is_null() {
+                    let list = (*from).fromlist;
+                    for i in 0..(*list).length {
+                        self.walk(pg_sys::list_nth(list, i) as *mut pg_sys::Node, context);
+                    }
+                }
+            }
+            pg_sys::NodeTag::T_JoinExpr => {
+                let join = node as *mut pg_sys::JoinExpr;
+                self.walk((*join).quals, context);
+                self.walk((*join).larg, context);
+                self.walk((*join).rarg, context);
+            }
+            pg_sys::NodeTag::T_BoolExpr => {
+                let bexpr = node as *mut pg_sys::BoolExpr;
+                let args = (*bexpr).args;
+                let new_context = VisitorContext {
+                    in_and_chain: context.in_and_chain
+                        && (*bexpr).boolop == pg_sys::BoolExprType::AND_EXPR,
+                };
+                if !args.is_null() {
+                    for i in 0..(*args).length {
+                        self.walk(pg_sys::list_nth(args, i) as *mut pg_sys::Node, new_context);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    unsafe fn run(
+        mut self,
+        node: *mut pg_sys::Node,
+    ) -> std::collections::HashMap<i32, QueryConstraints> {
+        self.walk(node, VisitorContext { in_and_chain: true });
+
+        for _ in 0..10 {
+            let mut changed = false;
+            let current_equalities = self.equalities.clone();
+            for (v1, v2) in current_equalities {
+                let (s1, e1) = {
+                    let r1 = self.constraints.get(&v1);
+                    (r1.and_then(|qc| qc.start), r1.and_then(|qc| qc.end))
+                };
+                let (s2, e2) = {
+                    let r2 = self.constraints.get(&v2);
+                    (r2.and_then(|qc| qc.start), r2.and_then(|qc| qc.end))
+                };
+
+                let new_start = s1.or(s2);
+                let new_end = e1.or(e2);
+
+                if new_start != s1 || new_end != e1 {
+                    let qc = self.constraints.entry(v1).or_default();
+                    qc.start = new_start;
+                    qc.end = new_end;
+                    changed = true;
+                }
+                if new_start != s2 || new_end != e2 {
+                    let qc = self.constraints.entry(v2).or_default();
+                    qc.start = new_start;
+                    qc.end = new_end;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.constraints
+    }
+}
+
 unsafe fn build_time_constraints(
     jointree: *mut pg_sys::Node,
     rtable: *mut pg_sys::List,
 ) -> (std::collections::HashMap<i32, QueryConstraints>, i64) {
-    let mut constraints: std::collections::HashMap<i32, QueryConstraints> =
-        std::collections::HashMap::new();
-    let mut equalities: Vec<(i32, i32)> = Vec::new();
+    let visitor = AstVisitor::new(rtable);
+    let constraints = visitor.run(jointree);
 
     // Use pg_timezone_names to get the UTC offset for the current session timezone.
     // The AT TIME ZONE + now() formula returns 0 inside the planner hook context;
@@ -613,179 +744,6 @@ unsafe fn build_time_constraints(
     .unwrap_or(Some(0))
     .unwrap_or(0);
 
-    if jointree.is_null() {
-        return (constraints, tz_offset);
-    }
-
-    let mut stack = vec![jointree];
-    while let Some(node) = stack.pop() {
-        if node.is_null() {
-            continue;
-        }
-        match (*node).type_ {
-            pg_sys::NodeTag::T_FromExpr => {
-                let from = node as *mut pg_sys::FromExpr;
-                if !(*from).quals.is_null() {
-                    stack.push((*from).quals);
-                }
-                if !(*from).fromlist.is_null() {
-                    let list = (*from).fromlist;
-                    for i in 0..(*list).length {
-                        stack.push(pg_sys::list_nth(list, i) as *mut pg_sys::Node);
-                    }
-                }
-            }
-            pg_sys::NodeTag::T_JoinExpr => {
-                let join = node as *mut pg_sys::JoinExpr;
-                if !(*join).quals.is_null() {
-                    stack.push((*join).quals);
-                }
-                stack.push((*join).larg);
-                stack.push((*join).rarg);
-            }
-            pg_sys::NodeTag::T_BoolExpr => {
-                let bexpr = node as *mut pg_sys::BoolExpr;
-                let args = (*bexpr).args;
-                if !args.is_null() {
-                    for i in 0..(*args).length {
-                        stack.push(pg_sys::list_nth(args, i) as *mut pg_sys::Node);
-                    }
-                }
-            }
-            pg_sys::NodeTag::T_OpExpr => {
-                let op = node as *mut pg_sys::OpExpr;
-                let opname_ptr = pg_sys::get_opname((*op).opno);
-                if opname_ptr.is_null() {
-                    continue;
-                }
-                let opname = CStr::from_ptr(opname_ptr).to_string_lossy();
-                let args = (*op).args;
-                if args.is_null() || (*args).length != 2 {
-                    continue;
-                }
-
-                let left = pg_sys::list_nth(args, 0) as *mut pg_sys::Node;
-                let right = pg_sys::list_nth(args, 1) as *mut pg_sys::Node;
-
-                let mut var_node = left;
-                if (*left).type_ == pg_sys::NodeTag::T_FuncExpr {
-                    let fe = left as *mut pg_sys::FuncExpr;
-                    if !(*fe).args.is_null() && (*(*fe).args).length > 0 {
-                        var_node = pg_sys::list_nth((*fe).args, 0) as *mut pg_sys::Node;
-                    }
-                }
-
-                if (*var_node).type_ == pg_sys::NodeTag::T_Var
-                    && (*right).type_ == pg_sys::NodeTag::T_Const
-                {
-                    let var = var_node as *mut pg_sys::Var;
-                    let rte =
-                        pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
-                    let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                    if !varname_ptr.is_null() {
-                        let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
-                        let con = right as *mut pg_sys::Const;
-
-                        if varname == "t" {
-                            let val = match (*con).consttype {
-                                pg_sys::INT8OID => Some(
-                                    i64::from_datum((*con).constvalue, (*con).constisnull).unwrap(),
-                                ),
-                                pg_sys::TIMESTAMPTZOID => {
-                                    // PG stores timestamptz as microseconds since 2000-01-01.
-                                    // Convert to Unix epoch seconds by dividing and adding the
-                                    // PG→Unix offset so segment boundaries match spiral(t) values.
-                                    let ts = i64::from_datum((*con).constvalue, (*con).constisnull)
-                                        .unwrap();
-                                    Some(ts / 1_000_000 + crate::POSTGRES_EPOCH_JDATE)
-                                }
-                                _ => None,
-                            };
-                            if let Some(v) = val {
-                                let qc = constraints.entry((*var).varno).or_default();
-                                if opname == ">=" {
-                                    qc.start = Some(v);
-                                    qc.start_node = Some(node);
-                                } else if opname == "<" {
-                                    qc.end = Some(v);
-                                    qc.end_node = Some(node);
-                                }
-                            }
-                        } else if opname == "=" {
-                            // Possible scope column — preserve the native JSON type so it
-                            // matches what track_changes_stmt stores via jsonb_build_object.
-                            let val: Option<serde_json::Value> = match (*con).consttype {
-                                pg_sys::TEXTOID => Some(serde_json::Value::String(
-                                    String::from_datum((*con).constvalue, (*con).constisnull)
-                                        .unwrap(),
-                                )),
-                                pg_sys::INT4OID => Some(serde_json::Value::Number(
-                                    i32::from_datum((*con).constvalue, (*con).constisnull)
-                                        .unwrap()
-                                        .into(),
-                                )),
-                                pg_sys::INT8OID => Some(serde_json::Value::Number(
-                                    i64::from_datum((*con).constvalue, (*con).constisnull)
-                                        .unwrap()
-                                        .into(),
-                                )),
-                                _ => None,
-                            };
-                            if let Some(v) = val {
-                                let qc = constraints.entry((*var).varno).or_default();
-                                qc.scopes.insert(varname.into_owned(), (v, node));
-                            }
-                        }
-                    }
-                } else if (*left).type_ == pg_sys::NodeTag::T_Var
-                    && (*right).type_ == pg_sys::NodeTag::T_Var
-                    && opname == "="
-                {
-                    let v1 = left as *mut pg_sys::Var;
-                    let v2 = right as *mut pg_sys::Var;
-                    let rte1 =
-                        pg_sys::list_nth(rtable, (*v1).varno - 1) as *mut pg_sys::RangeTblEntry;
-                    let rte2 =
-                        pg_sys::list_nth(rtable, (*v2).varno - 1) as *mut pg_sys::RangeTblEntry;
-                    let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
-                    let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
-                    if !n1.is_null()
-                        && !n2.is_null()
-                        && CStr::from_ptr(n1).to_string_lossy() == "t"
-                        && CStr::from_ptr(n2).to_string_lossy() == "t"
-                    {
-                        equalities.push(((*v1).varno, (*v2).varno));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for _ in 0..(*rtable).length {
-        let mut changed = false;
-        for (v1, v2) in &equalities {
-            let r1 = constraints.get(v1).cloned().unwrap_or_default();
-            let r2 = constraints.get(v2).cloned().unwrap_or_default();
-            let new_start = r1.start.or(r2.start);
-            let new_end = r1.end.or(r2.end);
-            if new_start != r1.start || new_end != r1.end {
-                let qc = constraints.entry(*v1).or_default();
-                qc.start = new_start;
-                qc.end = new_end;
-                changed = true;
-            }
-            if new_start != r2.start || new_end != r2.end {
-                let qc = constraints.entry(*v2).or_default();
-                qc.start = new_start;
-                qc.end = new_end;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
     (constraints, tz_offset)
 }
 

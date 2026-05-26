@@ -247,6 +247,99 @@ FROM roots r
 LEFT JOIN tiers t ON t.base_view = r.base_view
 LEFT JOIN dirty  d ON d.base_view = r.base_view;
 
+-- Custom aggregates for mixed-segment acceleration
+CREATE AGGREGATE spiral_stats_merge(jsonb) (
+    SFUNC = spiral_stats_combine,
+    STYPE = jsonb,
+    COMBINEFUNC = spiral_stats_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_avg(jsonb) (
+    SFUNC = spiral_stats_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_stats_mean,
+    COMBINEFUNC = spiral_stats_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_count(jsonb) (
+    SFUNC = spiral_stats_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_stats_count_final,
+    COMBINEFUNC = spiral_stats_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_sum(jsonb) (
+    SFUNC = spiral_stats_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_stats_sum_final,
+    COMBINEFUNC = spiral_stats_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_sketch_merge(jsonb) (
+    SFUNC = spiral_sketch_combine,
+    STYPE = jsonb,
+    COMBINEFUNC = spiral_sketch_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_tdigest_merge(jsonb) (
+    SFUNC = spiral_tdigest_combine,
+    STYPE = jsonb,
+    COMBINEFUNC = spiral_tdigest_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_ohlcv_merge(jsonb) (
+    SFUNC = spiral_ohlcv_combine,
+    STYPE = jsonb,
+    COMBINEFUNC = spiral_ohlcv_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_open(jsonb) (
+    SFUNC = spiral_ohlcv_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_ohlcv_open,
+    COMBINEFUNC = spiral_ohlcv_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_high(jsonb) (
+    SFUNC = spiral_ohlcv_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_ohlcv_high,
+    COMBINEFUNC = spiral_ohlcv_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_low(jsonb) (
+    SFUNC = spiral_ohlcv_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_ohlcv_low,
+    COMBINEFUNC = spiral_ohlcv_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_close(jsonb) (
+    SFUNC = spiral_ohlcv_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_ohlcv_close,
+    COMBINEFUNC = spiral_ohlcv_combine,
+    PARALLEL = SAFE
+);
+
+CREATE AGGREGATE spiral_volume(jsonb) (
+    SFUNC = spiral_ohlcv_combine,
+    STYPE = jsonb,
+    FINALFUNC = spiral_ohlcv_volume,
+    COMBINEFUNC = spiral_ohlcv_combine,
+    PARALLEL = SAFE
+);
+
 -- spiral_lag(base_view): returns the rollup lag for a single base table as
 -- an INTERVAL, or NULL if the rollup is fully current.
 -- Lag = time elapsed since the newest unprocessed data bucket's end timestamp.
@@ -261,6 +354,15 @@ $$ LANGUAGE SQL STABLE PARALLEL SAFE;
 -- lag is NULL when the scope has no unprocessed entries.
 CREATE OR REPLACE VIEW spiral.scope_status AS
 SELECT
+    base_view,
+    scope_values,
+    COUNT(*)                                      AS dirty_entries,
+    SUM(t_end - t_start)                          AS dirty_seconds,
+    to_timestamptz(MIN(t_start)::bigint)           AS oldest_dirty_ts,
+    to_timestamptz(MAX(t_end)::bigint)             AS newest_dirty_ts,
+    now() - to_timestamptz(MAX(t_end)::bigint)    AS lag
+FROM spiral.changelog
+GROUP BY base_view, scope_values;
     base_view,
     scope_values,
     COUNT(*)                                        AS dirty_entries,
