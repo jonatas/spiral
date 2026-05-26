@@ -2110,7 +2110,8 @@ fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols
                         else { format!("t <@ '{{ {} }}'::tstzmultirange", src_segs.iter().map(|s| format!("[\"{}\", \"{}\")", format_epoch(s._t_start), format_epoch(s._t_end))).collect::<Vec<_>>().join(", ")) };
         let zorder_pred = if is_rollup && !scope_vals.is_empty() {
             let min_t = src_segs.iter().map(|s| s._t_start).min().unwrap_or(0); let max_t = src_segs.iter().map(|s| s._t_end).max().unwrap_or(0);
-            let lo = crate::zorder::spiral_zorder(min_t, scope_vals.iter().map(|(_, v)| Some(v.clone())).collect()); let hi = crate::zorder::spiral_zorder(max_t, scope_vals.iter().map(|(_, v)| Some(v.clone())).collect());
+            let lo = crate::spiral_zorder(min_t, scope_vals.iter().map(|(_, v)| Some(v.clone())).collect());
+            let hi = crate::spiral_zorder(max_t, scope_vals.iter().map(|(_, v)| Some(v.clone())).collect());
             format!(" AND spiral_zorder(spiral(t), ARRAY[{}]::text[]) BETWEEN {} AND {}", scope_vals.iter().map(|(_, v)| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", "), lo, hi)
         } else { String::new() };
         let scope_pred = scope_vals.iter().filter(|(col, _)| is_rollup && rollup_cols.contains(col)).map(|(col, val)| format!(" AND \"{}\" = '{}'", col.replace("\"", "\"\""), val.replace("'", "''"))).collect::<String>();
