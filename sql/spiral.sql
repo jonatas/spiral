@@ -170,7 +170,7 @@ $$ LANGUAGE plpgsql
 SET search_path = public, spiral, "$user";
 
 -- Missing functions from demo.sql
-CREATE OR REPLACE FUNCTION to_spiraling_number(t BIGINT, cycle INTEGER, lane INTEGER) RETURNS BIGINT AS $$
+CREATE OR REPLACE FUNCTION to_spiraling_number(t BIGINT, cycle INTEGER, lane INTEGER) RETURNS NUMERIC AS $$
     SELECT spiral_zorder($1, ARRAY[$2::text, $3::text]);
 $$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
 

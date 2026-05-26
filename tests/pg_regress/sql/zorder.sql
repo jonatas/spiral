@@ -16,6 +16,12 @@ SELECT relname
 FROM pg_class 
 WHERE relname LIKE 'idx_spiral_z_multi_tenant%';
 
+-- Check return type (should be NUMERIC)
+SELECT pg_typeof(spiral_zorder(1, ARRAY['a']::text[]));
+
+-- Verify non-wrapping beyond 2^32
+SELECT spiral_zorder(0, ARRAY['a']::text[]) = spiral_zorder(4294967296, ARRAY['a']::text[]) as should_be_false;
+
 -- Check metadata
 SELECT view_name, scope_columns 
 FROM spiral.metadata 
