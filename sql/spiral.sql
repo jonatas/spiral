@@ -63,6 +63,9 @@ CREATE OR REPLACE FUNCTION to_timestamptz(BIGINT) RETURNS TIMESTAMPTZ AS $$
     SELECT spiral_from_epoch($1);
 $$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
 
+-- SLICE OPERATORS
+-- (Defined in src/zorder.rs via extension_sql! to handle pgrx dependencies)
+
 -- track_changes_stmt(base_view, bucket_seconds)
 -- Records one changelog entry per frame-aligned time bucket touched by the
 -- statement, rather than a single MIN..MAX span over the whole batch.

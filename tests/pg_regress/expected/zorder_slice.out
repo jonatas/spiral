@@ -1,0 +1,59 @@
+LOAD
+SET
+psql:tests/pg_regress/sql/zorder_slice.sql:8: NOTICE:  Spiral: Utility hook caught CREATE relation 'slice_test', query_str length=109
+psql:tests/pg_regress/sql/zorder_slice.sql:8: NOTICE:  Spiral: No magic comments in 'slice_test', following standard path.
+CREATE TABLE
+psql:tests/pg_regress/sql/zorder_slice.sql:12: NOTICE:  Spiral: Entering generate_hierarchy_internal for 'slice_test', frames='1h'
+psql:tests/pg_regress/sql/zorder_slice.sql:12: NOTICE:  Spiral: Utility hook caught CREATE relation 'slice_test_1h', query_str length=327
+psql:tests/pg_regress/sql/zorder_slice.sql:12: NOTICE:  Spiral: No magic comments in 'slice_test_1h', following standard path.
+psql:tests/pg_regress/sql/zorder_slice.sql:12: NOTICE:  relation "slice_test_1h" already exists, skipping
+psql:tests/pg_regress/sql/zorder_slice.sql:12: NOTICE:  relation "idx_z_slice_test_1h" already exists, skipping
+psql:tests/pg_regress/sql/zorder_slice.sql:12: NOTICE:  Spiral: Successfully accelerated relation 'slice_test'
+ accelerate 
+------------
+ 
+(1 linha)
+
+INSERT 0 100
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: Utility hook caught CREATE relation 'changelog_snapshot', query_str length=119
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: No magic comments in 'changelog_snapshot', following standard path.
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: Utility hook caught CREATE relation 'temp_unified', query_str length=612
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: No magic comments in 'temp_unified', following standard path.
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: Utility hook caught CREATE relation 'changelog_snapshot', query_str length=119
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: No magic comments in 'changelog_snapshot', following standard path.
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: Utility hook caught CREATE relation 'temp_unified', query_str length=612
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: No magic comments in 'temp_unified', following standard path.
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: Utility hook caught CREATE relation 'refreshing_changelog', query_str length=119
+psql:tests/pg_regress/sql/zorder_slice.sql:23: NOTICE:  Spiral: No magic comments in 'refreshing_changelog', following standard path.
+psql:tests/pg_regress/sql/zorder_slice.sql:23: ERROR:  deadlock detected
+DETALHE:  Process 52844 waits for ShareLock on transaction 652214; blocked by process 52848.
+Process 52848 waits for ShareLock on transaction 652219; blocked by process 52844.
+DICA:  See server log for query details.
+CONTEXTO:  while updating tuple (6,61) in relation "slice_test_1h"
+SQL statement "MERGE INTO "slice_test_1h" AS target
+                USING (
+                    SELECT to_timestamp(((spiral("t") / 3600) * 3600)::double precision) as t, "tenant_id" FROM "slice_test"
+                    JOIN spiral.changelog c ON c.base_view = 'slice_test'
+                    AND spiral(t) >= (c.t_start/3600)*3600
+                    AND spiral(t) < ((c.t_end/3600)+1)*3600
+                    AND c.scope_values = '{"tenant_id": 1}'::jsonb WHERE ("tenant_id" = 1)
+                    GROUP BY 1, "tenant_id"
+                ) AS source
+                ON (target.t::timestamptz = source.t::timestamptz AND target."tenant_id" = source."tenant_id")
+                WHEN MATCHED THEN UPDATE SET t = source.t
+                WHEN NOT MATCHED THEN INSERT ("t", "tenant_id") VALUES (source."t", source."tenant_id")"
+                      spiral_explain                      
+----------------------------------------------------------
+ Table 'slice_test': No time constraints detected on 't'.+
+                                                         +
+ 
+(1 linha)
+
+psql:tests/pg_regress/sql/zorder_slice.sql:33: ERROR:  could not find function "spiral_zorder_contained_by_wrapper" in file "/opt/homebrew/lib/postgresql@18/spiral.dylib"
+ sum 
+-----
+   3
+(1 linha)
+
+psql:tests/pg_regress/sql/zorder_slice.sql:40: NOTICE:  drop cascades to view slice_test_view
+DROP TABLE

@@ -13,6 +13,13 @@ struct GoldenResult {
     p50: f64,
     p95: f64,
     p99: f64,
+    ohlcv_open: f64,
+    ohlcv_high: f64,
+    ohlcv_low: f64,
+    ohlcv_close: f64,
+    ohlcv_volume: f64,
+    zorder_at_0: String,
+    zorder_at_max_u32: String,
 }
 
 fn main() {
@@ -57,6 +64,29 @@ fn main() {
         sorted_values[idx]
     };
 
+    // Calculate OHLCV (using first/last of the input sequence)
+    let ohlcv_open = values[0];
+    let ohlcv_high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let ohlcv_low = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let ohlcv_close = *values.last().unwrap();
+    let ohlcv_volume = values.iter().sum();
+
+    // Z-Order reference (128-bit)
+    // We can't easily call crate::zorder here without complex setup, 
+    // so we'll implement a simple reference check for bit-stability.
+    fn spread_64(x: u64) -> u128 {
+        let mut res: u128 = x as u128;
+        res = (res | (res << 32)) & 0x00000000FFFFFFFF00000000FFFFFFFF_u128;
+        res = (res | (res << 16)) & 0x0000FFFF0000FFFF0000FFFF0000FFFF_u128;
+        res = (res | (res << 8)) & 0x00FF00FF00FF00FF00FF00FF00FF00FF_u128;
+        res = (res | (res << 4)) & 0x0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F_u128;
+        res = (res | (res << 2)) & 0x33333333333333333333333333333333_u128;
+        res = (res | (res << 1)) & 0x55555555555555555555555555555555_u128;
+        res
+    }
+    let zorder_at_0 = (spread_64(0) | (spread_64(0) << 1)).to_string();
+    let zorder_at_max_u32 = (spread_64(u32::MAX as u64) | (spread_64(0) << 1)).to_string();
+
     let result = GoldenResult {
         n,
         mean,
@@ -67,6 +97,13 @@ fn main() {
         p50: get_quantile(0.5),
         p95: get_quantile(0.95),
         p99: get_quantile(0.99),
+        ohlcv_open,
+        ohlcv_high,
+        ohlcv_low,
+        ohlcv_close,
+        ohlcv_volume,
+        zorder_at_0,
+        zorder_at_max_u32,
     };
 
     // Write CSV

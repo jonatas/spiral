@@ -12,7 +12,7 @@ CREATE TABLE qa_base (
 SELECT accelerate('qa_base', 
                   frames => '1m,1h,1d,1mo', 
                   tenant => ARRAY['tenant_id'], 
-                  columns => ARRAY['val ohlcv as val_ohlcv', 'val stats as val_stats'],
+                  columns => ARRAY['val ohlcv as val_ohlcv', 'val stats as val_stats', 'val sketch as val_sketch'],
                   initial_load => false);
 
 -- 2. Data Ingestion: Single Tenant, Dense Data
@@ -80,7 +80,9 @@ WITH raw AS (
     SELECT round(spiral_stats_mean(spiral_stats(val))::numeric, 4) as mean,
            round(spiral_stats_variance(spiral_stats(val))::numeric, 4) as var,
            round(spiral_stats_skewness(spiral_stats(val))::numeric, 4) as skew,
-           round(spiral_stats_kurtosis(spiral_stats(val))::numeric, 4) as kurt
+           round(spiral_stats_kurtosis(spiral_stats(val))::numeric, 4) as kurt,
+           round(spiral_quantile(spiral_sketch(val), 0.5)::numeric, 4) as p50,
+           round(spiral_quantile(spiral_sketch(val), 0.95)::numeric, 4) as p95
     FROM qa_base
     WHERE tenant_id = 1
 ),
@@ -88,12 +90,14 @@ rollup AS (
     SELECT round(spiral_stats_mean(spiral_stats_merge(val_stats))::numeric, 4) as mean,
            round(spiral_stats_variance(spiral_stats_merge(val_stats))::numeric, 4) as var,
            round(spiral_stats_skewness(spiral_stats_merge(val_stats))::numeric, 4) as skew,
-           round(spiral_stats_kurtosis(spiral_stats_merge(val_stats))::numeric, 4) as kurt
+           round(spiral_stats_kurtosis(spiral_stats_merge(val_stats))::numeric, 4) as kurt,
+           round(spiral_quantile(spiral_sketch_merge(val_sketch), 0.5)::numeric, 4) as p50,
+           round(spiral_quantile(spiral_sketch_merge(val_sketch), 0.95)::numeric, 4) as p95
     FROM qa_base_1h
     WHERE tenant_id = 1
 )
-SELECT 'Tenant 1 Stats' as label,
-       mean, var, skew, kurt
+SELECT 'Tenant 1 Stats & Sketch' as label,
+       mean, var, skew, kurt, p50, p95
 FROM rollup;
 
 -- C. Multi-Tenant Consistency
