@@ -11,7 +11,7 @@ Define analytics pipelines directly within your `CREATE TABLE` statement. Spiral
 CREATE TABLE sensor_readings (
     t timestamptz NOT NULL,
     sensor_id int REFERENCES sensors(id),
-    voltage double precision, -- Spiral: ohlc as v, stats as v_stats
+    voltage double precision, -- Spiral: ohlcv as v, stats as v_stats
     current double precision, -- Spiral: stats
     status_code int           -- Spiral: sum
 ) WITH (
@@ -304,7 +304,7 @@ SET spiral.kickoff_date = '2026-04-15';
 CREATE TABLE ticks (
     t timestamptz NOT NULL,
     symbol_id int REFERENCES symbols(id),
-    price numeric, -- Spiral: ohlc, stats
+    price numeric, -- Spiral: ohlcv, stats
     vol int        -- Spiral: sum
 ) WITH (
     spiral.frames = '1m',

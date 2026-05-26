@@ -449,6 +449,25 @@ pub fn spiral_ohlcv_volume(state: pgrx::JsonB) -> f64 {
         .volume
 }
 
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_to_array(state: pgrx::JsonB) -> Vec<f64> {
+    let s = serde_json::from_value::<OHLCVState>(state.0).unwrap();
+    vec![s.open, s.high, s.low, s.close, s.volume]
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_ohlcv_to_json(state: pgrx::JsonB) -> pgrx::JsonB {
+    state
+}
+
+extension_sql!(
+    r#"
+    CREATE OR REPLACE FUNCTION spiral_ohlcv_to_array(jsonb) RETURNS double precision[] AS 'MODULE_PATHNAME', 'spiral_ohlcv_to_array_wrapper' LANGUAGE c IMMUTABLE PARALLEL SAFE;
+    "#,
+    name = "create_ohlcv_array_cast",
+    requires = [spiral_ohlcv_to_array]
+);
+
 extension_sql!(
     r#"
     CREATE OR REPLACE FUNCTION spiral_stats_mean(double precision) RETURNS double precision AS 'SELECT $1' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
@@ -589,7 +608,9 @@ extension_sql!(
         spiral_tdigest_accum,
         spiral_tdigest_combine,
         spiral_ohlcv_accum,
-        spiral_ohlcv_combine
+        spiral_ohlcv_combine,
+        spiral_ohlcv_to_array,
+        spiral_ohlcv_to_json
     ]
 );
 

@@ -448,13 +448,151 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
     .execute()
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct QueryConstraints {
     start: Option<i64>,
     end: Option<i64>,
     start_node: Option<*mut pg_sys::Node>,
     end_node: Option<*mut pg_sys::Node>,
     scopes: std::collections::HashMap<String, (serde_json::Value, *mut pg_sys::Node)>,
+}
+
+enum AstOpportunity {
+    TimeStart {
+        varno: i32,
+        ts: i64,
+        node: *mut pg_sys::Node,
+    },
+    TimeEnd {
+        varno: i32,
+        ts: i64,
+        node: *mut pg_sys::Node,
+    },
+    ScopeEquality {
+        varno: i32,
+        col: String,
+        val: serde_json::Value,
+        node: *mut pg_sys::Node,
+    },
+    EqualTimeColumns {
+        v1: i32,
+        v2: i32,
+    },
+}
+
+unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Option<AstOpportunity> {
+    if node.is_null() {
+        return None;
+    }
+
+    match (*node).type_ {
+        pg_sys::NodeTag::T_OpExpr => {
+            let op = node as *mut pg_sys::OpExpr;
+            let opname_ptr = pg_sys::get_opname((*op).opno);
+            if opname_ptr.is_null() {
+                return None;
+            }
+            let opname = CStr::from_ptr(opname_ptr).to_string_lossy();
+            let args = (*op).args;
+            if args.is_null() || (*args).length != 2 {
+                return None;
+            }
+
+            let left = pg_sys::list_nth(args, 0) as *mut pg_sys::Node;
+            let right = pg_sys::list_nth(args, 1) as *mut pg_sys::Node;
+
+            let mut var_node = left;
+            if (*left).type_ == pg_sys::NodeTag::T_FuncExpr {
+                let fe = left as *mut pg_sys::FuncExpr;
+                if !(*fe).args.is_null() && (*(*fe).args).length > 0 {
+                    var_node = pg_sys::list_nth((*fe).args, 0) as *mut pg_sys::Node;
+                }
+            }
+
+            if (*var_node).type_ == pg_sys::NodeTag::T_Var && (*right).type_ == pg_sys::NodeTag::T_Const
+            {
+                let var = var_node as *mut pg_sys::Var;
+                let varno = (*var).varno as i32;
+                let rte = pg_sys::list_nth(rtable, varno as usize - 1) as *mut pg_sys::RangeTblEntry;
+                let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                if varname_ptr.is_null() {
+                    return None;
+                }
+                let varname = CStr::from_ptr(varname_ptr).to_string_lossy();
+                let con = right as *mut pg_sys::Const;
+
+                if varname == "t" {
+                    let val = match (*con).consttype {
+                        pg_sys::INT8OID => {
+                            Some(i64::from_datum((*con).constvalue, (*con).constisnull).unwrap())
+                        }
+                        pg_sys::TIMESTAMPTZOID => {
+                            let ts =
+                                i64::from_datum((*con).constvalue, (*con).constisnull).unwrap();
+                            Some(ts / 1_000_000 + crate::POSTGRES_EPOCH_JDATE)
+                        }
+                        _ => None,
+                    };
+                    if let Some(ts) = val {
+                        if opname == ">=" {
+                            return Some(AstOpportunity::TimeStart { varno, ts, node });
+                        } else if opname == "<" {
+                            return Some(AstOpportunity::TimeEnd { varno, ts, node });
+                        }
+                    }
+                } else if opname == "=" {
+                    let val: Option<serde_json::Value> = match (*con).consttype {
+                        pg_sys::TEXTOID => Some(serde_json::Value::String(
+                            String::from_datum((*con).constvalue, (*con).constisnull).unwrap(),
+                        )),
+                        pg_sys::INT4OID => Some(serde_json::Value::Number(
+                            i32::from_datum((*con).constvalue, (*con).constisnull)
+                                .unwrap()
+                                .into(),
+                        )),
+                        pg_sys::INT8OID => Some(serde_json::Value::Number(
+                            i64::from_datum((*con).constvalue, (*con).constisnull)
+                                .unwrap()
+                                .into(),
+                        )),
+                        _ => None,
+                    };
+                    if let Some(v) = val {
+                        return Some(AstOpportunity::ScopeEquality {
+                            varno,
+                            col: varname.into_owned(),
+                            val: v,
+                            node,
+                        });
+                    }
+                }
+            } else if (*left).type_ == pg_sys::NodeTag::T_Var
+                && (*right).type_ == pg_sys::NodeTag::T_Var
+                && opname == "="
+            {
+                let v1 = left as *mut pg_sys::Var;
+                let v2 = right as *mut pg_sys::Var;
+                let rte1 = pg_sys::list_nth(rtable, (*v1).varno as usize - 1)
+                    as *mut pg_sys::RangeTblEntry;
+                let rte2 = pg_sys::list_nth(rtable, (*v2).varno as usize - 1)
+                    as *mut pg_sys::RangeTblEntry;
+                let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
+                let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
+                if !n1.is_null()
+                    && !n2.is_null()
+                    && CStr::from_ptr(n1).to_string_lossy() == "t"
+                    && CStr::from_ptr(n2).to_string_lossy() == "t"
+                {
+                    return Some(AstOpportunity::EqualTimeColumns {
+                        v1: (*v1).varno as i32,
+                        v2: (*v2).varno as i32,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 unsafe fn build_time_constraints(
@@ -1695,7 +1833,7 @@ fn validate_formula_column_type(col: &str, formula: &str, type_oid: pg_sys::Oid)
     let formula_lower = formula.to_lowercase();
     let needs_numeric = matches!(
         formula_lower.as_str(),
-        "sum" | "stats" | "ohlc" | "ohlcv" | "tdigest" | "sketch" | "quantile"
+        "sum" | "stats" | "ohlcv" | "tdigest" | "sketch" | "quantile"
     );
     let needs_timestamptz = matches!(formula_lower.as_str(), "range_max_end" | "range_merge");
 
@@ -2299,20 +2437,9 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
         return format!("\"{}\"", mapped_col);
     }
 
-    match (agg_lower.as_str(), formula) {
-        ("sum", "ohlcv") => format!("\"{}_v\"", mapped_col),
-        ("max", "ohlcv") => format!("\"{}_h\"", mapped_col),
-        ("min", "ohlcv") => format!("\"{}_l\"", mapped_col),
-        ("first", "ohlcv") => format!("\"{}_o\"", mapped_col),
-        ("last", "ohlcv") => format!("\"{}_c\"", mapped_col),
-        ("count", "stats") | ("sum", "stats") | ("avg", "stats") | ("spiral_stats", "stats") => {
-            format!("\"{}\"", mapped_col)
-        }
-        ("min", "stats") => format!("(\"{}\"->>'min')::numeric", mapped_col),
-        ("max", "stats") => format!("(\"{}\"->>'max')::numeric", mapped_col),
-        _ => format!("\"{}\"", mapped_col),
-    }
+    format!("\"{}\"", mapped_col)
 }
+
 fn format_epoch(epoch: i64) -> String {
     Spi::get_one::<String>(&format!(
         "SELECT to_char(to_timestamp({}::double precision), 'YYYY-MM-DD HH24:MI:SS')",

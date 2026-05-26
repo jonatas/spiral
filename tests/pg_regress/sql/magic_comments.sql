@@ -5,7 +5,7 @@ SET spiral.kickoff_date = '2026-04-15';
 CREATE TABLE sensors (
     t timestamptz NOT NULL,
     sensor_id int, -- Spiral: count as total_readings
-    voltage double precision, -- Spiral: ohlc as v, stats as v_stats
+    voltage double precision, -- Spiral: ohlcv as v, stats as v_stats
     current double precision, -- Spiral: stats
     status_code int           -- Spiral: count
 ) WITH (

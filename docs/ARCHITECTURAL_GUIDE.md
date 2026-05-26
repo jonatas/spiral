@@ -28,6 +28,23 @@ The query planner automatically maps standard aggregates to the consolidated sta
 - `last(col, t)` $\rightarrow$ `spiral_close(col)`
 - `sum(col)` $\rightarrow$ `spiral_volume(col)`
 
+**Manual Access & Transformation**:
+Users can access components independently or transform the state using these helper functions:
+- `spiral_ohlcv_open(col)`: Get the Open price.
+- `spiral_ohlcv_high(col)`: Get the High price.
+- `spiral_ohlcv_low(col)`: Get the Low price.
+- `spiral_ohlcv_close(col)`: Get the Close price.
+- `spiral_ohlcv_volume(col)`: Get the Volume.
+- `spiral_ohlcv_to_array(col)`: Cast the state to a `double precision[]` array: `[open, high, low, close, volume]`.
+- `spiral_ohlcv_to_json(col)`: Return the raw JSONB representation.
+
+**Example**:
+```sql
+-- Accessing as an array for external visualization
+SELECT spiral_ohlcv_to_array(price) FROM asset_ohlcv_1m;
+-- Result: {100.0, 115.0, 100.0, 112.0, 542.0}
+```
+
 ### Stats & Sketches
 - **Stats**: Consolidated moments (Mean, Variance, Skewness, Kurtosis).
 - **T-Digest/Sketch**: Quantile and distribution sketches.

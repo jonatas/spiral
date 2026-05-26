@@ -553,7 +553,7 @@ To make the system usable, I wanted to automate the creation of hierarchies. In 
 ```sql
 CREATE TABLE asset_ticks (
     t timestamptz NOT NULL,
-    price double precision, -- Spiral: ohlc, stats, sketch
+    price double precision, -- Spiral: ohlcv, stats, sketch
     vol int                 -- Spiral: sum
 );
 ```

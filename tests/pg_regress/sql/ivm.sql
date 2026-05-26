@@ -4,7 +4,7 @@ SET spiral.kickoff_date = '2026-04-15';
 CREATE TABLE metrics (
     t timestamptz NOT NULL,
     device_id text NOT NULL,
-    val double precision -- Spiral: ohlc, sum
+    val double precision -- Spiral: ohlcv, sum
 ) WITH (
     spiral.frames = '1m',
     spiral.tenant = 'device_id'
