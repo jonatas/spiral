@@ -418,6 +418,101 @@
             .ivalue.warn { color: var(--yellow); }
             .ivalue.bad  { color: var(--red); }
 
+            /* ─── CHARTS ──────────────────────────────── */
+            .charts-section {
+                border-top: 1px solid var(--border);
+                padding-top: 8px;
+            }
+            .charts-meta {
+                font-size: 9px;
+                color: var(--muted);
+                margin-bottom: 6px;
+            }
+            .charts-grid {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            .chart-item {
+                background: rgba(255,255,255,0.02);
+                border-radius: 3px;
+                padding: 2px;
+                overflow: hidden;
+            }
+
+            /* ─── QUERY PANEL ─────────────────────────── */
+            .query-panel {
+                border-top: 1px solid var(--border);
+                padding-top: 8px;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            .qp-hdr {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            .query-input {
+                width: 100%;
+                background: var(--bg);
+                border: 1px solid var(--border);
+                border-radius: 3px;
+                color: var(--text);
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 10px;
+                padding: 6px 8px;
+                resize: vertical;
+                outline: none;
+                line-height: 1.5;
+            }
+            .query-input:focus { border-color: var(--blue); }
+            .run-btn {
+                background: rgba(88,166,255,0.12);
+                border: 1px solid rgba(88,166,255,0.35);
+                border-radius: 3px;
+                color: var(--blue);
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 3px 10px;
+                cursor: pointer;
+                white-space: nowrap;
+                flex-shrink: 0;
+            }
+            .run-btn:hover { background: rgba(88,166,255,0.22); }
+            .run-btn:disabled { opacity: 0.4; cursor: default; }
+
+            .explain-out {
+                border: 1px solid var(--border);
+                border-radius: 3px;
+                overflow: hidden;
+            }
+            .er-meta {
+                padding: 3px 8px;
+                font-size: 10px;
+                font-weight: 700;
+                border-bottom: 1px solid var(--border);
+            }
+            .er-ok  { color: var(--green); }
+            .er-err { color: var(--red); }
+            .er-lines {
+                max-height: 200px;
+                overflow-y: auto;
+                padding: 4px 0;
+            }
+            .er-line {
+                font-size: 9px;
+                color: var(--muted);
+                padding: 1px 8px;
+                white-space: pre-wrap;
+                word-break: break-all;
+                line-height: 1.5;
+            }
+            .er-spiral  { color: var(--green) !important; }
+            .er-index   { color: var(--blue)  !important; }
+            .er-buffers { color: var(--yellow) !important; }
+
             /* scrollbar */
             ::-webkit-scrollbar { width: 4px; height: 4px; }
             ::-webkit-scrollbar-track { background: transparent; }

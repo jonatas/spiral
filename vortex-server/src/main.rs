@@ -1,11 +1,11 @@
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,10 @@ struct BlockInfo {
     is_boundary: bool,
     drift_records: i64,
     alignment_pct: f64,
+    #[serde(default)]
+    t_actual_start: i64,
+    #[serde(default)]
+    t_actual_end: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -220,6 +224,8 @@ async fn main() {
         .route("/api/metadata/{name}", get(get_metadata))
         .route("/api/changelog", get(get_changelog))
         .route("/api/storage/{name}/block/{blkno}", get(get_block_info))
+        .route("/api/slice/{view_name}", get(get_slice_data))
+        .route("/api/explain", post(run_explain))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -231,14 +237,25 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+fn valid_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().next().map(|c| !c.is_ascii_digit()).unwrap_or(false)
+}
+
 async fn get_block_info(
     State(state): State<Arc<AppState>>,
     Path((name, blkno)): Path<(String, i32)>,
 ) -> Result<Json<BlockInfo>, (axum::http::StatusCode, String)> {
+    if !valid_identifier(&name) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid view name".into()));
+    }
+
     let row = sqlx::query(
         "SELECT spiral_blkno_to_tenant_range(oid::int, $2) as info FROM pg_class WHERE relname = $1"
     )
-    .bind(name)
+    .bind(&name)
     .bind(blkno)
     .fetch_optional(&state.pool)
     .await
@@ -246,16 +263,54 @@ async fn get_block_info(
     .ok_or((axum::http::StatusCode::NOT_FOUND, "Relation not found".into()))?;
 
     let info_val: Option<serde_json::Value> = row.get("info");
-    if let Some(info) = info_val {
-        let block_info = serde_json::from_value::<BlockInfo>(info)
-            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        Ok(Json(block_info))
-    } else {
-        Err((
-            axum::http::StatusCode::NOT_FOUND,
-            "Block info not available".into(),
-        ))
+    let Some(info) = info_val else {
+        return Err((axum::http::StatusCode::NOT_FOUND, "Block info not available".into()));
+    };
+
+    let mut block_info = serde_json::from_value::<BlockInfo>(info)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Look up the time column from spiral metadata
+    let meta_row = sqlx::query(
+        "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1"
+    )
+    .bind(&name)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let time_col = meta_row
+        .as_ref()
+        .and_then(|row| {
+            let cm: serde_json::Value = row.get("columns_metadata");
+            cm.get("time_column").and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "t".to_string());
+
+    // time_col comes from our own metadata — safe to interpolate after identifier check
+    if valid_identifier(&time_col) {
+        let time_sql = format!(
+            "SELECT extract(epoch from min({tc}))::bigint, \
+                    extract(epoch from max({tc}))::bigint \
+             FROM {view} \
+             WHERE (ctid::text::point)[0]::int = $1",
+            tc = time_col,
+            view = name,
+        );
+
+        if let Ok(time_row) = sqlx::query(&time_sql)
+            .bind(blkno)
+            .fetch_one(&state.pool)
+            .await
+        {
+            let t_min: Option<i64> = time_row.get(0);
+            let t_max: Option<i64> = time_row.get(1);
+            block_info.t_actual_start = t_min.unwrap_or(0);
+            block_info.t_actual_end = t_max.unwrap_or(0);
+        }
     }
+
+    Ok(Json(block_info))
 }
 
 async fn get_all_metadata(
@@ -503,4 +558,137 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
     }
 
     Ok(SystemConfig { hierarchies })
+}
+
+#[derive(Deserialize)]
+struct SliceParams {
+    t_start: f64,
+    t_end: f64,
+    limit: Option<i64>,
+}
+
+async fn get_slice_data(
+    State(state): State<Arc<AppState>>,
+    Path(view_name): Path<String>,
+    Query(params): Query<SliceParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let limit = params.limit.unwrap_or(2000).min(5000);
+
+    // Look up metadata to find time_col and scope_col
+    let meta_row = sqlx::query(
+        "SELECT columns_metadata, scope_columns
+         FROM spiral.metadata
+         WHERE view_name = $1",
+    )
+    .bind(&view_name)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // view_name must be a registered spiral view — prevents SQL injection
+    let meta_row = meta_row.ok_or_else(|| {
+        (axum::http::StatusCode::NOT_FOUND, format!("View '{}' not in spiral.metadata", view_name))
+    })?;
+
+    let columns_metadata: serde_json::Value = meta_row.get("columns_metadata");
+    let scope_columns: Vec<String> = meta_row.get("scope_columns");
+
+    let time_col = columns_metadata
+        .get("time_column")
+        .and_then(|v| v.as_str())
+        .unwrap_or("t")
+        .to_string();
+    let scope_col = scope_columns
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "tenant_id".to_string());
+
+    // Build query with safe identifiers (all from our own metadata, not user input)
+    let sql = format!(
+        "SELECT json_agg(row_to_json(d)) FROM (
+           SELECT *, extract(epoch from {time_col})::bigint AS t_epoch
+           FROM {view_name}
+           WHERE {time_col} >= to_timestamp($1)
+             AND {time_col} < to_timestamp($2)
+           ORDER BY {time_col}
+           LIMIT $3
+         ) d",
+        time_col = time_col,
+        view_name = view_name,
+    );
+
+    let row = sqlx::query(&sql)
+        .bind(params.t_start)
+        .bind(params.t_end)
+        .bind(limit)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let agg: Option<serde_json::Value> = row.get(0);
+    let rows = agg.unwrap_or(serde_json::Value::Array(vec![]));
+    let count = rows.as_array().map(|a| a.len()).unwrap_or(0);
+
+    Ok(Json(serde_json::json!({
+        "view_name": view_name,
+        "time_col": time_col,
+        "scope_col": scope_col,
+        "count": count,
+        "rows": rows,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ExplainRequest {
+    query: String,
+}
+
+async fn run_explain(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ExplainRequest>,
+) -> Json<serde_json::Value> {
+    let trimmed = payload.query.trim().to_string();
+    let upper = trimmed.to_uppercase();
+
+    if !upper.starts_with("SELECT")
+        && !upper.starts_with("WITH")
+        && !upper.starts_with("EXPLAIN")
+    {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "Only SELECT/WITH/EXPLAIN allowed",
+            "lines": [],
+            "duration_ms": 0,
+        }));
+    }
+
+    let final_query = if upper.starts_with("EXPLAIN") {
+        trimmed
+    } else {
+        format!("EXPLAIN (ANALYZE, BUFFERS) {}", trimmed)
+    };
+
+    let start = std::time::Instant::now();
+    let result = sqlx::query(&final_query).fetch_all(&state.pool).await;
+    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    match result {
+        Ok(rows) => {
+            let lines: Vec<String> = rows
+                .iter()
+                .map(|row| row.get::<String, _>(0))
+                .collect();
+            Json(serde_json::json!({
+                "ok": true,
+                "lines": lines,
+                "duration_ms": duration_ms,
+            }))
+        }
+        Err(e) => Json(serde_json::json!({
+            "ok": false,
+            "error": e.to_string(),
+            "lines": [],
+            "duration_ms": duration_ms,
+        })),
+    }
 }

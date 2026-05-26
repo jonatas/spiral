@@ -41,6 +41,10 @@ struct BlockInfo {
     is_boundary: bool,
     drift_records: i64,
     alignment_pct: f64,
+    #[serde(default)]
+    t_actual_start: i64,
+    #[serde(default)]
+    t_actual_end: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -89,6 +93,28 @@ enum VortexEvent {
     ChangelogUpdate(ChangelogEntry),
     StorageStats(StorageStats),
     SystemConfig(SystemConfig),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct SliceResponse {
+    view_name: String,
+    #[serde(default)]
+    time_col: String,
+    #[serde(default)]
+    scope_col: String,
+    count: usize,
+    rows: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ExplainResult {
+    ok: bool,
+    #[serde(default)]
+    lines: Vec<String>,
+    #[serde(default)]
+    duration_ms: f64,
+    #[serde(default)]
+    error: String,
 }
 
 const HEAP_BYTES_PER_ROW: f64 = 48.0;
@@ -149,6 +175,21 @@ fn format_bytes(kb: i64) -> String {
     } else {
         format!("{} KB", kb)
     }
+}
+
+fn extract_numeric_cols(rows: &[serde_json::Value], time_col: &str, scope_col: &str) -> Vec<String> {
+    let Some(first) = rows.first() else { return vec![] };
+    let Some(obj) = first.as_object() else { return vec![] };
+    let mut cols: Vec<String> = obj
+        .iter()
+        .filter(|(k, v)| {
+            let s = k.as_str();
+            s != "t_epoch" && s != time_col && s != scope_col && v.as_f64().is_some()
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    cols.sort();
+    cols
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -277,8 +318,8 @@ fn PageMap(
 
 #[component]
 fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
-    let start_t = kickoff + block.t_range[0];
-    let end_t = kickoff + block.t_range[1];
+    let start_t = if block.t_actual_start > 0 { block.t_actual_start } else { kickoff + block.t_range[0] };
+    let end_t = if block.t_actual_end > 0 { block.t_actual_end } else { kickoff + block.t_range[1] };
     let duration_sec = (end_t - start_t).abs();
     let duration_fmt = if duration_sec < 60 {
         format!("{}s", duration_sec)
@@ -483,6 +524,109 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
 }
 
 #[component]
+fn SvgLineChart(
+    rows: Vec<serde_json::Value>,
+    scope_col: String,
+    metric_col: String,
+) -> impl IntoView {
+    const W: f64 = 300.0;
+    const H: f64 = 70.0;
+    const MX: f64 = 6.0;
+    const MY: f64 = 14.0;
+    const MB: f64 = 4.0;
+    let plot_w = W - MX * 2.0;
+    let plot_h = H - MY - MB;
+
+    let mut t_min: f64 = 0.0;
+    let mut t_max: f64 = 1.0;
+    let mut v_min: f64 = 0.0;
+    let mut v_max: f64 = 1.0;
+    let mut has_data = false;
+    let mut by_tenant: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new();
+
+    for row in &rows {
+        let Some(t) = row.get("t_epoch").and_then(|v| v.as_f64()) else { continue };
+        let Some(v) = row.get(&metric_col).and_then(|v| v.as_f64()) else { continue };
+        let scope = row.get(&scope_col).and_then(|v| v.as_i64()).unwrap_or(0);
+        if !has_data {
+            t_min = t; t_max = t; v_min = v; v_max = v;
+            has_data = true;
+        } else {
+            if t < t_min { t_min = t; }
+            if t > t_max { t_max = t; }
+            if v < v_min { v_min = v; }
+            if v > v_max { v_max = v; }
+        }
+        by_tenant.entry(scope).or_default().push((t, v));
+    }
+
+    if t_max <= t_min { t_max = t_min + 1.0; }
+    if v_max <= v_min { v_max = v_min + 1.0; }
+
+    let t_range = t_max - t_min;
+    let v_range = v_max - v_min;
+    let n = by_tenant.len() as i32;
+
+    let polylines = by_tenant.into_iter().enumerate().map(|(i, (_, pts))| {
+        let color = get_color_for_tenant(i as i32, n);
+        let pts_str: String = pts
+            .iter()
+            .map(|(t, v)| {
+                let x = MX + (t - t_min) / t_range * plot_w;
+                let y = MY + (1.0 - (v - v_min) / v_range) * plot_h;
+                format!("{:.1},{:.1}", x, y)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        view! {
+            <polyline points={pts_str} fill="none" stroke={color} stroke-width="1.5" opacity="0.85" />
+        }
+    }).collect_view();
+
+    let label = metric_col;
+    let vmax_s = if has_data { format!("{:.1}", v_max) } else { "—".to_string() };
+    let vmin_s = if has_data { format!("{:.1}", v_min) } else { "—".to_string() };
+    let vb = format!("0 0 {} {}", W, H);
+
+    view! {
+        <svg viewBox={vb} style="width:100%; height:70px; display:block; overflow:visible;">
+            <text x="4" y="9" font-size="8" fill="var(--muted)">{label}</text>
+            <text x="296" y="9" font-size="7" fill="var(--muted)" text-anchor="end">{vmax_s}</text>
+            <text x="296" y="67" font-size="7" fill="var(--muted)" text-anchor="end">{vmin_s}</text>
+            {(!has_data).then(|| view! {
+                <text x="150" y="42" font-size="9" fill="var(--muted)" text-anchor="middle">"no data"</text>
+            })}
+            {polylines}
+        </svg>
+    }
+}
+
+#[component]
+fn PageDataCharts(slice: SliceResponse) -> impl IntoView {
+    let cols = extract_numeric_cols(&slice.rows, &slice.time_col, &slice.scope_col);
+    let rows = slice.rows;
+    let sc = slice.scope_col;
+    let count = slice.count;
+
+    view! {
+        <div class="charts-section">
+            <div class="charts-meta">{format!("{} rows · {} columns", count, cols.len())}</div>
+            <div class="charts-grid">
+                {cols.into_iter().map(|col| {
+                    let rows_c = rows.clone();
+                    let sc_c = sc.clone();
+                    view! {
+                        <div class="chart-item">
+                            <SvgLineChart rows=rows_c scope_col=sc_c metric_col=col />
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+        </div>
+    }
+}
+
+#[component]
 fn App() -> impl IntoView {
     let stats_by_base = RwSignal::new(BTreeMap::<String, StorageStats>::new());
     let config = RwSignal::new(SystemConfig::default());
@@ -492,6 +636,10 @@ fn App() -> impl IntoView {
     let selected_block = RwSignal::new(None::<BlockInfo>);
     let selected_page_no = RwSignal::new(None::<i32>);
     let is_connected = RwSignal::new(false);
+    let slice_data = RwSignal::new(None::<SliceResponse>);
+    let explain_result = RwSignal::new(None::<ExplainResult>);
+    let explain_query = RwSignal::new(String::new());
+    let explain_running = RwSignal::new(false);
 
     let hostname = web_sys::window()
         .map(|w| {
@@ -610,6 +758,82 @@ fn App() -> impl IntoView {
             .unwrap_or(0)
     });
 
+    // Auto-fetch slice data when a block is selected
+    let api_base_slice = Arc::clone(&api_base);
+    Effect::new(move |_| {
+        let block = selected_block.get();
+        let selected = selected_base_view.get_untracked();
+        let view_name = selected_tier_view
+            .get_untracked()
+            .unwrap_or_else(|| {
+                stats_by_base
+                    .get_untracked()
+                    .get(&selected)
+                    .map(|s| s.view_name.clone())
+                    .unwrap_or_default()
+            });
+        let k = kickoff.get_untracked();
+
+        let Some(b) = block else {
+            slice_data.set(None);
+            return;
+        };
+
+        // Use actual timestamps from the block if available; fall back to kickoff+t_range
+        let (t_start, t_end) = if b.t_actual_start > 0 {
+            (b.t_actual_start as f64, (b.t_actual_end + 120) as f64)
+        } else {
+            ((k + b.t_range[0]) as f64, (k + b.t_range[1]) as f64)
+        };
+
+        explain_query.set(format!(
+            "SELECT * FROM {} WHERE t >= to_timestamp({}) AND t < to_timestamp({})",
+            view_name,
+            t_start as i64,
+            t_end as i64
+        ));
+
+        if view_name.is_empty() {
+            return;
+        }
+
+        let url = format!(
+            "{}/api/slice/{}?t_start={}&t_end={}",
+            api_base_slice, view_name, t_start, t_end
+        );
+        leptos::task::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
+                if let Ok(sr) = resp.json::<SliceResponse>().await {
+                    slice_data.set(Some(sr));
+                }
+            }
+        });
+    });
+
+    let api_base_explain = Arc::clone(&api_base);
+    let run_explain = move || {
+        let q = explain_query.get_untracked();
+        if q.is_empty() {
+            return;
+        }
+        explain_running.set(true);
+        explain_result.set(None);
+        let url = format!("{}/api/explain", api_base_explain);
+        leptos::task::spawn_local(async move {
+            let res = gloo_net::http::Request::post(&url)
+                .json(&serde_json::json!({ "query": q }))
+                .unwrap()
+                .send()
+                .await;
+            explain_running.set(false);
+            if let Ok(r) = res {
+                if let Ok(er) = r.json::<ExplainResult>().await {
+                    explain_result.set(Some(er));
+                }
+            }
+        });
+    };
+
     view! {
         <div id="app">
             <header class="topbar">
@@ -700,6 +924,64 @@ fn App() -> impl IntoView {
                         selected_page=Signal::derive(move || selected_page_no.get())
                         on_click=fetch_block_info
                     />
+
+                    // Data charts for selected page
+                    {move || slice_data.get().map(|sr| view! {
+                        <PageDataCharts slice=sr />
+                    })}
+
+                    // Query / Explain panel (shown when a block is selected)
+                    {move || selected_block.get().map(|_| {
+                        let run = run_explain.clone();
+                        view! {
+                            <div class="query-panel">
+                                <div class="qp-hdr">
+                                    <span class="panel-hdr" style="border:none;margin:0;padding:0;">"EXPLAIN ANALYZE"</span>
+                                    <button
+                                        class="run-btn"
+                                        on:click=move |_| run()
+                                        disabled=move || explain_running.get()
+                                    >
+                                        {move || if explain_running.get() { "running…" } else { "▶ RUN" }}
+                                    </button>
+                                </div>
+                                <textarea
+                                    class="query-input"
+                                    prop:value=move || explain_query.get()
+                                    on:input=move |ev| explain_query.set(event_target_value(&ev))
+                                    rows="4"
+                                    spellcheck="false"
+                                />
+                                {move || explain_result.get().map(|er| {
+                                    let dur = er.duration_ms;
+                                    let ok = er.ok;
+                                    view! {
+                                        <div class="explain-out">
+                                            <div class={if ok { "er-meta er-ok" } else { "er-meta er-err" }}>
+                                                {if ok { format!("✓ {:.1}ms", dur) }
+                                                 else { format!("✗ {}", er.error.clone()) }}
+                                            </div>
+                                            <div class="er-lines">
+                                                {er.lines.into_iter().map(|line| {
+                                                    let cls = if line.contains("Spiral") || line.contains("spiral") {
+                                                        "er-line er-spiral"
+                                                    } else if line.contains("Index") {
+                                                        "er-line er-index"
+                                                    } else if line.contains("Buffers:") {
+                                                        "er-line er-buffers"
+                                                    } else {
+                                                        "er-line"
+                                                    };
+                                                    view! { <div class={cls}>{line}</div> }
+                                                }).collect_view()}
+                                            </div>
+                                        </div>
+                                    }
+                                })}
+                            </div>
+                        }
+                    })}
+
                     <div class="ticker">
                         {move || last_event.get().unwrap_or_else(|| {
                             if is_connected.get() {
