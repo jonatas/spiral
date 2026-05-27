@@ -62,6 +62,10 @@ struct BlockInfo {
     t_actual_start: i64,
     #[serde(default)]
     t_actual_end: i64,
+    #[serde(default)]
+    pending_changes: i32,
+    #[serde(default)]
+    is_stale: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -338,6 +342,37 @@ async fn get_block_info(
             let t_max: Option<i64> = time_row.get(1);
             block_info.t_actual_start = t_min.unwrap_or(0);
             block_info.t_actual_end = t_max.unwrap_or(0);
+        }
+    }
+
+    // Count pending changelog entries overlapping this block's time range
+    if block_info.t_actual_start > 0 && block_info.t_actual_end > 0 {
+        let base_view_opt = sqlx::query_scalar::<_, String>(
+            "SELECT base_view FROM spiral.metadata WHERE view_name = $1",
+        )
+        .bind(&name)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(base_view) = base_view_opt {
+            if let Ok(cl_row) = sqlx::query(
+                "SELECT COUNT(*)::int FROM spiral.changelog
+                 WHERE base_view = $1
+                   AND t_start <= $2
+                   AND t_end >= $3",
+            )
+            .bind(&base_view)
+            .bind(block_info.t_actual_end)
+            .bind(block_info.t_actual_start)
+            .fetch_one(&state.pool)
+            .await
+            {
+                let count: i32 = cl_row.get(0);
+                block_info.pending_changes = count;
+                block_info.is_stale = count > 0;
+            }
         }
     }
 

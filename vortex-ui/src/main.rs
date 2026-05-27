@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use gloo_net::websocket::Message;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use wasm_bindgen::JsValue;
 
@@ -215,9 +215,10 @@ struct SourceInfo {
 struct ChangelogEntry {
     event_id: i64,
     base_view: String,
-    t_start: String,
-    t_end: String,
-    ops: i64,
+    #[serde(default)]
+    scope_values: serde_json::Value,
+    t_start: i64,
+    t_end: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -231,6 +232,10 @@ struct BlockInfo {
     is_boundary: bool,
     t_actual_start: i64,
     t_actual_end: i64,
+    #[serde(default)]
+    pending_changes: i32,
+    #[serde(default)]
+    is_stale: bool,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -336,6 +341,7 @@ fn PageMap(
     kickoff: Signal<i64>,
     frame_seconds: Signal<i32>,
     selected_page: Signal<Option<i32>>,
+    dirty_blocks: Signal<BTreeSet<i32>>,
     on_click: impl Fn(i32) + 'static + Send + Clone,
 ) -> impl IntoView {
     let visible_limit = RwSignal::new(200);
@@ -365,20 +371,27 @@ fn PageMap(
                 let k = kickoff.get();
                 let fs = frame_seconds.get().max(1);
                 let sel = selected_page.get();
+                let dirty = dirty_blocks.get();
                 (0..total.min(limit) as i32)
                     .map(|idx| {
                         let color = get_color_for_tenant(idx % scale, scale);
                         let on_click = on_click.clone();
                         let is_sel = sel == Some(idx);
-                        
                         let tenant_id = idx % scale;
                         let time_step = idx / scale;
                         let est_t = k + (time_step as i64 * fs as i64);
                         let t_str = if k > 0 { format!("\nEst. Time: {}", format_epoch_seconds(est_t)) } else { "".into() };
-
+                        let is_dirty = dirty.contains(&idx);
+                        let class = if is_sel {
+                            "page-cell selected"
+                        } else if is_dirty {
+                            "page-cell dirty"
+                        } else {
+                            "page-cell"
+                        };
                         view! {
                             <div
-                                class=if is_sel { "page-cell selected" } else { "page-cell" }
+                                class=class
                                 style=format!("background:{}", color)
                                 on:click=move |_| on_click(idx)
                                 title=format!("Page {}\nTenant: {}{}", idx, tenant_id, t_str)
@@ -428,6 +441,9 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
                 {block.is_boundary.then(|| view! {
                     <span class="badge-boundary">"BOUNDARY"</span>
                 })}
+                {block.is_stale.then(|| view! {
+                    <span class="badge-dirty">"DIRTY"</span>
+                })}
             </div>
             <div class="irow">
                 <span class="ilabel">"capacity"</span>
@@ -441,6 +457,12 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
                 <span class="ilabel">"drift"</span>
                 <span class={if block.drift_records > 0 { "ivalue warn" } else { "ivalue" }}>
                     {block.drift_records} " rec"
+                </span>
+            </div>
+            <div class="irow">
+                <span class="ilabel">"pending"</span>
+                <span class={if block.pending_changes > 0 { "ivalue warn" } else { "ivalue" }}>
+                    {block.pending_changes} " changes"
                 </span>
             </div>
             <div class="irow">
@@ -1259,6 +1281,7 @@ fn App() -> impl IntoView {
     let explain_result = RwSignal::new(None::<ExplainResult>);
     let explain_query = RwSignal::new(String::new());
     let explain_running = RwSignal::new(false);
+    let dirty_page_nos = RwSignal::new(BTreeSet::<i32>::new());
 
     let hostname = web_sys::window()
         .map(|w| {
@@ -1311,6 +1334,31 @@ fn App() -> impl IntoView {
                                             "#{} {} @ {}",
                                             entry.event_id, entry.base_view, entry.t_start
                                         )));
+                                        if entry.base_view == selected_base_view.get_untracked() {
+                                            let h = config.get_untracked()
+                                                .hierarchies
+                                                .into_iter()
+                                                .find(|h| h.base_view == entry.base_view);
+                                            if let Some(h) = h {
+                                                let kickoff = h.kickoff_epoch;
+                                                let tenant_scale = h.tenant_scale.max(1);
+                                                let data_per_page = stats_by_view
+                                                    .get_untracked()
+                                                    .get(&h.raw_view_name)
+                                                    .map(|s| s.data_per_page)
+                                                    .filter(|&d| d > 0)
+                                                    .unwrap_or(1018);
+                                                let t_rel_start = (entry.t_start - kickoff).max(0);
+                                                let t_rel_end = (entry.t_end - kickoff).max(0);
+                                                let blkno_start = ((t_rel_start * tenant_scale) / data_per_page).max(0) as i32;
+                                                let blkno_end = ((t_rel_end * tenant_scale) / data_per_page + 1) as i32;
+                                                dirty_page_nos.update(|set| {
+                                                    for b in blkno_start..=blkno_end {
+                                                        set.insert(b);
+                                                    }
+                                                });
+                                            }
+                                        }
                                     }
                                 },
                                 Err(_) => {}
@@ -1519,6 +1567,7 @@ fn App() -> impl IntoView {
                                             selected_tier_view.set(None);
                                             selected_block.set(None);
                                             selected_page_no.set(None);
+                                            dirty_page_nos.set(BTreeSet::new());
                                         }
                                     >{h.base_view.to_uppercase()}</button>
                                 }
@@ -1614,6 +1663,7 @@ fn App() -> impl IntoView {
                         kickoff=kickoff
                         frame_seconds=current_frame_seconds
                         selected_page=Signal::derive(move || selected_page_no.get())
+                        dirty_blocks=Signal::derive(move || dirty_page_nos.get())
                         on_click=fetch_block_info
                     />
 

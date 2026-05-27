@@ -353,6 +353,18 @@
                 opacity: 0.72;
                 transition: transform 0.1s, opacity 0.1s;
                 flex-shrink: 0;
+                position: relative;
+            }
+            .page-cell.dirty::after {
+                content: '';
+                position: absolute;
+                top: 2px;
+                right: 2px;
+                width: 4px;
+                height: 4px;
+                border-radius: 50%;
+                background: #f97316;
+                pointer-events: none;
             }
             .page-cell:hover {
                 transform: scale(1.4);
@@ -408,6 +420,15 @@
                 background: rgba(188,140,255,0.15);
                 color: var(--purple);
                 border: 1px solid rgba(188,140,255,0.3);
+            }
+            .badge-dirty {
+                font-size: 9px;
+                font-weight: 700;
+                padding: 1px 5px;
+                border-radius: 2px;
+                background: rgba(249,115,22,0.15);
+                color: #f97316;
+                border: 1px solid rgba(249,115,22,0.35);
             }
 
             .irow {
