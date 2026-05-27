@@ -161,29 +161,26 @@ This issue tracks a stricter documentation policy:
 - `docs/BENCHMARK_RESULTS.md`
 - `benchmarks/`
 
-## 6. Align compatibility claims with tested CI targets
+## 7. Implement high-precision 128-bit Z-order and Hilbert Curve [DONE]
+
+**Status Update (2026-05-27):**
+- Transitioned from 64-bit to 128-bit bit-budget for Z-order and Hilbert curves.
+- Removed the 32-bit timestamp truncation, enabling full 64-bit temporal range.
+- Implemented recursive Hilbert Curve encoding for superior spatial locality.
+- Aligned return types to `NUMERIC` for all 128-bit space-filling curve results.
 
 **Title**
-`build: align documented PostgreSQL compatibility with Cargo features and CI coverage`
+`math: implement high-precision 128-bit indexing for infinite temporal range`
 
 **Description**
-The repo should only claim PostgreSQL versions that are exercised by Cargo features and CI jobs in this branch.
+The current 64-bit Z-order implementation truncates timestamps to 32 bits, leading to overflows in 2106 and potential index collisions. We need to expand the bit-budget to 128 bits to support full 64-bit timestamps and high-entropy dimension hashes.
 
-Right now, documentation needs to stay aligned with:
+## 8. Implement Z-Order Slice Operators (@>, <@) and quadrant decomposition [DONE]
 
-- the enabled `pgrx` feature set
-- CI test coverage
-- release packaging targets
+**Status Update (2026-05-27):**
+- Implemented recursive quadrant decomposition for 2D range generation.
+- Added `spiral_zorder_contained_by` function and `@>` operator for Z-value/BOX intersection.
+- Verified core logic with unit tests in `zorder.rs`.
 
-**Acceptance criteria**
-
-- Document the active compatibility matrix in one place
-- Keep README, Cargo features, and CI in sync
-- Add new version claims only when they are tested in CI
-
-**Relevant files**
-
-- `Cargo.toml`
-- `.github/workflows/ci.yml`
-- `.github/workflows/release.yml`
-- `README.md`
+**Title**
+`indexing: add slice operators and range generation for Z-order skip-scans`
