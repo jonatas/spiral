@@ -236,15 +236,11 @@ struct BlockInfo {
     t_actual_start: i64,
     t_actual_end: i64,
     #[serde(default)]
+    kickoff_epoch: i64,
+    #[serde(default)]
     pending_changes: i32,
     #[serde(default)]
     is_stale: bool,
-    #[serde(default)]
-    kickoff_epoch: i64,
-}
-
-    #[serde(default)]
-    kickoff_epoch: i64,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -1418,6 +1414,7 @@ fn App() -> impl IntoView {
         leptos::task::spawn_local(async move {
             if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
                 if let Ok(info) = resp.json::<BlockInfo>().await {
+                    console_log!("FETCHED BLOCK INFO: {:?}", info);
                     selected_block.set(Some(info));
                 }
             }
@@ -1551,6 +1548,9 @@ fn App() -> impl IntoView {
             if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
                 if let Ok(mut sr) = resp.json::<SliceResponse>().await {
                     sr.fetch_ms = js_sys::Date::now() - start;
+                    if let Some(first) = sr.rows.first() {
+                        console_log!("SLICE DATA (first row): {:?}", first);
+                    }
                     slice_data.set(Some(sr));
                 }
             }
