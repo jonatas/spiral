@@ -224,7 +224,6 @@ struct ChangelogEntry {
     t_start: i64,
     t_end: i64,
 }
-
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 struct BlockInfo {
     blkno: i32,
@@ -240,6 +239,10 @@ struct BlockInfo {
     pending_changes: i32,
     #[serde(default)]
     is_stale: bool,
+    #[serde(default)]
+    kickoff_epoch: i64,
+}
+
     #[serde(default)]
     kickoff_epoch: i64,
 }
@@ -1459,9 +1462,11 @@ fn App() -> impl IntoView {
         let stats = current_stats.get();
         let s_kickoff = stats.kickoff_epoch;
         
-        // If we have a selected block with actual time, we can infer the real kickoff
-        // kickoff = actual_time - relative_time
+        // If we have a selected block with actual time or explicit kickoff, we can infer the real kickoff
         if let Some(b) = selected_block.get() {
+            if b.kickoff_epoch > 0 && b.kickoff_epoch != PG_EPOCH {
+                return b.kickoff_epoch;
+            }
             if b.t_actual_start > 0 {
                 let inferred = b.t_actual_start - b.t_range[0];
                 if inferred > 0 {
