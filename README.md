@@ -75,8 +75,9 @@ WHERE risk_factor > 3.0; -- Instant detection of extreme anomalies
 ---
 
 ### 3. Multi-Dimensional Clustering (Z-Order)
-Spiral solves the "Composite Index Trap" by interleaving the bits of Time and Tenant IDs into a single dimension.
+Spiral solves the "Composite Index Trap" by interleaving the bits of Time and Tenant IDs into a single dimension using a high-precision **128-bit Morton curve**.
 
+- **Full Precision**: Utilizes the full 64-bit bit-budget for both Time and Tenant hashes, eliminating the "Year 2106" overflow problem.
 - **Fair Performance**: Queries filtering only by Time, only by Tenant, or both, all benefit from the same index.
 - **Support for All Types**: Automatically hashes string-based dimensions (like `symbol`) for bit-interleaving.
 - **13x Speedup**: Benchmarks show significant I/O reduction for multi-tenant range queries compared to traditional `(tenant_id, time)` indexes.

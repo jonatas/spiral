@@ -50,12 +50,7 @@ pub fn decode_zorder_2d(z: u128) -> (u64, u64) {
 /// Generates a set of Z-ranges that cover a 2D box.
 /// Uses recursive quadrant decomposition to identify which 1D segments
 /// intersect with the target multidimensional box.
-pub fn generate_z_ranges_2d(
-    min_x: u64,
-    min_y: u64,
-    max_x: u64,
-    max_y: u64,
-) -> Vec<(u128, u128)> {
+pub fn generate_z_ranges_2d(min_x: u64, min_y: u64, max_x: u64, max_y: u64) -> Vec<(u128, u128)> {
     let mut ranges = Vec::new();
     decompose_quadrant(0, 0, 64, min_x, min_y, max_x, max_y, &mut ranges);
     ranges
@@ -71,7 +66,11 @@ fn decompose_quadrant(
     max_y: u64,
     ranges: &mut Vec<(u128, u128)>,
 ) {
-    let side = if level == 64 { u64::MAX } else { (1u64 << level).wrapping_sub(1) };
+    let side = if level == 64 {
+        u64::MAX
+    } else {
+        (1u64 << level).wrapping_sub(1)
+    };
     let x_end = x.saturating_add(side);
     let y_end = y.saturating_add(side);
 
@@ -100,9 +99,36 @@ fn decompose_quadrant(
 
     // Subdivide into 4 quadrants in Morton order
     decompose_quadrant(x, y, next_level, min_x, min_y, max_x, max_y, ranges);
-    decompose_quadrant(x + next_side, y, next_level, min_x, min_y, max_x, max_y, ranges);
-    decompose_quadrant(x, y + next_side, next_level, min_x, min_y, max_x, max_y, ranges);
-    decompose_quadrant(x + next_side, y + next_side, next_level, min_x, min_y, max_x, max_y, ranges);
+    decompose_quadrant(
+        x + next_side,
+        y,
+        next_level,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        ranges,
+    );
+    decompose_quadrant(
+        x,
+        y + next_side,
+        next_level,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        ranges,
+    );
+    decompose_quadrant(
+        x + next_side,
+        y + next_side,
+        next_level,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        ranges,
+    );
 }
 
 #[pg_extern(immutable, parallel_safe)]
@@ -110,7 +136,7 @@ pub fn spiral_zorder_contained_by(z: AnyNumeric, b: pg_sys::BOX) -> bool {
     let z_str = z.to_string();
     let z_val = u128::from_str_radix(z_str.as_str(), 10).unwrap_or(0);
     let (x, y) = decode_zorder_2d(z_val);
-    
+
     // Postgres BOX: high is (max_x, max_y), low is (min_x, min_y)
     let b_low_x = b.low.x as u64;
     let b_high_x = b.high.x as u64;
@@ -245,7 +271,7 @@ mod tests {
         // In Morton order: (0,0)->0, (1,0)->2, (0,1)->1, (1,1)->3
         // So the range should be [0, 3] if contiguous or discrete.
         let ranges = generate_z_ranges_2d(0, 0, 1, 1);
-        
+
         // Decompose quadrant will find the 2x2 block and return it as one range [0, 3]
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], (0, 3));

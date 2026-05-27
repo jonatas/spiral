@@ -139,7 +139,8 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
             }
 
             let idx = (blkno as i64 * crate::storage::DATA_PER_PAGE as i64) + (posid as i64 - 1);
-            let t = idx / tenant_scale;
+            let kickoff = crate::get_kickoff_epoch();
+            let t = (idx / tenant_scale) + kickoff;
             let tenant_id = (idx % tenant_scale) as i32;
 
             pg_sys::ExecClearTuple(slot);
@@ -345,41 +346,39 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
         let t_rel = t - kickoff;
 
         if t_rel >= 0 && (0..tenant_scale).contains(&(tid as i64)) {
-            let logical_offset = (t_rel * tenant_scale * 8) + (tid as i64 * 8);
-            let (blkno, page_offset) = crate::storage::logical_to_physical_offset(logical_offset);
+            let index = (t_rel * tenant_scale) + (tid as i64);
+            let (blkno, page_offset) = crate::storage::logical_to_physical_offset(index);
 
             let smgr = pg_sys::RelationGetSmgr(rel);
             let mut nblocks = pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
 
-            // 1. Initialize missing pages with WAL logging
+            // 1. Initialize missing pages
             while nblocks <= blkno {
-                let state = pg_sys::GenericXLogStart(rel);
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
-
-                let page = pg_sys::GenericXLogRegisterBuffer(
-                    state,
-                    buffer,
-                    pg_sys::GENERIC_XLOG_FULL_IMAGE as i32,
-                );
+                let page = pg_sys::BufferGetPage(buffer);
                 crate::storage::initialize_spiral_page(page, tenant_scale as i32);
-
-                pg_sys::GenericXLogFinish(state);
+                pg_sys::MarkBufferDirty(buffer);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                 pg_sys::ReleaseBuffer(buffer);
                 nblocks += 1;
             }
 
-            // 2. Perform point insertion with WAL logging
-            let xlog_state = pg_sys::GenericXLogStart(rel);
+            // 2. Perform point insertion
             let buffer = pg_sys::ReadBuffer(rel, blkno);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
 
-            let page = pg_sys::GenericXLogRegisterBuffer(xlog_state, buffer, 0);
+            let page = pg_sys::BufferGetPage(buffer);
             let ptr = (page as *mut u8).add(page_offset as usize);
             *(ptr as *mut f64) = v;
 
-            pg_sys::GenericXLogFinish(xlog_state);
+            pg_sys::ItemPointerSet(
+                &mut (*slot).tts_tid,
+                blkno,
+                ((page_offset - crate::storage::HEADER_SIZE as u32) / 8 + 1) as u16,
+            );
+
+            pg_sys::MarkBufferDirty(buffer);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
             pg_sys::ReleaseBuffer(buffer);
         }
@@ -450,17 +449,14 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
         return pg_sys::TM_Result::TM_Ok;
     }
 
-    let state = pg_sys::GenericXLogStart(rel);
     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
-    let page = pg_sys::GenericXLogRegisterBuffer(state, buffer, 0);
+    let page = pg_sys::BufferGetPage(buffer);
 
     if crate::storage::is_valid_spiral_page(page) {
         let offset = (crate::storage::HEADER_SIZE as u32) + (posid as u32 - 1) * 8;
         let ptr = (page as *mut u8).add(offset as usize);
         *(ptr as *mut f64) = 0.0;
-        pg_sys::GenericXLogFinish(state);
-    } else {
-        pg_sys::GenericXLogAbort(state);
+        pg_sys::MarkBufferDirty(buffer);
     }
 
     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
@@ -885,7 +881,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                     * crate::storage::DATA_PER_PAGE as i64)
                     + items_before as i64;
 
-                let t = idx / state.tenant_scale;
+                let kickoff = crate::get_kickoff_epoch();
+                let t = (idx / state.tenant_scale) + kickoff;
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
                 pg_sys::ExecClearTuple(slot);
@@ -1038,7 +1035,8 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64)
                     + items_before as i64;
 
-                let t = idx / state.tenant_scale;
+                let kickoff = crate::get_kickoff_epoch();
+                let t = (idx / state.tenant_scale) + kickoff;
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
                 pg_sys::ExecClearTuple(slot);

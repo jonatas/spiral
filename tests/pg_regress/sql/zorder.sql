@@ -1,6 +1,7 @@
 LOAD 'spiral';
 SET spiral.kickoff_date = '2026-04-15';
 
+DROP TABLE IF EXISTS multi_tenant CASCADE;
 CREATE TABLE multi_tenant (
     t timestamptz NOT NULL,
     tenant_id text NOT NULL,
@@ -21,6 +22,11 @@ SELECT pg_typeof(spiral_zorder(1, ARRAY['a']::text[]));
 
 -- Verify non-wrapping beyond 2^32
 SELECT spiral_zorder(0, ARRAY['a']::text[]) = spiral_zorder(4294967296, ARRAY['a']::text[]) as should_be_false;
+
+-- Verify Hilbert 2D return type and basic locality
+SELECT pg_typeof(spiral_hilbert_2d(1, 1)) as h_type;
+-- (0,0) -> 0, (1,0) -> 1, (1,1) -> 2, (0,1) -> 3
+SELECT spiral_hilbert_2d(0, 0) < spiral_hilbert_2d(1, 0) as h_mono;
 
 -- Check metadata
 SELECT view_name, scope_columns 

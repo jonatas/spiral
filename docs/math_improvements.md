@@ -1,14 +1,30 @@
 
-## 11.3 Decoding the Z-Value Formula
-The interleaved Z-value calculation can be expressed as a summation of bits. Let's break down the variables to understand how we map 2D space into a 1D line:
+## 11.3 High-Precision 128-bit Indexing
+Spiral has moved from 64-bit to **128-bit Morton (Z-order) and Hilbert curves**. This transition provides several critical advantages for high-frequency time-series data:
+
+### A. Removal of the 32-bit Timestamp Truncation
+Previously, timestamps were truncated to 32 bits, which limited the temporal range of the index (the "Year 2106" problem) and caused bit collisions in long-lived datasets. Spiral now utilizes the full **64-bit precision** of the Unix epoch timestamp.
+
+### B. Expanded Dimensionality
+With a 128-bit bit-budget, Spiral can interleave:
+- **Time**: 64 bits (full range)
+- **Space/Dimensions**: 64 bits (high-entropy hashes)
+
+This allows for nearly infinite temporal range while maintaining extremely high entropy for tenant and dimension identification, drastically reducing index collisions in multi-tenant environments.
+
+### C. Performance & Type Alignment
+The 128-bit Z-values are stored as PostgreSQL **NUMERIC** types. While slightly larger than `bigint`, this allows Spiral to leverage standard B-tree indexing while preserving the full mathematical precision of the space-filling curve.
+
+## 11.4 Decoding the Z-Value Formula (128-bit Precision)
+The interleaved Z-value calculation can be expressed as a summation of bits. Spiral now utilizes a full **128-bit bit-budget** to support high-precision indexing without truncation.
 
 <div class="math-formula">
 \[ \text{Z}(x, y) = \sum_{i=0}^{n-1} (x_i \cdot 2^{2i+1} + y_i \cdot 2^{2i}) \]
 </div>
 
-- **\(x_i, y_i\)**: These represent the individual bits of your coordinates (e.g., Time and Tenant ID).
-- **\(2^{2i+1}\) and \(2^{2i}\)**: These powers of 2 act as "masks" that shift the bits into their new interleaved positions.
-- **The Result**: A single scalar that increases as you move along the Morton Curve, ensuring that points with similar bit patterns (close in 2D) have similar Z-values (close on disk).
+- **\(x_i, y_i\)**: These represent the individual bits of your coordinates. Spiral uses the full **64 bits** of the timestamp (\(x\)) and a **64-bit hash** of the spatial dimensions (\(y\)).
+- **\(2^{2i+1}\) and \(2^{2i}\)**: These powers of 2 act as "masks" that shift the bits into their new interleaved positions, creating a 128-bit scalar result.
+- **The Result**: A single `NUMERIC` scalar that increases as you move along the Morton Curve. This move from 64-bit to 128-bit Z-values eliminates the "Year 2106" overflow problem and provides nearly infinite temporal range.
 
 ---
 

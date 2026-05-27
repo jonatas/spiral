@@ -1159,6 +1159,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                         col_types.insert(name.clone(), typ.clone());
                                     }
 
+                                    // 1. Maintain original column positions
                                     for (c, _typ) in &base_table_columns {
                                         if c == "t" {
                                             continue;
@@ -1169,6 +1170,15 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                             cols.push((c.clone(), agg.clone()));
                                         } else {
                                             cols.push((c.clone(), None));
+                                        }
+                                    }
+                                    
+                                    // 2. Append additional expressions (e.g. price * vol)
+                                    for (c, agg) in &query_cols {
+                                        if !base_table_columns.iter().any(|(bc, _)| bc == c) && c != "t" {
+                                            if !cols.iter().any(|(cc, _)| cc == c) {
+                                                cols.push((c.clone(), agg.clone()));
+                                            }
                                         }
                                     }
 

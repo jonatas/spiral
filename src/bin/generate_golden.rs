@@ -72,7 +72,7 @@ fn main() {
     let ohlcv_volume = values.iter().sum();
 
     // Z-Order reference (128-bit)
-    // We can't easily call crate::zorder here without complex setup, 
+    // We can't easily call crate::zorder here without complex setup,
     // so we'll implement a simple reference check for bit-stability.
     fn spread_64(x: u64) -> u128 {
         let mut res: u128 = x as u128;
