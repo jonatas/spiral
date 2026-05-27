@@ -1244,8 +1244,8 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
                                             Ok::<(), spi::Error>(())
                                         }).unwrap_or(());
 
-                                        // Rewrite top-level aggregates to their merge equivalents
-                                        rewrite_query_aggregates(query, &column_formulas, varno);
+                                        // Rewrite top-level aggregates to their merge equivalents using indexed columns
+                                        rewrite_query_aggregates(query, &base_table, rtable, &cols, varno);
                                         // Neutralize consumed constraints from the outer query to avoid double verification.
                                         if let Some(qc) = constraint_map.get(&varno) {
                                             if let Some(node) = qc.start_node {
@@ -2080,222 +2080,122 @@ fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
 
 pub(crate) unsafe fn rewrite_query_aggregates(
     query: *mut pg_sys::Query,
-    column_formulas: &std::collections::HashMap<String, String>,
+    base_table: &str,
+    rtable: *mut pg_sys::List,
+    detected_cols: &[(String, Option<String>)],
     varno: i32,
 ) {
     if !(*query).hasAggs {
         return;
     }
-    let target_list = (*query).targetList;
-    if target_list.is_null() {
-        return;
-    }
 
     let oids = [
         Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_stats_merge' AND pronargs = 1",
+            \"SELECT oid FROM pg_proc WHERE proname = 'spiral_stats_merge' AND pronargs = 1\",
         )
         .unwrap_or(None),
         Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_tdigest_merge' AND pronargs = 1",
+            \"SELECT oid FROM pg_proc WHERE proname = 'spiral_tdigest_merge' AND pronargs = 1\",
         )
         .unwrap_or(None),
         Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_sketch_merge' AND pronargs = 1",
+            \"SELECT oid FROM pg_proc WHERE proname = 'spiral_sketch_merge' AND pronargs = 1\",
         )
         .unwrap_or(None),
         Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_avg' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_count' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_sum' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_ohlcv_merge' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_open' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_high' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_low' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_close' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_volume' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_min' AND pronargs = 1",
-        )
-        .unwrap_or(None),
-        Spi::get_one::<pg_sys::Oid>(
-            "SELECT oid FROM pg_proc WHERE proname = 'spiral_max' AND pronargs = 1",
+            \"SELECT oid FROM pg_proc WHERE proname = 'spiral_ohlcv_merge' AND pronargs = 1\",
         )
         .unwrap_or(None),
     ];
 
     unsafe fn walk_and_rewrite(
         node: *mut pg_sys::Node,
-        column_formulas: &std::collections::HashMap<String, String>,
+        base_table: &str,
         rtable: *mut pg_sys::List,
-        oids: &[Option<pg_sys::Oid>],
+        detected_cols: &[(String, Option<String>)],
         varno: i32,
+        oids: &[Option<pg_sys::Oid>],
     ) {
         if node.is_null() {
             return;
         }
+
         if (*node).type_ == pg_sys::NodeTag::T_Aggref {
             let agg = node as *mut pg_sys::Aggref;
             let agg_fn_ptr = pg_sys::get_func_name((*agg).aggfnoid);
-            if !agg_fn_ptr.is_null() {
-                let agg_fn = CStr::from_ptr(agg_fn_ptr).to_string_lossy().to_lowercase();
-                let mut formula = "sum".to_string();
-                let mut is_json_target = false;
-                if (*agg).aggstar && agg_fn == "count" {
-                    formula = "count".to_string();
-                } else if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
-                    let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
-                    let mut expr = (*arg).expr as *mut pg_sys::Node;
-                    while !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_OpExpr {
-                        let op = expr as *mut pg_sys::OpExpr;
-                        if (*op).args.is_null() || (*(*op).args).length != 2 {
-                            break;
-                        }
-                        let l = pg_sys::list_nth((*op).args, 0) as *mut pg_sys::Node;
-                        let r = pg_sys::list_nth((*op).args, 1) as *mut pg_sys::Node;
-                        if (*l).type_ == pg_sys::NodeTag::T_Var {
-                            expr = l;
-                        } else if (*r).type_ == pg_sys::NodeTag::T_Var {
-                            expr = r;
-                        } else {
-                            break;
-                        }
-                    }
-                    if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
-                        let var = expr as *mut pg_sys::Var;
-                        if (*var).varno > 0 && (*var).varno as usize <= (*rtable).length as usize {
-                            let rte = pg_sys::list_nth(rtable, (*var).varno as i32 - 1)
-                                as *mut pg_sys::RangeTblEntry;
-                            let varname_ptr = pg_sys::get_rte_attribute_name(rte, (*var).varattno);
-                            if !varname_ptr.is_null() {
-                                let name = CStr::from_ptr(varname_ptr).to_string_lossy();
-                                if let Some(f) = column_formulas.get(name.as_ref()) {
-                                    formula = f.clone();
-                                }
-                                pg_sys::pfree(varname_ptr as *mut std::ffi::c_void);
-                            }
-                        }
-                        if (*var).vartype == pg_sys::JSONBOID {
-                            is_json_target = true;
-                        }
-                    }
-                }
-                let new_oid = if (*agg).aggstar && agg_fn == "count" {
-                    oids[4]
-                } else if formula == "ohlcv" {
-                    match agg_fn.as_ref() {
-                        "first" => oids[7],
-                        "last" => oids[10],
-                        "max" => oids[8],
-                        "min" => oids[9],
-                        "sum" => oids[11],
-                        "spiral_ohlcv" | "spiral_ohlcv_merge" => oids[6],
-                        _ => None,
-                    }
-                } else if formula == "stats" {
-                    match agg_fn.as_ref() {
-                        "avg" => oids[3],
-                        "count" => oids[4],
-                        "sum" => oids[5],
-                        "min" => oids[12],
-                        "max" => oids[13],
-                        "spiral_stats" | "spiral_stats_merge" => oids[0],
-                        _ => None,
-                    }
-                } else {
-                    match agg_fn.as_ref() {
-                        "avg" if is_json_target => oids[3],
-                        "count" if is_json_target => oids[4],
-                        "sum" if is_json_target => oids[5],
-                        "min" if is_json_target => oids[12],
-                        "max" if is_json_target => oids[13],
-                        _ => None,
-                    }
-                };
+            if agg_fn_ptr.is_null() {
+                return;
+            }
+            let agg_fn = CStr::from_ptr(agg_fn_ptr).to_string_lossy().to_lowercase();
 
-                if let Some(oid) = new_oid {
-                    (*agg).aggfnoid = oid;
-                    if (*agg).aggstar {
-                        use std::os::raw::c_void;
-                        (*agg).aggstar = false;
-                        let var =
-                            pg_sys::makeVar(varno, 2, pg_sys::JSONBOID, -1, pg_sys::InvalidOid, 0);
-                        let tle = pg_sys::makeTargetEntry(
-                            var as *mut pg_sys::Expr,
-                            1,
-                            std::ptr::null_mut(),
-                            false,
-                        );
-                        (*agg).args = pg_sys::lappend(std::ptr::null_mut(), tle as *mut c_void);
-                    } else if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
-                        let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
-                        let mut expr = (*arg).expr as *mut pg_sys::Node;
-                        while !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_OpExpr {
-                            let op = expr as *mut pg_sys::OpExpr;
-                            if (*op).args.is_null() || (*(*op).args).length != 2 {
-                                break;
-                            }
-                            let l = pg_sys::list_nth((*op).args, 0) as *mut pg_sys::Node;
-                            let r = pg_sys::list_nth((*op).args, 1) as *mut pg_sys::Node;
-                            if (*l).type_ == pg_sys::NodeTag::T_Var {
-                                expr = l;
-                            } else if (*r).type_ == pg_sys::NodeTag::T_Var {
-                                expr = r;
-                            } else {
-                                break;
-                            }
-                        }
-                        if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
-                            let var = expr as *mut pg_sys::Var;
-                            let is_json_target_rewrite = matches!(
-                                agg_fn.as_ref(),
-                                "avg"
-                                    | "count"
-                                    | "sum"
-                                    | "min"
-                                    | "max"
-                                    | "spiral_stats"
-                                    | "spiral_tdigest"
-                                    | "spiral_sketch"
-                                    | "spiral_ohlcv"
-                            ) || (formula == "ohlcv"
-                                && matches!(agg_fn.as_ref(), "first" | "last"));
-                            if is_json_target_rewrite {
-                                (*var).vartype = pg_sys::JSONBOID;
-                                (*var).vartypmod = -1;
-                            }
-                        }
-                        if agg_fn == "first" || agg_fn == "last" {
-                            (*agg).args = pg_sys::lappend(std::ptr::null_mut(), arg as *mut _);
-                        }
-                    }
+            // 1. Identify the column/expression and aggregate function
+            let mut current_cols = Vec::new();
+            if !walk_expr(node, base_table, rtable, &mut current_cols) {
+                return;
+            }
+            if current_cols.is_empty() {
+                return;
+            }
+            let (expr_str, found_agg) = &current_cols[0];
+            if found_agg.as_ref().map(|s| s.as_str()) != Some(agg_fn.as_str()) {
+                return;
+            }
+
+            // 2. Find the index in detected_cols
+            if let Some(idx) = detected_cols
+                .iter()
+                .position(|(c, a)| c == expr_str && a.as_ref() == found_agg.as_ref())
+            {
+                let attno = (idx + 2) as i16;
+                
+                // Determine if it's a state column by checking if it was mapped in sources
+                let formula = Spi::get_one_with_args::<String>(
+                    \"SELECT formula FROM spiral.sources WHERE base_view = $1 AND base_column = $2 LIMIT 1\",
+                    vec![
+                        (pg_sys::TEXTOID, base_table.into_datum()),
+                        (pg_sys::TEXTOID, expr_str.into_datum()),
+                    ]
+                ).unwrap_or(None).unwrap_or_else(|| \"sum\".to_string());
+
+                let mut new_fn_oid = None;
+                let mut is_json_target = false;
+                if formula == \"ohlcv\" {
+                    new_fn_oid = oids[3];
+                    is_json_target = true;
+                } else if formula == \"stats\" {
+                    new_fn_oid = oids[0];
+                    is_json_target = true;
+                } else if formula == \"tdigest\" {
+                    new_fn_oid = oids[1];
+                    is_json_target = true;
+                } else if formula == \"sketch\" {
+                    new_fn_oid = oids[2];
+                    is_json_target = true;
                 }
+
+                if let Some(oid) = new_fn_oid {
+                    (*agg).aggfnoid = oid;
+                }
+
+                // 3. Replace arguments with a Var pointing to the subquery column
+                let var = pg_sys::makeVar(
+                    varno,
+                    attno,
+                    if is_json_target { pg_sys::JSONBOID } else { (*agg).aggtype },
+                    -1,
+                    pg_sys::InvalidOid,
+                    0,
+                );
+                
+                let tle = pg_sys::makeTargetEntry(
+                    var as *mut pg_sys::Expr,
+                    1,
+                    std::ptr::null_mut(),
+                    false,
+                );
+                
+                (*agg).args = pg_sys::lappend(std::ptr::null_mut(), tle as *mut std::os::raw::c_void);
+                (*agg).aggstar = false;
             }
         } else if (*node).type_ == pg_sys::NodeTag::T_FuncExpr {
             let f = node as *mut pg_sys::FuncExpr;
@@ -2303,10 +2203,11 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                 for i in 0..(*(*f).args).length {
                     walk_and_rewrite(
                         pg_sys::list_nth((*f).args, i) as *mut pg_sys::Node,
-                        column_formulas,
+                        base_table,
                         rtable,
-                        oids,
+                        detected_cols,
                         varno,
+                        oids,
                     );
                 }
             }
@@ -2316,25 +2217,30 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                 for i in 0..(*(*o).args).length {
                     walk_and_rewrite(
                         pg_sys::list_nth((*o).args, i) as *mut pg_sys::Node,
-                        column_formulas,
+                        base_table,
                         rtable,
-                        oids,
+                        detected_cols,
                         varno,
+                        oids,
                     );
                 }
             }
         }
     }
 
-    for i in 0..(*target_list).length {
-        let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
-        walk_and_rewrite(
-            (*tle).expr as *mut pg_sys::Node,
-            column_formulas,
-            (*query).rtable,
-            &oids,
-            varno,
-        );
+    let target_list = (*query).targetList;
+    if !target_list.is_null() {
+        for i in 0..(*target_list).length {
+            let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+            walk_and_rewrite(
+                (*tle).expr as *mut pg_sys::Node,
+                base_table,
+                rtable,
+                detected_cols,
+                varno,
+                &oids,
+            );
+        }
     }
 }
 
@@ -2714,28 +2620,28 @@ fn construct_union_sql_hierarchical(
             std::collections::HashSet::new()
         };
         let mut inner_select = Vec::new();
-        inner_select.push("t::timestamptz".to_string());
-        for (col, agg) in cols {
-            let orig_type = col_types.get(col).map(|s| s.as_str()).unwrap_or("");
+        inner_select.push(\"t::timestamptz\".to_string());
+        for (i, (col, agg)) in cols.iter().enumerate() {
+            let orig_type = col_types.get(col).map(|s| s.as_str()).unwrap_or(\"\");
             if let Some(agg_fn) = agg {
                 let (formula_for_col, mapped) = if is_rollup {
                     Spi::connect(|client| -> Result<(String, String), spi::Error> {
-                        let formula_filter = match agg_fn.to_lowercase().as_str() { "spiral_stats" | "spiral_stats_merge" | "avg" => "stats", "spiral_tdigest" | "spiral_tdigest_merge" => "tdigest", "spiral_sketch" | "spiral_sketch_merge" => "sketch", "first" | "last" => "ohlcv", "sum" | "min" | "max" => "sum", "count" => "stats", _ => "" };
-                        let mut sql = if formula_filter.is_empty() { format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1", src.replace("'", "''"), col.replace("'", "''")) }
-                                      else { format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' AND (formula = '{}' OR formula = 'ohlcv') LIMIT 1", src.replace("'", "''"), col.replace("'", "''"), formula_filter) };
+                        let formula_filter = match agg_fn.to_lowercase().as_str() { \"spiral_stats\" | \"spiral_stats_merge\" | \"avg\" => \"stats\", \"spiral_tdigest\" | \"spiral_tdigest_merge\" => \"tdigest\", \"spiral_sketch\" | \"spiral_sketch_merge\" => \"sketch\", \"first\" | \"last\" => \"ohlcv\", \"sum\" | \"min\" | \"max\" => \"sum\", \"count\" => \"stats\", _ => \"\" };
+                        let mut sql = if formula_filter.is_empty() { format!(\"SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1\", src.replace(\"'\", \"''\"), col.replace(\"'\", \"''\")) }
+                                      else { format!(\"SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' AND (formula = '{}' OR formula = 'ohlcv') LIMIT 1\", src.replace(\"'\", \"''\"), col.replace(\"'\", \"''\"), formula_filter) };
                         let mut rows = client.select(&sql, Some(1), &[])?;
-                        if rows.is_empty() && !formula_filter.is_empty() { sql = format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1", src.replace("'", "''"), col.replace("'", "''")); rows = client.select(&sql, Some(1), &[])?; }
+                        if rows.is_empty() && !formula_filter.is_empty() { sql = format!(\"SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1\", src.replace(\"'\", \"''\"), col.replace(\"'\", \"''\")); rows = client.select(&sql, Some(1), &[])?; }
                         if let Some(row) = rows.next() { return Ok((row.get::<String>(1)?.unwrap_or_default(), row.get::<String>(2)?.unwrap_or_default())); }
                         Ok((String::new(), col.clone()))
                     }).unwrap_or_else(|_| (String::new(), col.clone()))
                 } else {
                     (String::new(), col.clone())
                 };
-                if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) {
+                if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) && !rollup_cols.contains(&mapped) {
                     inner_select.push(if orig_type.is_empty() {
-                        format!("NULL AS \"{}\"", col)
+                        format!(\"NULL AS \\\"spiral_col_{}\\\"\", i)
                     } else {
-                        format!("NULL::{} AS \"{}\"", orig_type, col)
+                        format!(\"NULL::{} AS \\\"spiral_col_{}\\\"\", orig_type, i)
                     });
                     continue;
                 }
@@ -2747,39 +2653,39 @@ fn construct_union_sql_hierarchical(
                 let is_json_target =
                     matches!(
                         agg_fn.to_lowercase().as_str(),
-                        "spiral_stats"
-                            | "spiral_tdigest"
-                            | "spiral_sketch"
-                            | "spiral_ohlcv"
-                            | "spiral_stats_merge"
-                            | "spiral_tdigest_merge"
-                            | "spiral_sketch_merge"
-                            | "spiral_ohlcv_merge"
-                    ) || (matches!(agg_fn.to_lowercase().as_str(), "sum" | "count" | "avg")
-                        && (formula_for_col == "stats"
-                            || formula_for_col == "ohlcv"
+                        \"spiral_stats\"
+                            | \"spiral_tdigest\"
+                            | \"spiral_sketch\"
+                            | \"spiral_ohlcv\"
+                            | \"spiral_stats_merge\"
+                            | \"spiral_tdigest_merge\"
+                            | \"spiral_sketch_merge\"
+                            | \"spiral_ohlcv_merge\"
+                    ) || (matches!(agg_fn.to_lowercase().as_str(), \"sum\" | \"count\" | \"avg\")
+                        && (formula_for_col == \"stats\"
+                            || formula_for_col == \"ohlcv\"
                             || !is_rollup));
                 inner_select.push(if !orig_type.is_empty() && !is_json_target {
-                    format!("({})::{} AS \"{}\"", col_expr, orig_type, col)
+                    format!(\"({})::{} AS \\\"spiral_col_{}\\\"\", col_expr, orig_type, i)
                 } else {
-                    format!("{} AS \"{}\"", col_expr, col)
+                    format!(\"{} AS \\\"spiral_col_{}\\\"\", col_expr, i)
                 });
             } else {
-                if col == "t" {
+                if col == \"t\" {
                     continue;
                 }
                 let col_sql = if is_rollup && !rollup_cols.contains(col.as_str()) {
                     if orig_type.is_empty() {
-                        format!("NULL AS \"{}\"", col)
+                        format!(\"NULL AS \\\"spiral_col_{}\\\"\", i)
                     } else {
-                        format!("NULL::{} AS \"{}\"", orig_type, col)
+                        format!(\"NULL::{} AS \\\"spiral_col_{}\\\"\", orig_type, i)
                     }
                 } else if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) {
                     reconstruction_expr(col, &oc.formula, is_rollup)
                 } else if is_rollup && !orig_type.is_empty() {
-                    format!("\"{}\"::{} AS \"{}\"", col, orig_type, col)
+                    format!(\"\\\"{}\\\"::{} AS \\\"spiral_col_{}\\\"\", col, orig_type, i)
                 } else {
-                    format!("\"{}\"", col)
+                    format!(\"\\\"{}\\\" AS \\\"spiral_col_{}\\\"\", col, i)
                 };
                 inner_select.push(col_sql);
             }

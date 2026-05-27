@@ -704,6 +704,13 @@ struct SpiralScanState {
     curr_offset_idx: i32,
 }
 
+    // Bitmap scan state
+    tbm_res: pg_sys::TBMIterateResult,
+    offsets: [pg_sys::OffsetNumber; 1024], // Max tuples per page
+    noffsets: i32,
+    curr_offset_idx: i32,
+}
+
 #[repr(C)]
 struct SpiralScanDescData {
     base: pg_sys::TableScanDescData,
