@@ -244,10 +244,6 @@ struct BlockInfo {
     kickoff_epoch: i64,
 }
 
-    #[serde(default)]
-    kickoff_epoch: i64,
-}
-
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
     config
         .hierarchies
