@@ -16,6 +16,7 @@ Spiral uses a **Constraint Reasoning Engine** to transform standard SQL queries 
 | **Join Propagation** | `JOIN b ON a.tid = b.tid WHERE a.tid = 1` | Transitive Equality | ✅ Supported |
 | **Logical Unions** | `WHERE t < '1h' OR t > '5h'` | **Convex Hull** Bounding | ✅ Supported |
 | **IN Clauses** | `WHERE tenant_id IN (1, 2, 3)` | Set Membership | ✅ Supported |
+| **Spatial Boxes** | `WHERE spiral(t) @> box(p1, p2)` | Z-Order Quadrant Decomposition | ✅ Supported |
 
 ---
 
@@ -46,9 +47,6 @@ The following syntaxes currently trigger a fallback to the raw base table to mai
 - [ ] **Non-Linear Cross-Moments**:
     - *Example*: Support `SUM(price * volume)` by storing $\sum(x \cdot y)$ in the rollup.
     - *Reasoning*: Essential for financial metrics like VWAP (Volume Weighted Average Price).
-- [ ] **Hyper-box Containment Operators**:
-    - *Example*: `zorder_col <@ box(p1, p2)`
-    - *Reasoning*: Moving beyond `BETWEEN` to true geometric skip-scans for Z-order curves.
 
 ### Priority: Low (Niche Features)
 - [ ] **Filter-Clause Lifting**:

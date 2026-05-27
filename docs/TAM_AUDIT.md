@@ -24,7 +24,7 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 | `scan_rescan` | **Implemented** | Resets scan pointers. |
 | `scan_set_tidrange` | **Placeholder** | No-op. Required for `TID Scan`. |
 | `scan_getnextslot_tidrange` | **Partial** | Calls standard `scan_getnextslot`. |
-| `scan_bitmap_next_tuple` | **Unsupported** | Returns `false`. Required for `Bitmap Scan`. |
+| `scan_bitmap_next_tuple` | **Implemented** | Iterates over `TBMIterator` for Bitmap Heap Scans. |
 | `scan_sample_next_block` | **Unsupported** | Returns `false`. Required for `TABLESAMPLE`. |
 | `scan_sample_next_tuple` | **Unsupported** | Returns `false`. Required for `TABLESAMPLE`. |
 
@@ -76,9 +76,8 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 
 ## Summary of Missing Semantics
 
-1.  **WAL Logging**: Not currently implemented. `GenericXLog` usage was attempted but reverted due to same-transaction visibility issues. Marked as TODO.
-2.  **MVCC**: Snapshot isolation is completely absent. The TAM currently reads the "current" state of blocks regardless of the transaction snapshot.
-3.  **Indices**: Index-organized access is not supported. Only sequential scans (accelerated by `SCAN_TIME_RANGE` in the planner) work.
+1.  **MVCC**: Snapshot isolation is completely absent. The TAM currently reads the "current" state of blocks regardless of the transaction snapshot. Updates are implemented as logical deletes and inserts, but visibility is strictly latest-wins.
+2.  **TABLESAMPLE**: `TABLESAMPLE` clauses are currently unsupported.
 
 ## Roadmap
 
@@ -87,5 +86,5 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 - [x] Implement `relation_vacuum` and `ANALYZE` support.
 - [x] Implement parallel scan support.
 - [x] Implement `index_build_range_scan` and fetch callbacks for standard indices.
-- [ ] Add `GenericXLog` support to point-in-time operations for durability.
-- [ ] Implement `scan_bitmap_next_tuple` for Bitmap Scan support.
+- [x] Add `GenericXLog` support to point-in-time operations for durability.
+- [x] Implement `scan_bitmap_next_tuple` for Bitmap Scan support.

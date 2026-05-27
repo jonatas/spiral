@@ -67,12 +67,14 @@ Either way, the implementation needs explicit semantics, test coverage, and benc
 - `docs/BENCHMARK.md`
 - `README.md`
 
-## 3. Complete or narrow the TAM implementation surface [PARTIALLY DONE]
+## 3. Complete or narrow the TAM implementation surface [DONE]
 
-**Status Update (2026-05-25):**
-- Implemented `tuple_insert` for functional basic inserts.
-- Added basic `ANALYZE` support via `relation_estimate_size`.
-- Updated `docs/TAM_AUDIT.md` with current status.
+**Status Update (2026-05-27):**
+- Completed `tuple_insert`, `tuple_update`, and `tuple_delete`.
+- Re-implemented and verified `GenericXLog` for durable WAL logging.
+- Integrated `scan_bitmap_next_tuple` to enable standard index usage (B-Tree, Z-order) via Bitmap Heap Scans.
+- Verified parallel sequential scans.
+- Updated `docs/TAM_AUDIT.md` with final status.
 
 **Title**
 `tam: audit unimplemented callbacks and define supported storage semantics`
