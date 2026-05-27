@@ -44,6 +44,7 @@ struct AggregationLevel {
 struct HierarchyConfig {
     base_view: String,
     raw_view_name: String,
+    #[serde(default)]
     time_column: String,
     aggregation_levels: Vec<AggregationLevel>,
     tenant_scale: i64,
@@ -1371,7 +1372,7 @@ fn App() -> impl IntoView {
                                         }
                                     }
                                 },
-                                Err(_) => {}
+                                Err(e) => console_log!("VortexEvent deserialization error: {}", e)
                             }
                         }
                     }
