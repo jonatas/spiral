@@ -555,7 +555,19 @@ fn spiral_register_view(
 }
 
 pub fn get_kickoff_epoch() -> i64 {
-    Spi::get_one::<i64>("SELECT spiral(COALESCE(NULLIF(current_setting('spiral.kickoff_date', true), ''), '2000-01-01')::timestamptz)").unwrap_or(Some(0)).unwrap_or(0)
+    let kickoff_str = Spi::get_one::<String>("SELECT current_setting('spiral.kickoff_date', true)")
+        .unwrap_or(None)
+        .unwrap_or_else(|| "2000-01-01".to_string());
+    
+    let kickoff_val = if kickoff_str.is_empty() { "2000-01-01".to_string() } else { kickoff_str };
+
+    Spi::connect(|client| {
+        let ts = client.select(&format!("SELECT '{}'::timestamptz", kickoff_val.replace("'", "''")), Some(1), &[])?
+            .first()
+            .get::<pgrx::datum::TimestampWithTimeZone>(1)?
+            .unwrap();
+        Ok::<i64, spi::Error>(spiral_to_epoch(ts))
+    }).unwrap_or(0)
 }
 
 pub fn get_minimal_pace() -> f64 {

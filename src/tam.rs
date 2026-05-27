@@ -304,7 +304,6 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
             continue;
         }
         let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-        warning!("Spiral: found column '{}'", name);
         let is_null = *(*slot).tts_isnull.add(i as usize);
         if is_null {
             continue;
@@ -351,35 +350,35 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
             let smgr = pg_sys::RelationGetSmgr(rel);
             let mut nblocks = pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
 
-            // 1. Initialize missing pages with WAL logging
+            // 1. Initialize missing pages
             while nblocks <= blkno {
-                let state = pg_sys::GenericXLogStart(rel);
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
 
-                let page = pg_sys::GenericXLogRegisterBuffer(
-                    state,
-                    buffer,
-                    pg_sys::GENERIC_XLOG_FULL_IMAGE as i32,
-                );
+                let page = pg_sys::BufferGetPage(buffer);
                 crate::storage::initialize_spiral_page(page, tenant_scale as i32);
 
-                pg_sys::GenericXLogFinish(state);
+                pg_sys::MarkBufferDirty(buffer);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                 pg_sys::ReleaseBuffer(buffer);
                 nblocks += 1;
             }
 
-            // 2. Perform point insertion with WAL logging
-            let xlog_state = pg_sys::GenericXLogStart(rel);
+            // 2. Perform point insertion
             let buffer = pg_sys::ReadBuffer(rel, blkno);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
 
-            let page = pg_sys::GenericXLogRegisterBuffer(xlog_state, buffer, 0);
+            let page = pg_sys::BufferGetPage(buffer);
             let ptr = (page as *mut u8).add(page_offset as usize);
             *(ptr as *mut f64) = v;
 
-            pg_sys::GenericXLogFinish(xlog_state);
+            pg_sys::ItemPointerSet(
+                &mut (*slot).tts_tid,
+                blkno,
+                ((page_offset - crate::storage::HEADER_SIZE as u32) / 8 + 1) as u16,
+            );
+
+            pg_sys::MarkBufferDirty(buffer);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
             pg_sys::ReleaseBuffer(buffer);
         }
@@ -450,17 +449,14 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
         return pg_sys::TM_Result::TM_Ok;
     }
 
-    let state = pg_sys::GenericXLogStart(rel);
     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
-    let page = pg_sys::GenericXLogRegisterBuffer(state, buffer, 0);
+    let page = pg_sys::BufferGetPage(buffer);
 
     if crate::storage::is_valid_spiral_page(page) {
         let offset = (crate::storage::HEADER_SIZE as u32) + (posid as u32 - 1) * 8;
         let ptr = (page as *mut u8).add(offset as usize);
         *(ptr as *mut f64) = 0.0;
-        pg_sys::GenericXLogFinish(state);
-    } else {
-        pg_sys::GenericXLogAbort(state);
+        pg_sys::MarkBufferDirty(buffer);
     }
 
     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
@@ -700,6 +696,12 @@ struct SpiralScanState {
     current_offset_in_page: u32,
     phsw: pg_sys::ParallelBlockTableScanWorkerData,
     read_stream: *mut pg_sys::ReadStream,
+
+    // Bitmap scan state
+    tbm_res: pg_sys::TBMIterateResult,
+    offsets: [pg_sys::OffsetNumber; 1024], // Max tuples per page
+    noffsets: i32,
+    curr_offset_idx: i32,
 }
 
 #[repr(C)]
@@ -753,15 +755,21 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
         }
     }
 
-    let smgr = pg_sys::RelationGetSmgr(rel);
-    let total_blks = pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
+    let smgr = unsafe { pg_sys::RelationGetSmgr(rel) };
+    let total_blks = unsafe { pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
+
+    let kickoff = crate::get_kickoff_epoch();
 
     // Consume the time range set by the planner hook (None → full scan).
     let time_range = crate::SCAN_TIME_RANGE.with(|r| r.take());
     let (scan_first_blk, scan_last_blk) = if let Some((ts, te)) = time_range {
         let dpg = crate::storage::DATA_PER_PAGE as i64;
-        let first = (ts.saturating_mul(tenant_scale) / dpg).max(0) as u32;
-        let last = ((te.saturating_mul(tenant_scale) / dpg) + 1)
+        let ts_rel = ts - kickoff;
+        let te_rel = te - kickoff;
+
+        // Calculate block bounds based on physical layout
+        let first = (ts_rel.saturating_mul(tenant_scale) / dpg).max(0) as u32;
+        let last = ((te_rel.saturating_mul(tenant_scale) / dpg) + 1)
             .min(total_blks as i64)
             .max(0) as u32;
         (first, last)
@@ -776,20 +784,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     (*state).scan_first_blk = scan_first_blk;
     (*state).scan_last_blk = scan_last_blk;
     (*state).current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+    (*state).curr_offset_idx = 0;
+    (*state).noffsets = 0;
+    (*state).read_stream = std::ptr::null_mut();
 
-    if pscan.is_null() {
-        // Sequential scan: use relation stream with callback
-        let stream = pg_sys::read_stream_begin_relation(
-            pg_sys::READ_STREAM_SEQUENTIAL as i32,
-            std::ptr::null_mut(),
-            rel,
-            pg_sys::ForkNumber::MAIN_FORKNUM,
-            Some(spiral_read_stream_next_block),
-            state as *mut std::ffi::c_void,
-            0,
-        );
-        (*state).read_stream = stream;
-    }
+    warning!("Spiral: scan_begin total_blks={} bounds=[{}, {})", total_blks, scan_first_blk, scan_last_blk);
 
     (*spiral_scan).state = state;
 
@@ -855,6 +854,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
         let page = pg_sys::BufferGetPage(buffer);
 
         if !crate::storage::is_valid_spiral_page(page) {
+            warning!("Spiral: scan encountered INVALID page at blkno {}", pg_sys::BufferGetBlockNumber(buffer));
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
             pg_sys::ReleaseBuffer(buffer);
             if state.read_stream.is_null() && pscan.is_null() {
@@ -948,7 +948,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
             let state = &mut *(*spiral_scan).state;
             state.current_blkno = state.scan_first_blk;
             state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
+            state.curr_offset_idx = 0;
+            state.noffsets = 0;
+
             if !state.read_stream.is_null() {
+
                 pg_sys::read_stream_reset(state.read_stream);
             }
         }
@@ -1143,13 +1147,78 @@ pub unsafe extern "C-unwind" fn spiral_index_validate_scan(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_scan_bitmap_next_tuple(
-    _scan: pg_sys::TableScanDesc,
-    _slot: *mut pg_sys::TupleTableSlot,
-    _recheck: *mut bool,
-    _lossy_pages: *mut u64,
-    _exact_pages: *mut u64,
+    scan: pg_sys::TableScanDesc,
+    slot: *mut pg_sys::TupleTableSlot,
+    recheck: *mut bool,
+    lossy_pages: *mut u64,
+    exact_pages: *mut u64,
 ) -> bool {
-    false
+    if scan.is_null() || slot.is_null() {
+        return false;
+    }
+
+    let spiral_scan = scan as *mut SpiralScanDescData;
+    let state = &mut *(*spiral_scan).state;
+    let rel = (*scan).rs_rd;
+
+    // Use the iterator from the scan descriptor
+    let tbm_iterator = &mut (*scan).st.rs_tbmiterator;
+
+    loop {
+        // 1. Move to next offset if we have some left in the current page
+        if state.curr_offset_idx < state.noffsets {
+            let posid = if state.tbm_res.lossy {
+                (state.curr_offset_idx + 1) as u16
+            } else {
+                state.offsets[state.curr_offset_idx as usize]
+            };
+            state.curr_offset_idx += 1;
+
+            let tid = pg_sys::ItemPointerData {
+                ip_blkid: pg_sys::BlockIdData {
+                    bi_hi: (state.tbm_res.blockno >> 16) as u16,
+                    bi_lo: (state.tbm_res.blockno & 0xffff) as u16,
+                },
+                ip_posid: posid,
+            };
+
+            // Fetch and reconstruct the tuple
+            if spiral_tuple_fetch_row_version(
+                rel,
+                &tid as *const _ as *mut _,
+                std::ptr::null_mut(),
+                slot,
+            ) {
+                if !recheck.is_null() {
+                    *recheck = state.tbm_res.recheck || state.tbm_res.lossy;
+                }
+                return true;
+            }
+            continue;
+        }
+
+        // 2. No more offsets in current page, get next page from bitmap
+        if !pg_sys::tbm_iterate(tbm_iterator, &mut state.tbm_res) {
+            return false;
+        }
+
+        state.curr_offset_idx = 0;
+        if state.tbm_res.lossy {
+            state.noffsets = crate::storage::DATA_PER_PAGE as i32;
+            if !lossy_pages.is_null() {
+                *lossy_pages += 1;
+            }
+        } else {
+            state.noffsets = pg_sys::tbm_extract_page_tuple(
+                &mut state.tbm_res,
+                state.offsets.as_mut_ptr(),
+                state.offsets.len() as u32,
+            );
+            if !exact_pages.is_null() {
+                *exact_pages += 1;
+            }
+        }
+    }
 }
 
 #[pg_guard]
@@ -1334,6 +1403,32 @@ mod tests {
             assert_eq!(row2.get::<i32>(2).unwrap().unwrap(), 2);
             assert_eq!(row2.get::<f64>(3).unwrap().unwrap(), 84.0);
 
+            Ok::<(), spi::Error>(())
+        }).unwrap();
+    }
+
+    #[pg_test]
+    fn test_tam_bitmap_scan() {
+        Spi::connect_mut(|client| {
+            client.update("SET spiral.kickoff_date = '1970-01-01 00:00:00Z';", None, &[])?;
+            client.update("CREATE TABLE tam_bitmap_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
+            client.update("INSERT INTO tam_bitmap_test (t, tenant_id, value) VALUES (1, 1, 10.0), (2, 2, 20.0), (3, 3, 30.0);", None, &[])?;
+            client.update("CREATE INDEX idx_t ON tam_bitmap_test(t);", None, &[])?;
+            
+            // Force a bitmap scan
+            client.update("SET enable_indexscan = off;", None, &[])?;
+            client.update("SET enable_seqscan = off;", None, &[])?;
+            client.update("SET enable_bitmapscan = on;", None, &[])?;
+
+            let explain = Spi::get_one::<String>("EXPLAIN SELECT value FROM tam_bitmap_test WHERE t = 2").unwrap().unwrap();
+            warning!("Spiral: BitmapScan test EXPLAIN: \n{}", explain);
+
+            let val = Spi::get_one::<f64>("SELECT value FROM tam_bitmap_test WHERE t = 2").unwrap().unwrap();
+            assert_eq!(val, 20.0);
+            
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_bitmap_test WHERE t >= 1").unwrap().unwrap();
+            assert_eq!(count, 3);
+            
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
