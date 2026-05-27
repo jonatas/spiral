@@ -88,7 +88,8 @@ pub fn get_table_stats(relname: &str) -> (f64, i32) {
         relname.replace("\"", "\"\"")
     ))
     .unwrap_or_default();
-    (t.unwrap_or(0.0), p.unwrap_or(0))
+    let t = t.unwrap_or(0.0);
+    (if t < 0.0 { 0.0 } else { t }, p.unwrap_or(0))
 }
 
 pub fn get_metadata(view_name: &str) -> Option<Metadata> {

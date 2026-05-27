@@ -72,6 +72,8 @@ struct StorageStats {
     view_name: String,
     total_pages: i64,
     total_rows_capacity: i64,
+    #[serde(default)]
+    row_count: i64,
     tenant_scale: i64,
     spiral_size_kb: i64,
     projected_heap_size_kb: i64,
@@ -89,6 +91,7 @@ struct AggregationLevel {
 struct HierarchyConfig {
     base_view: String,
     raw_view_name: String,
+    time_column: String,
     aggregation_levels: Vec<AggregationLevel>,
     tenant_scale: i64,
     sources: Vec<SourceInfo>,
@@ -191,24 +194,32 @@ async fn main() {
                     }
 
                     for hierarchy in &config.hierarchies {
-                        match load_storage_stats(
+                        // Polling for raw view
+                        if let Ok(Some(storage_stats)) = load_storage_stats(
                             &polling_state.pool,
                             &hierarchy.base_view,
                             &hierarchy.raw_view_name,
                         )
                         .await
                         {
-                            Ok(Some(storage_stats)) => {
+                            let _ = polling_state
+                                .tx
+                                .send(VortexEvent::StorageStats(storage_stats));
+                        }
+
+                        // Polling for aggregation levels
+                        for level in &hierarchy.aggregation_levels {
+                            if let Ok(Some(storage_stats)) = load_storage_stats(
+                                &polling_state.pool,
+                                &hierarchy.base_view,
+                                &level.view_name,
+                            )
+                            .await
+                            {
                                 let _ = polling_state
                                     .tx
                                     .send(VortexEvent::StorageStats(storage_stats));
                             }
-                            Ok(None) => {}
-                            Err(e) => tracing::error!(
-                                "Storage stats polling error for {}: {}",
-                                hierarchy.base_view,
-                                e
-                            ),
                         }
                     }
                 }
@@ -272,20 +283,40 @@ async fn get_block_info(
 
     // Look up the time column from spiral metadata
     let meta_row = sqlx::query(
-        "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1"
+        "SELECT base_view, columns_metadata FROM spiral.metadata WHERE view_name = $1",
     )
     .bind(&name)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let time_col = meta_row
-        .as_ref()
-        .and_then(|row| {
-            let cm: serde_json::Value = row.get("columns_metadata");
-            cm.get("time_column").and_then(|v| v.as_str()).map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "t".to_string());
+    let mut time_col = meta_row.as_ref().and_then(|row| {
+        let cm: serde_json::Value = row.get("columns_metadata");
+        cm.get("time_column")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    if time_col.is_none() {
+        if let Some(ref row) = meta_row {
+            let base_view: String = row.get("base_view");
+            if let Ok(Some(base_meta)) = sqlx::query(
+                "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1",
+            )
+            .bind(&base_view)
+            .fetch_optional(&state.pool)
+            .await
+            {
+                let cm: serde_json::Value = base_meta.get("columns_metadata");
+                time_col = cm
+                    .get("time_column")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+        }
+    }
+
+    let time_col = time_col.unwrap_or_else(|| "t".to_string());
 
     // time_col comes from our own metadata — safe to interpolate after identifier check
     if valid_identifier(&time_col) {
@@ -374,12 +405,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
 
         for hierarchy in &config.hierarchies {
+            // Stats for raw view
             if let Ok(Some(storage_stats)) =
                 load_storage_stats(&state.pool, &hierarchy.base_view, &hierarchy.raw_view_name)
                     .await
             {
                 if let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats)) {
                     let _ = sender.send(Message::Text(msg.into())).await;
+                }
+            }
+
+            // Stats for all aggregation levels
+            for level in &hierarchy.aggregation_levels {
+                if let Ok(Some(storage_stats)) =
+                    load_storage_stats(&state.pool, &hierarchy.base_view, &level.view_name).await
+                {
+                    if let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
+                    {
+                        let _ = sender.send(Message::Text(msg.into())).await;
+                    }
                 }
             }
         }
@@ -484,8 +528,21 @@ async fn load_storage_stats(
         return Ok(None);
     };
 
+    let reltuples: f32 = sqlx::query("SELECT reltuples FROM pg_class WHERE relname = $1")
+        .bind(raw_view_name)
+        .fetch_one(pool)
+        .await?
+        .get(0);
+
     let mut storage_stats = match serde_json::from_value::<StorageStats>(stats) {
-        Ok(storage_stats) => storage_stats,
+        Ok(mut storage_stats) => {
+            storage_stats.row_count = if reltuples < 0.0 {
+                storage_stats.total_rows_capacity
+            } else {
+                reltuples as i64
+            };
+            storage_stats
+        }
         Err(_) => return Ok(None),
     };
 
@@ -522,12 +579,26 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
                 .then_with(|| a.view_name.cmp(&b.view_name))
         });
 
-        let raw_view_name = views
+        let raw_view = views
             .iter()
             .find(|view| view.view_name == base_view || view.frame_seconds == 0)
-            .map(|view| view.view_name.clone())
-            .or_else(|| views.first().map(|view| view.view_name.clone()))
+            .cloned()
+            .or_else(|| views.first().cloned());
+
+        let raw_view_name = raw_view
+            .as_ref()
+            .map(|v| v.view_name.clone())
             .unwrap_or_else(|| base_view.clone());
+
+        let time_column = raw_view
+            .as_ref()
+            .and_then(|v| {
+                v.columns_metadata
+                    .get("time_column")
+                    .and_then(|tc| tc.as_str())
+            })
+            .unwrap_or("t")
+            .to_string();
 
         let storage_stats = load_storage_stats(pool, &base_view, &raw_view_name).await?;
         let tenant_scale = storage_stats
@@ -550,6 +621,7 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
         hierarchies.push(HierarchyConfig {
             base_view: base_view.clone(),
             raw_view_name,
+            time_column,
             aggregation_levels,
             tenant_scale,
             sources: sources_by_base.remove(&base_view).unwrap_or_default(),
@@ -576,7 +648,7 @@ async fn get_slice_data(
 
     // Look up metadata to find time_col and scope_col
     let meta_row = sqlx::query(
-        "SELECT columns_metadata, scope_columns
+        "SELECT columns_metadata, scope_columns, base_view
          FROM spiral.metadata
          WHERE view_name = $1",
     )
@@ -593,11 +665,29 @@ async fn get_slice_data(
     let columns_metadata: serde_json::Value = meta_row.get("columns_metadata");
     let scope_columns: Vec<String> = meta_row.get("scope_columns");
 
-    let time_col = columns_metadata
+    let mut time_col = columns_metadata
         .get("time_column")
         .and_then(|v| v.as_str())
-        .unwrap_or("t")
-        .to_string();
+        .map(|s| s.to_string());
+
+    if time_col.is_none() {
+        let base_view: String = meta_row.get("base_view");
+        if let Ok(Some(base_meta)) = sqlx::query(
+            "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1",
+        )
+        .bind(&base_view)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            let cm: serde_json::Value = base_meta.get("columns_metadata");
+            time_col = cm
+                .get("time_column")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+
+    let time_col = time_col.unwrap_or_else(|| "t".to_string());
     let scope_col = scope_columns
         .into_iter()
         .next()

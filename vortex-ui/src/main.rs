@@ -133,7 +133,9 @@ fn format_epoch_seconds(epoch: i64) -> String {
 }
 
 fn format_bytes(kb: i64) -> String {
-    if kb >= 1_000_000 {
+    if kb >= 1_000_000_000 {
+        format!("{:.2} TB", kb as f64 / 1_000_000_000.0)
+    } else if kb >= 1_000_000 {
         format!("{:.1} GB", kb as f64 / 1_000_000.0)
     } else if kb >= 1_000 {
         format!("{:.1} MB", kb as f64 / 1_000.0)
@@ -173,7 +175,7 @@ fn determine_charts(slice: &SliceResponse, sources: &[SourceInfo]) -> Vec<ChartD
         
         // Find source formula if available
         let formula = sources.iter()
-            .find(|src| src.mat_column == s)
+            .find(|src| src.mat_column == s || src.base_column == s)
             .map(|src| src.formula.as_str())
             .unwrap_or("");
             
@@ -220,9 +222,9 @@ struct ChangelogEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 struct BlockInfo {
     blkno: i32,
-    tuple_count: i32,
+    tuple_count: i64,
     alignment_pct: f64,
-    drift_records: i32,
+    drift_records: i64,
     t_range: [i64; 2],
     tenant_range: [i32; 2],
     is_boundary: bool,
@@ -242,6 +244,7 @@ fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<Hierarchy
 fn HierarchyTree(
     hierarchy: Signal<Option<HierarchyConfig>>,
     selected_tier: RwSignal<Option<String>>,
+    kickoff: Signal<i64>,
 ) -> impl IntoView {
     view! {
         {move || {
@@ -310,12 +313,15 @@ fn HierarchyTree(
                         <span class="tf-label">"tenant_scale"</span>
                         <span class="tf-value">{h.tenant_scale}</span>
                     </div>
-                    {(h.kickoff_epoch > 0).then(|| view! {
-                        <div class="tree-footer">
-                            <span class="tf-label">"kickoff"</span>
-                            <span class="tf-value tf-ts">{format_epoch_seconds(h.kickoff_epoch)}</span>
-                        </div>
-                    })}
+                    {move || {
+                        let k = kickoff.get();
+                        (k > 0).then(|| view! {
+                            <div class="tree-footer">
+                                <span class="tf-label">"kickoff"</span>
+                                <span class="tf-value tf-ts">{format_epoch_seconds(k)}</span>
+                            </div>
+                        })
+                    }}
                 </div>
             }.into_any()
         }}
@@ -326,6 +332,8 @@ fn HierarchyTree(
 fn PageMap(
     total_pages: Signal<i64>,
     tenant_scale: Signal<i64>,
+    kickoff: Signal<i64>,
+    frame_seconds: Signal<i32>,
     selected_page: Signal<Option<i32>>,
     on_click: impl Fn(i32) + 'static + Send + Clone,
 ) -> impl IntoView {
@@ -353,18 +361,26 @@ fn PageMap(
                 let total = total_pages.get();
                 let limit = visible_limit.get() as i64;
                 let scale = tenant_scale.get().max(1) as i32;
+                let k = kickoff.get();
+                let fs = frame_seconds.get().max(1);
                 let sel = selected_page.get();
                 (0..total.min(limit) as i32)
                     .map(|idx| {
                         let color = get_color_for_tenant(idx % scale, scale);
                         let on_click = on_click.clone();
                         let is_sel = sel == Some(idx);
+                        
+                        let tenant_id = idx % scale;
+                        let time_step = idx / scale;
+                        let est_t = k + (time_step as i64 * fs as i64);
+                        let t_str = if k > 0 { format!("\nEst. Time: {}", format_epoch_seconds(est_t)) } else { "".into() };
+
                         view! {
                             <div
                                 class=if is_sel { "page-cell selected" } else { "page-cell" }
                                 style=format!("background:{}", color)
                                 on:click=move |_| on_click(idx)
-                                title=format!("Page {}", idx)
+                                title=format!("Page {}\nTenant: {}{}", idx, tenant_id, t_str)
                             ></div>
                         }
                     })
@@ -559,8 +575,8 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 />
                 <span class="slider-label">{move || {
                     let n = 10.0_f64.powf(row_count_exp.get());
-                    if n >= 1e9 { format!("{:.1}B rows", n / 1e9) }
-                    else if n >= 1e6 { format!("{:.0}M rows", n / 1e6) }
+                    if n >= 1e9 { format!("{:.1} Billion rows", n / 1e9) }
+                    else if n >= 1e6 { format!("{:.0} Million rows", n / 1e6) }
                     else { format!("{:.0}K rows", n / 1e3) }
                 }}</span>
             </div>
@@ -568,42 +584,60 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 <div class="tg-cell">
                     <span class="tg-label">"HEAP"</span>
                     <span class="tg-value tg-red">{move || {
-                        let gb = 10.0_f64.powf(row_count_exp.get()) * HEAP_BYTES_PER_ROW / (1024.0 * 1024.0 * 1024.0);
-                        if gb < 1.0 { format!("{:.0}MB", gb * 1024.0) } else { format!("{:.1}GB", gb) }
+                        let bytes = 10.0_f64.powf(row_count_exp.get()) * HEAP_BYTES_PER_ROW;
+                        if bytes >= 1099511627776.0 { format!("{:.2}TB", bytes / 1099511627776.0) }
+                        else if bytes >= 1073741824.0 { format!("{:.1}GB", bytes / 1073741824.0) }
+                        else { format!("{:.0}MB", bytes / 1048576.0) }
                     }}</span>
                 </div>
                 <div class="tg-cell">
                     <span class="tg-label">"SPIRAL"</span>
                     <span class="tg-value tg-green">{move || {
-                        let gb = 10.0_f64.powf(row_count_exp.get()) * spiral_bpr() / (1024.0 * 1024.0 * 1024.0);
-                        if gb < 1.0 { format!("{:.0}MB", gb * 1024.0) } else { format!("{:.1}GB", gb) }
+                        let bytes = 10.0_f64.powf(row_count_exp.get()) * spiral_bpr();
+                        if bytes >= 1099511627776.0 { format!("{:.2}TB", bytes / 1099511627776.0) }
+                        else if bytes >= 1073741824.0 { format!("{:.1}GB", bytes / 1073741824.0) }
+                        else { format!("{:.0}MB", bytes / 1048576.0) }
                     }}</span>
                 </div>
                 <div class="tg-cell">
                     <span class="tg-label">"XOR"</span>
                     <span class="tg-value tg-purple">{move || {
-                        let gb = 10.0_f64.powf(row_count_exp.get()) * XOR_BLOCK_BYTES_PER_ROW / (1024.0 * 1024.0 * 1024.0);
-                        if gb < 1.0 { format!("{:.0}MB", gb * 1024.0) } else { format!("{:.1}GB", gb) }
+                        let bytes = 10.0_f64.powf(row_count_exp.get()) * XOR_BLOCK_BYTES_PER_ROW;
+                        if bytes >= 1099511627776.0 { format!("{:.2}TB", bytes / 1099511627776.0) }
+                        else if bytes >= 1073741824.0 { format!("{:.1}GB", bytes / 1073741824.0) }
+                        else { format!("{:.0}MB", bytes / 1048576.0) }
                     }}</span>
                 </div>
                 <div class="tg-cell">
                     <span class="tg-label">"SAVED"</span>
-                    <span class="tg-value tg-green">{move || format!("{:.0}%", (1.0 - XOR_BLOCK_BYTES_PER_ROW / HEAP_BYTES_PER_ROW) * 100.0)}</span>
+                    <span class="tg-value tg-green">{move || {
+                        let saving = (1.0 - spiral_bpr() / HEAP_BYTES_PER_ROW) * 100.0;
+                        format!("{:.1}%", saving)
+                    }}</span>
                 </div>
             </div>
 
-            <div class="cmp-section-label" style="margin-top:10px;">"1B ROWS PROJECTION (XOR)"</div>
+            <div class="cmp-section-label" style="margin-top:10px;">"1 Billion ROWS PROJECTION (SPIRAL)"</div>
             <div class="ls-row">
                 <span class="ls-label">"Storage"</span>
-                <span class="ls-value tg-purple">"1.9 GB"</span>
+                <span class="ls-value tg-purple">{move || {
+                    let kb = (1_000_000_000.0 * spiral_bpr() / 1024.0) as i64;
+                    format_bytes(kb)
+                }}</span>
             </div>
             <div class="ls-row">
                 <span class="ls-label">"Heap equiv"</span>
-                <span class="ls-value ls-dim">"44.7 GB"</span>
+                <span class="ls-value ls-dim">{move || {
+                    let kb = (1_000_000_000.0 * HEAP_BYTES_PER_ROW / 1024.0) as i64;
+                    format_bytes(kb)
+                }}</span>
             </div>
             <div class="ls-row">
-                <span class="ls-label">"Mathematical Saving"</span>
-                <span class="ls-value ls-green">"95.6%"</span>
+                <span class="ls-label">"Estimated Saving"</span>
+                <span class="ls-value ls-green">{move || {
+                    let saving = (1.0 - spiral_bpr() / HEAP_BYTES_PER_ROW) * 100.0;
+                    format!("{:.1}%", saving)
+                }}</span>
             </div>
         </div>
     }
@@ -1106,12 +1140,68 @@ fn SvgLineChart(
 }
 
 #[component]
+fn DataTable(slice: SliceResponse) -> impl IntoView {
+    let rows = slice.rows;
+    if rows.is_empty() {
+        return view! { <div class="empty-state">"no rows"</div> }.into_any();
+    }
+    
+    let first = rows.first().unwrap();
+    let Some(obj) = first.as_object() else {
+        return view! { <div class="empty-state">"invalid data format"</div> }.into_any();
+    };
+    let mut keys: Vec<String> = obj.keys().cloned().collect();
+    // Prioritize t_epoch and common time/scope columns
+    keys.sort_by_key(|k| {
+        if k == "t_epoch" || k == &slice.time_col { (0, k.clone()) }
+        else if k == &slice.scope_col { (1, k.clone()) }
+        else { (2, k.clone()) }
+    });
+    
+    view! {
+        <div class="data-table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        {keys.clone().into_iter().map(|k| view! { <th>{k}</th> }).collect_view()}
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|row| {
+                        let Some(obj) = row.as_object() else { return view! { <tr></tr> }.into_any() };
+                        let keys_c = keys.clone();
+                        view! {
+                            <tr>
+                                {keys_c.into_iter().map(|k| {
+                                    let val = obj.get(&k).unwrap_or(&serde_json::Value::Null);
+                                    let (val_str, cls) = if let Some(f) = val.as_f64() {
+                                        (format!("{:.4}", f), "td-num")
+                                    } else if let Some(i) = val.as_i64() {
+                                        (i.to_string(), "td-num")
+                                    } else if val.is_object() {
+                                        (serde_json::to_string(val).unwrap_or_default(), "td-obj")
+                                    } else {
+                                        (val.to_string().replace("\"", ""), "")
+                                    };
+                                    view! { <td class={cls}>{val_str}</td> }
+                                }).collect_view()}
+                            </tr>
+                        }.into_any()
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }.into_any()
+}
+
+#[component]
 fn PageDataCharts(slice: SliceResponse, sources: Vec<SourceInfo>) -> impl IntoView {
     let charts = determine_charts(&slice, &sources);
-    let rows = slice.rows;
-    let sc = slice.scope_col;
+    let rows = slice.rows.clone();
+    let sc = slice.scope_col.clone();
     let count = slice.count;
     let fetch_ms = slice.fetch_ms;
+    let slice_c = slice.clone();
 
     view! {
         <div class="charts-section">
@@ -1147,6 +1237,9 @@ fn PageDataCharts(slice: SliceResponse, sources: Vec<SourceInfo>) -> impl IntoVi
                     }
                 }).collect_view()}
             </div>
+            
+            <div class="panel-hdr" style="margin-top: 20px; border-bottom: 1px solid var(--border); padding-bottom: 4px;">"RAW DATA"</div>
+            <DataTable slice=slice_c />
         </div>
     }
 }
@@ -1303,10 +1396,24 @@ fn App() -> impl IntoView {
     });
 
     let kickoff = Signal::derive(move || {
-        current_hierarchy_opt
+        let h_kickoff = current_hierarchy_opt
             .get()
             .map(|h| h.kickoff_epoch)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let s_kickoff = current_stats.get().kickoff_epoch;
+        if s_kickoff > 0 { s_kickoff } else { h_kickoff }
+    });
+
+    let current_frame_seconds = Signal::derive(move || {
+        let tier = selected_tier_view.get();
+        let h = current_hierarchy_opt.get();
+        match (tier, h) {
+            (Some(t), Some(h)) => h.aggregation_levels.iter()
+                .find(|l| l.view_name == t)
+                .map(|l| l.frame_seconds)
+                .unwrap_or(0),
+            _ => 0,
+        }
     });
 
     let api_base_slice = Arc::clone(&api_base);
@@ -1334,7 +1441,7 @@ fn App() -> impl IntoView {
         let (t_start, t_end) = if b.t_actual_start > 0 {
             (b.t_actual_start as f64, (b.t_actual_end + 120) as f64)
         } else {
-            ((k + b.t_range[0]) as f64, (k + b.t_range[1]) as f64)
+            ((k + b.t_range[0]) as f64, (k + b.t_range[1] + 120) as f64)
         };
 
         explain_query.set(format!(
@@ -1444,7 +1551,7 @@ fn App() -> impl IntoView {
                 <aside class="left-panel">
                     <div class="panel-block">
                         <div class="panel-hdr">"HIERARCHY"</div>
-                        <HierarchyTree hierarchy=current_hierarchy_opt selected_tier=selected_tier_view />
+                        <HierarchyTree hierarchy=current_hierarchy_opt selected_tier=selected_tier_view kickoff=kickoff />
                     </div>
                     <div class="panel-block">
                         <div class="panel-hdr">"STORAGE ANALYSIS"</div>
@@ -1469,10 +1576,22 @@ fn App() -> impl IntoView {
                                 format!("{} pages · {} tenant scale", s.total_pages, s.tenant_scale)
                             }}
                         </span>
+                        {move || selected_block.get().map(|b| {
+                            let k = kickoff.get();
+                            let start_t = if b.t_actual_start > 0 { b.t_actual_start } else { k + b.t_range[0] };
+                            let end_t = if b.t_actual_end > 0 { b.t_actual_end } else { k + b.t_range[1] };
+                            view! {
+                                <span class="page-meta" style="margin-left:auto; color:var(--blue); font-weight:700;">
+                                    {format!("{} → {}", format_epoch_seconds(start_t), format_epoch_seconds(end_t))}
+                                </span>
+                            }
+                        })}
                     </div>
                     <PageMap
                         total_pages=Signal::derive(move || current_stats.get().total_pages)
                         tenant_scale=tenant_scale
+                        kickoff=kickoff
+                        frame_seconds=current_frame_seconds
                         selected_page=Signal::derive(move || selected_page_no.get())
                         on_click=fetch_block_info
                     />
