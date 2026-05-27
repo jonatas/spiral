@@ -25,6 +25,10 @@ struct StorageStats {
     compression_ratio: f64,
     kickoff_epoch: i64,
     #[serde(default)]
+    min_t: i64,
+    #[serde(default)]
+    max_t: i64,
+    #[serde(default)]
     data_per_page: i64,
     #[serde(default)]
     page_size: i64,
@@ -231,6 +235,8 @@ struct BlockInfo {
     is_boundary: bool,
     t_actual_start: i64,
     t_actual_end: i64,
+    #[serde(default)]
+    kickoff_epoch: i64,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -400,8 +406,9 @@ fn PageMap(
 
 #[component]
 fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
-    let start_t = if block.t_actual_start > 0 { block.t_actual_start } else { kickoff + block.t_range[0] };
-    let end_t = if block.t_actual_end > 0 { block.t_actual_end } else { kickoff + block.t_range[1] };
+    let kb = if block.kickoff_epoch > 0 { block.kickoff_epoch } else { kickoff };
+    let start_t = if block.t_actual_start > 0 { block.t_actual_start } else { kb + block.t_range[0] };
+    let end_t = if block.t_actual_end > 0 { block.t_actual_end } else { kb + block.t_range[1] };
     let duration_sec = (end_t - start_t).abs();
     let duration_fmt = if duration_sec < 60 {
         format!("{}s", duration_sec)
@@ -1401,8 +1408,31 @@ fn App() -> impl IntoView {
             .get()
             .map(|h| h.kickoff_epoch)
             .unwrap_or(0);
-        let s_kickoff = current_stats.get().kickoff_epoch;
-        if s_kickoff > 0 { s_kickoff } else { h_kickoff }
+        let stats = current_stats.get();
+        let s_kickoff = stats.kickoff_epoch;
+        
+        // If we have a selected block with actual time, we can infer the real kickoff
+        // kickoff = actual_time - relative_time
+        if let Some(b) = selected_block.get() {
+            if b.t_actual_start > 0 {
+                let inferred = b.t_actual_start - b.t_range[0];
+                if inferred > 0 {
+                    return inferred;
+                }
+            }
+        }
+
+        const PG_EPOCH: i64 = 946684800; // 2000-01-01
+
+        if s_kickoff > 0 && s_kickoff != PG_EPOCH { 
+            s_kickoff 
+        } else if h_kickoff > 0 && h_kickoff != PG_EPOCH {
+            h_kickoff
+        } else {
+            // If both are 2000 or 0, we might be in a default state.
+            // But we prefer the stats kickoff if it's all we have.
+            if s_kickoff > 0 { s_kickoff } else { h_kickoff }
+        }
     });
 
     let current_frame_seconds = Signal::derive(move || {
@@ -1439,10 +1469,12 @@ fn App() -> impl IntoView {
             return;
         };
 
+        let kb = if b.kickoff_epoch > 0 { b.kickoff_epoch } else { k };
+
         let (t_start, t_end) = if b.t_actual_start > 0 {
             (b.t_actual_start as f64, (b.t_actual_end + 120) as f64)
         } else {
-            ((k + b.t_range[0]) as f64, (k + b.t_range[1] + 120) as f64)
+            ((kb + b.t_range[0]) as f64, (kb + b.t_range[1] + 120) as f64)
         };
 
         explain_query.set(format!(
@@ -1585,22 +1617,27 @@ fn App() -> impl IntoView {
                             let scale = s.tenant_scale.max(1);
 
                             if let Some(b) = selected_block.get() {
-                                let start_t = if b.t_actual_start > 0 { b.t_actual_start } else { k + b.t_range[0] };
-                                let end_t = if b.t_actual_end > 0 { b.t_actual_end } else { k + b.t_range[1] };
+                                let kb = if b.kickoff_epoch > 0 { b.kickoff_epoch } else { k };
+                                let start_t = if b.t_actual_start > 0 { b.t_actual_start } else { kb + b.t_range[0] };
+                                let end_t = if b.t_actual_end > 0 { b.t_actual_end } else { kb + b.t_range[1] };
                                 let span = (end_t - start_t).abs() as i32;
                                 view! {
                                     <span class="page-meta" style="margin-left:auto; color:var(--blue); font-weight:700;">
                                         {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(span))}
                                     </span>
                                 }.into_any()
-                            } else if s.total_pages > 0 && k > 0 {
-                                let num_steps = (s.total_pages + scale - 1) / scale;
-                                let total_duration = num_steps * fs;
-                                let start_t = k;
-                                let end_t = k + total_duration;
+                            } else if s.total_pages > 0 && (k > 0 || s.min_t > 0) {
+                                let (start_t, end_t, duration) = if s.min_t > 0 && s.max_t > 0 {
+                                    (s.min_t, s.max_t, (s.max_t - s.min_t) as i32)
+                                } else {
+                                    let num_steps = (s.total_pages + scale - 1) / scale;
+                                    let total_duration = num_steps * fs;
+                                    (k, k + total_duration, total_duration as i32)
+                                };
+
                                 view! {
                                     <span class="page-meta" style="margin-left:auto; color:var(--blue); opacity: 0.8;">
-                                        {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(total_duration as i32))}
+                                        {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(duration))}
                                     </span>
                                 }.into_any()
                             } else {
