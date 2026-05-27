@@ -337,17 +337,27 @@ fn refresh_incremental(
         );
 
         SKIP_ACCELERATION.with(|s| s.set(true));
-        let _ = Spi::run(&merge_sql);
+        let run_result = Spi::run(&merge_sql);
         SKIP_ACCELERATION.with(|s| s.set(false));
+        if let Err(e) = run_result {
+            notice!(
+                "Spiral: refresh_incremental failed for '{}': {:?}\nSQL: {}",
+                view_name, e, merge_sql
+            );
+            return false;
+        }
     }
 
     let children = catalog::get_children(view_name);
+    let mut all_ok = true;
     for child in children {
         if child != view_name {
-            let _ = refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone());
+            if !refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone()) {
+                all_ok = false;
+            }
         }
     }
-    true
+    all_ok
 }
 
 #[pg_extern]
@@ -1887,6 +1897,49 @@ mod zorder_tests {
         let za = spiral_zorder_core(0, vec![Some("tenant_a".to_string())]);
         let zb = spiral_zorder_core(0, vec![Some("tenant_b".to_string())]);
         assert_ne!(za, zb, "different tenant strings must not collide");
+    }
+
+    #[pg_test]
+    fn test_changelog_preserved_on_failed_refresh() {
+        // If the merge SQL fails (e.g. rollup schema is corrupted), the changelog
+        // rows must survive so the planner keeps falling back to raw data and the
+        // background worker can retry later.
+        Spi::run("CREATE TABLE fail_ticks (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('fail_ticks', 'BASE', 0, 'fail_ticks', '{}')")
+            .unwrap();
+        Spi::run("SELECT spiral_register_view('fail_ticks_1h', 'fail_ticks', 3600, 'fail_ticks', '{}')")
+            .unwrap();
+
+        Spi::run(
+            "INSERT INTO fail_ticks (t, val)
+             SELECT now() - interval '2 hours' + (i * interval '20 minutes'), 1.0
+             FROM generate_series(0, 5) i",
+        )
+        .unwrap();
+
+        let before: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'fail_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert!(before > 0, "changelog must have entries before refresh");
+
+        // Break the rollup so MERGE SQL will fail at runtime.
+        Spi::run("ALTER TABLE fail_ticks_1h DROP COLUMN val").unwrap();
+
+        // Refresh must not panic, and changelog rows must remain intact.
+        let _ = Spi::run("SELECT spiral_refresh('fail_ticks')");
+
+        let after: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'fail_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(
+            after, before,
+            "changelog must be unchanged after a failed refresh — got {} rows, expected {}",
+            after, before
+        );
     }
 
     #[test]
