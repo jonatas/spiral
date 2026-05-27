@@ -1681,6 +1681,68 @@ mod tests {
         .unwrap_or(false);
         assert!(rollup_exists, "Second tier should be created on second accelerate call");
     }
+
+    #[pg_test]
+    fn test_subquery_and_join_acceleration() {
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run("CREATE TABLE j1 (t timestamptz, tenant_id int, val float)").unwrap();
+        Spi::run("SELECT accelerate('j1', frames => '1h', tenant => ARRAY['tenant_id'])").unwrap();
+        Spi::run("INSERT INTO j1 VALUES ('2026-05-25 10:00:00Z', 1, 10)").unwrap();
+        Spi::run("INSERT INTO j1 VALUES ('2026-05-25 11:00:00Z', 1, 15)").unwrap(); // Second hour
+        Spi::run("SELECT spiral_refresh('j1_1h')").unwrap();
+
+        Spi::run("CREATE TABLE j2 (t timestamptz, tenant_id int, val float)").unwrap();
+        Spi::run("SELECT accelerate('j2', frames => '1h', tenant => ARRAY['tenant_id'])").unwrap();
+        Spi::run("INSERT INTO j2 VALUES ('2026-05-25 10:00:00Z', 1, 20)").unwrap();
+        Spi::run("INSERT INTO j2 VALUES ('2026-05-25 11:00:00Z', 1, 25)").unwrap(); // Second hour
+        Spi::run("SELECT spiral_refresh('j2_1h')").unwrap();
+
+        // 1. Subquery acceleration
+        // Query for only ONE hour (10:00). If it works, it should show 1 segment of j1_1h.
+        let subq_sql = "SELECT * FROM (SELECT sum(val) FROM j1 WHERE t >= ''2026-05-25 10:00:00Z'' AND t < ''2026-05-25 11:00:00Z'') sub";
+        let subq_explain = Spi::get_one::<String>(&format!("SELECT spiral_explain('{}')", subq_sql)).unwrap().unwrap();
+        assert!(subq_explain.contains("1x j1_1h"), "Subquery should use exactly 1 rollup segment");
+        assert!(subq_explain.contains("Range: 2026-05-25 10:00:00"), "Subquery should use the correct start range");
+
+        // 2. JOIN predicate propagation (tenant_id = 1 should propagate from j1 to j2)
+        let join_sql = "SELECT * FROM j1 JOIN j2 USING (t, tenant_id) \
+                        WHERE j1.t >= ''2026-05-25 10:00:00Z'' AND j1.t < ''2026-05-25 11:00:00Z'' \
+                        AND j1.tenant_id = 1";
+        let join_explain = Spi::get_one::<String>(&format!("SELECT spiral_explain('{}')", join_sql)).unwrap().unwrap();
+        
+        assert!(join_explain.contains("Accelerating 'j1'"), "j1 should be accelerated in JOIN");
+        assert!(join_explain.contains("Accelerating 'j2'"), "j2 should be accelerated in JOIN via predicate propagation");
+        
+        // Count segments to ensure propagation worked for both
+        let j1_accel_line = join_explain.lines().find(|l| l.contains("Accelerating 'j1'")).unwrap();
+        let j2_accel_line = join_explain.lines().find(|l| l.contains("Accelerating 'j2'")).unwrap();
+        
+        assert!(j1_accel_line.contains("1x j1_1h"), "j1 should use 1 segment");
+        assert!(j2_accel_line.contains("1x j2_1h"), "j2 should use 1 segment via propagated time and scope");
+    }
+
+    #[pg_test]
+    fn test_cost_based_slicing() {
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        // Create a table with very sparse data (1 record per hour)
+        Spi::run("CREATE TABLE sparse (t timestamptz, val float)").unwrap();
+        Spi::run("SELECT accelerate('sparse', frames => '1h')").unwrap();
+        Spi::run("INSERT INTO sparse VALUES ('2026-05-25 10:30:00Z', 10)").unwrap();
+        Spi::run("INSERT INTO sparse VALUES ('2026-05-25 11:30:00Z', 20)").unwrap();
+        Spi::run("SELECT spiral_refresh('sparse_1h')").unwrap();
+        
+        // Update statistics so pg_class has row counts
+        Spi::run("ANALYZE sparse").unwrap();
+        Spi::run("ANALYZE sparse_1h").unwrap();
+
+        // In this case, sparse has 2 rows, sparse_1h has 2 rows.
+        // The cost model should skip sparse_1h because 2 >= 2 * 0.9.
+        let explain = Spi::get_one::<String>("SELECT spiral_explain('SELECT sum(val) FROM sparse WHERE t >= ''2026-05-25 10:00:00Z'' AND t < ''2026-05-25 12:00:00Z''')").unwrap().unwrap();
+        
+        // It should NOT contain sparse_1h
+        assert!(!explain.contains("sparse_1h"), "Should not use rollup if it doesn't reduce rows significantly");
+        assert!(explain.contains("no rollups available"), "Should report no rollups available (due to cost model rejection)");
+    }
 }
 
 #[cfg(test)]

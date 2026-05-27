@@ -82,6 +82,15 @@ pub fn get_hierarchy(base_table: &str) -> Vec<String> {
     views
 }
 
+pub fn get_table_stats(relname: &str) -> (f64, i32) {
+    let (t, p) = Spi::get_two::<f64, i32>(&format!(
+        "SELECT reltuples::float8, relpages FROM pg_class WHERE oid = '\"{}\"'::regclass",
+        relname.replace("\"", "\"\"")
+    ))
+    .unwrap_or_default();
+    (t.unwrap_or(0.0), p.unwrap_or(0))
+}
+
 pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     let cached = METADATA_CACHE.with(|c| c.borrow().get(view_name).cloned());
     if let Some(entry) = cached {

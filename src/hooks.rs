@@ -480,9 +480,10 @@ enum AstOpportunity {
         vals: Vec<serde_json::Value>,
         node: *mut pg_sys::Node,
     },
-    EqualTimeColumns {
+    EqualColumns {
         v1: i32,
         v2: i32,
+        col: String,
     },
 }
 
@@ -597,15 +598,16 @@ unsafe fn match_node(node: *mut pg_sys::Node, rtable: *mut pg_sys::List) -> Opti
                 let rte2 = pg_sys::list_nth(rtable, varno2 - 1) as *mut pg_sys::RangeTblEntry;
                 let n1 = pg_sys::get_attname((*rte1).relid, (*v1).varattno, true);
                 let n2 = pg_sys::get_attname((*rte2).relid, (*v2).varattno, true);
-                if !n1.is_null()
-                    && !n2.is_null()
-                    && CStr::from_ptr(n1).to_string_lossy() == "t"
-                    && CStr::from_ptr(n2).to_string_lossy() == "t"
-                {
-                    return Some(AstOpportunity::EqualTimeColumns {
-                        v1: varno1,
-                        v2: varno2,
-                    });
+                if !n1.is_null() && !n2.is_null() {
+                    let name1 = CStr::from_ptr(n1).to_string_lossy();
+                    let name2 = CStr::from_ptr(n2).to_string_lossy();
+                    if name1 == name2 {
+                        return Some(AstOpportunity::EqualColumns {
+                            v1: varno1,
+                            v2: varno2,
+                            col: name1.into_owned(),
+                        });
+                    }
                 }
             }
         }
@@ -672,7 +674,7 @@ struct VisitorContext {
 struct AstVisitor {
     rtable: *mut pg_sys::List,
     constraints: std::collections::HashMap<i32, QueryConstraints>,
-    equalities: Vec<(i32, i32)>,
+    equalities: Vec<(i32, i32, String)>,
 }
 
 impl AstVisitor {
@@ -720,8 +722,8 @@ impl AstVisitor {
                         let qc = self.constraints.entry(varno).or_default();
                         qc.in_clauses.insert(col, (vals, node));
                     }
-                    AstOpportunity::EqualTimeColumns { v1, v2 } => {
-                        self.equalities.push((v1, v2));
+                    AstOpportunity::EqualColumns { v1, v2, col } => {
+                        self.equalities.push((v1, v2, col));
                     }
                 }
                 return;
@@ -864,64 +866,55 @@ impl AstVisitor {
         for _ in 0..10 {
             let mut changed = false;
             let current_equalities = self.equalities.clone();
-            for (v1, v2) in current_equalities {
-                let (s1, e1) = {
-                    let r1 = self.constraints.get(&v1);
-                    (r1.and_then(|qc| qc.start), r1.and_then(|qc| qc.end))
-                };
-                let (s2, e2) = {
-                    let r2 = self.constraints.get(&v2);
-                    (r2.and_then(|qc| qc.start), r2.and_then(|qc| qc.end))
-                };
+            for (v1, v2, col) in current_equalities {
+                if col == "t" {
+                    let (s1, e1) = {
+                        let r1 = self.constraints.get(&v1);
+                        (r1.and_then(|qc| qc.start), r1.and_then(|qc| qc.end))
+                    };
+                    let (s2, e2) = {
+                        let r2 = self.constraints.get(&v2);
+                        (r2.and_then(|qc| qc.start), r2.and_then(|qc| qc.end))
+                    };
 
-                let new_start = s1.or(s2);
-                let new_end = e1.or(e2);
+                    let new_start = s1.or(s2);
+                    let new_end = e1.or(e2);
 
-                if new_start != s1 || new_end != e1 {
-                    let qc = self.constraints.entry(v1).or_default();
-                    qc.start = new_start;
-                    qc.end = new_end;
-                    changed = true;
-                }
-                if new_start != s2 || new_end != e2 {
-                    let qc = self.constraints.entry(v2).or_default();
-                    qc.start = new_start;
-                    qc.end = new_end;
-                    changed = true;
-                }
+                    if new_start != s1 || new_end != e1 {
+                        let qc = self.constraints.entry(v1).or_default();
+                        qc.start = new_start;
+                        qc.end = new_end;
+                        changed = true;
+                    }
+                    if new_start != s2 || new_end != e2 {
+                        let qc = self.constraints.entry(v2).or_default();
+                        qc.start = new_start;
+                        qc.end = new_end;
+                        changed = true;
+                    }
+                } else {
+                    // Propagate scope equality for the matching column
+                    let val1 = self.constraints.get(&v1).and_then(|qc| qc.scopes.get(&col).cloned());
+                    let val2 = self.constraints.get(&v2).and_then(|qc| qc.scopes.get(&col).cloned());
 
-                // Propagate scopes and in_clauses
-                let sc1 = self.constraints.get(&v1).map(|qc| qc.scopes.clone());
-                let sc2 = self.constraints.get(&v2).map(|qc| qc.scopes.clone());
-                if let (Some(sc1), Some(sc2)) = (sc1, sc2) {
-                    for (col, val) in sc1 {
-                        if !self.constraints.get(&v2).unwrap().scopes.contains_key(&col) {
-                            self.constraints.entry(v2).or_default().scopes.insert(col, val);
-                            changed = true;
-                        }
+                    if val1.is_some() && val2.is_none() {
+                        self.constraints.entry(v2).or_default().scopes.insert(col.clone(), val1.unwrap());
+                        changed = true;
+                    } else if val2.is_some() && val1.is_none() {
+                        self.constraints.entry(v1).or_default().scopes.insert(col.clone(), val2.unwrap());
+                        changed = true;
                     }
-                    for (col, val) in sc2 {
-                        if !self.constraints.get(&v1).unwrap().scopes.contains_key(&col) {
-                            self.constraints.entry(v1).or_default().scopes.insert(col, val);
-                            changed = true;
-                        }
-                    }
-                }
-                
-                let in1 = self.constraints.get(&v1).map(|qc| qc.in_clauses.clone());
-                let in2 = self.constraints.get(&v2).map(|qc| qc.in_clauses.clone());
-                if let (Some(in1), Some(in2)) = (in1, in2) {
-                    for (col, vals) in in1 {
-                        if !self.constraints.get(&v2).unwrap().in_clauses.contains_key(&col) {
-                            self.constraints.entry(v2).or_default().in_clauses.insert(col, vals);
-                            changed = true;
-                        }
-                    }
-                    for (col, vals) in in2 {
-                        if !self.constraints.get(&v1).unwrap().in_clauses.contains_key(&col) {
-                            self.constraints.entry(v1).or_default().in_clauses.insert(col, vals);
-                            changed = true;
-                        }
+
+                    // Propagate IN clauses for the matching column
+                    let in1 = self.constraints.get(&v1).and_then(|qc| qc.in_clauses.get(&col).cloned());
+                    let in2 = self.constraints.get(&v2).and_then(|qc| qc.in_clauses.get(&col).cloned());
+
+                    if in1.is_some() && in2.is_none() {
+                        self.constraints.entry(v2).or_default().in_clauses.insert(col.clone(), in1.unwrap());
+                        changed = true;
+                    } else if in2.is_some() && in1.is_none() {
+                        self.constraints.entry(v1).or_default().in_clauses.insert(col.clone(), in2.unwrap());
+                        changed = true;
                     }
                 }
             }
@@ -971,289 +964,290 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
     // Clear any stale time range from a previous query so non-spiral scans see None.
     crate::SCAN_TIME_RANGE.with(|r| r.set(None));
     PgTryBuilder::new(AssertUnwindSafe(|| {
-    // Ensure background worker is running for this database. The WORKER_STARTED
-    // thread-local guard makes this a cheap no-op after the first query per session,
-    // which lets the worker recover after a server restart without a new CREATE TABLE.
-    crate::bgworker::maybe_start_worker();
-    let query = &mut *parse;
-    if query.commandType == pg_sys::CmdType::CMD_SELECT {
-        let rtable = query.rtable;
-        if !rtable.is_null() {
-            let (constraint_map, tz_offset) =
-                build_time_constraints(query.jointree as *mut pg_sys::Node, rtable);
+        // Ensure background worker is running for this database.
+        crate::bgworker::maybe_start_worker();
+        
+        let tz_offset = Spi::get_one::<i64>(
+            "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint \
+             FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1",
+        )
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
 
-            for i in 0..(*rtable).length {
-                let varno = (i + 1) as i32;
-                let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
-                if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
-                    let relid = (*rte).relid;
-                    let relname = pg_sys::get_rel_name(relid);
-                    if !relname.is_null() {
-                        let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
-                        let hierarchy = catalog::get_hierarchy(&base_table);
+        process_query_recursive(parse, tz_offset);
 
-                        if !hierarchy.is_empty() {
-                            let offset_cols = catalog::get_offset_columns(&base_table);
-                            let metadata_obj = catalog::get_metadata(&base_table);
+        if let Some(prev_hook) = PREV_PLANNER_HOOK {
+            prev_hook(parse, query_string, cursor_options, bound_params)
+        } else {
+            pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
+        }
+    }))
+    .finally(|| IN_HOOK.with(|h| h.set(false)))
+    .execute()
+}
 
-                            // Time range: from WHERE clause or inferred from coarsest rollup
-                            // (enables unbounded queries like SELECT sum(col) FROM tbl).
-                            let qc_opt = constraint_map.get(&varno);
-                            let time_range = qc_opt
-                                .and_then(|q| q.start.zip(q.end))
-                                .or_else(|| get_actual_data_range(&base_table, &hierarchy));
+unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
+    if query.is_null() || (*query).commandType != pg_sys::CmdType::CMD_SELECT {
+        return;
+    }
 
-                            if let Some((ts, te)) = time_range {
-                                // Publish time range so the TAM scan can skip pages outside [ts, te].
-                                crate::SCAN_TIME_RANGE.with(|r| r.set(Some((ts, te))));
-                                // Build scope_values JsonB from qc.scopes if they match view's scope_columns
-                                let scope_values = qc_opt.and_then(|qc| {
-                                    metadata_obj.as_ref().and_then(|m| {
-                                        let mut map = serde_json::Map::new();
-                                        for col in &m.scope_columns {
-                                            if let Some(val_tuple) = qc.scopes.get(col) {
-                                                map.insert(col.clone(), val_tuple.0.clone());
-                                            }
-                                        }
-                                        if map.is_empty() {
-                                            None
-                                        } else {
-                                            Some(pgrx::JsonB(serde_json::Value::Object(map)))
-                                        }
-                                    })
-                                });
+    let rtable = (*query).rtable;
+    if rtable.is_null() {
+        return;
+    }
 
+    let (constraint_map, _) = build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
 
-                                let dirty_ranges = catalog::get_dirty_ranges(
-                                    &base_table,
-                                    ts,
-                                    te,
-                                    scope_values,
-                                );
-                                let max_frame_secs = extract_group_granularity_secs(query);
-                                let segments = resolve_segments(
-                                    &base_table,
-                                    ts,
-                                    te,
-                                    &hierarchy,
-                                    &dirty_ranges,
-                                    tz_offset,
-                                    max_frame_secs,
-                                );
+    for i in 0..(*rtable).length {
+        let varno = (i + 1) as i32;
+        let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
+        if rte.is_null() {
+            continue;
+        }
 
-                                if !segments.is_empty()
-                                    && (segments.len() > 1 || segments[0].source != base_table)
+        if (*rte).rtekind == pg_sys::RTEKind::RTE_SUBQUERY {
+            process_query_recursive((*rte).subquery, tz_offset);
+            continue;
+        }
+
+        if (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
+            let relid = (*rte).relid;
+            let relname = pg_sys::get_rel_name(relid);
+            if !relname.is_null() {
+                let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
+                let hierarchy = catalog::get_hierarchy(&base_table);
+
+                if !hierarchy.is_empty() {
+                    let offset_cols = catalog::get_offset_columns(&base_table);
+                    let metadata_obj = catalog::get_metadata(&base_table);
+
+                    let qc_opt = constraint_map.get(&varno);
+                    let time_range = qc_opt
+                        .and_then(|q| q.start.zip(q.end))
+                        .or_else(|| get_actual_data_range(&base_table, &hierarchy));
+
+                    if let Some((ts, te)) = time_range {
+                        // Publish time range so the TAM scan can skip pages outside [ts, te].
+                        crate::SCAN_TIME_RANGE.with(|r| r.set(Some((ts, te))));
+                        
+                        let scope_values = qc_opt.and_then(|qc| {
+                            metadata_obj.as_ref().and_then(|m| {
+                                let mut map = serde_json::Map::new();
+                                for col in &m.scope_columns {
+                                    if let Some(val_tuple) = qc.scopes.get(col) {
+                                        map.insert(col.clone(), val_tuple.0.clone());
+                                    }
+                                }
+                                if map.is_empty() {
+                                    None
+                                } else {
+                                    Some(pgrx::JsonB(serde_json::Value::Object(map)))
+                                }
+                            })
+                        });
+
+                        let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
+                        let max_frame_secs = extract_group_granularity_secs(query);
+                        let segments = resolve_segments(
+                            &base_table,
+                            ts,
+                            te,
+                            &hierarchy,
+                            &dirty_ranges,
+                            tz_offset,
+                            max_frame_secs,
+                        );
+
+                        if !segments.is_empty()
+                            && (segments.len() > 1 || segments[0].source != base_table)
+                        {
+                            // Heuristic: If we have too many segments, the UNION ALL overhead might exceed the rollup benefit.
+                            // Fall back to RAW for the whole range in this case.
+                            if segments.len() > 100 {
+                                notice!("Spiral: Too many segments ({}) for '{}', falling back to RAW scan.", segments.len(), base_table);
+                                continue;
+                            }
+
+                            let Some(query_cols) =
+                                extract_supported_query_columns(query, rtable, &base_table)
+                            else {
+                                continue;
+                            };
+
+                            let mut cols = Vec::new();
+                            let base_cols_query = format!(
+                                "SELECT attname::text, atttypid::regtype::text \
+                                 FROM pg_attribute \
+                                 WHERE attrelid = '\"{}\"'::regclass \
+                                 AND attnum > 0 AND NOT attisdropped \
+                                 ORDER BY attnum",
+                                base_table.replace("\"", "\"\"")
+                            );
+                            let base_table_columns: Vec<(String, String)> = Spi::connect(|client| {
+                                Ok::<Vec<(String, String)>, spi::Error>(
+                                    client
+                                        .select(&base_cols_query, None, &[])?
+                                        .map(|r| {
+                                            let name = r.get::<String>(1).unwrap().unwrap_or_default();
+                                            let typ = r.get::<String>(2).unwrap().unwrap_or_default();
+                                            (name, typ)
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .unwrap_or_default();
+
+                            let mut col_types = std::collections::HashMap::new();
+                            for (name, typ) in &base_table_columns {
+                                col_types.insert(name.clone(), typ.clone());
+                            }
+
+                            for (c, _typ) in &base_table_columns {
+                                if c == "t" {
+                                    continue;
+                                }
+                                if let Some((_, agg)) = query_cols.iter().find(|(name, _)| name == c)
                                 {
-                                    let Some(query_cols) = extract_supported_query_columns(
-                                        query,
-                                        rtable,
-                                        &base_table,
-                                    ) else {
-                                        continue;
-                                    };
-                                    // Build cols from ALL base table columns to match original
-                                    // table's column positions (Var.varattno references).
-                                    // Aggregate columns get their agg function; others get None.
-                                    // construct_union_sql_hierarchical NULL-fills columns that
-                                    // don't exist in the rollup tier.
-                                    let mut cols = Vec::new();
-                                    let base_cols_query = format!(
-                                        "SELECT attname::text, atttypid::regtype::text \
-                                         FROM pg_attribute \
-                                         WHERE attrelid = '\"{}\"'::regclass \
-                                         AND attnum > 0 AND NOT attisdropped \
-                                         ORDER BY attnum",
-                                        base_table.replace("\"", "\"\"")
-                                    );
-                                    let base_table_columns: Vec<(String, String)> =
-                                        Spi::connect(|client| {
-                                            Ok::<Vec<(String, String)>, spi::Error>(
-                                                client
-                                                    .select(&base_cols_query, None, &[])?
-                                                    .map(|r| {
-                                                        let name = r
-                                                            .get::<String>(1)
-                                                            .unwrap()
-                                                            .unwrap_or_default();
-                                                        let typ = r
-                                                            .get::<String>(2)
-                                                            .unwrap()
-                                                            .unwrap_or_default();
-                                                        (name, typ)
-                                                    })
-                                                    .collect(),
-                                            )
-                                        })
-                                        .unwrap_or_default();
-
-                                    // col_types: name -> original SQL type for casting
-                                    let mut col_types: std::collections::HashMap<
-                                        String,
-                                        String,
-                                    > = std::collections::HashMap::new();
-                                    for (name, typ) in &base_table_columns {
-                                        col_types.insert(name.clone(), typ.clone());
-                                    }
-
-                                    for (c, _typ) in &base_table_columns {
-                                        if c == "t" {
-                                            continue;
-                                        }
-                                        if let Some((_, agg)) =
-                                            query_cols.iter().find(|(name, _)| name == c)
-                                        {
-                                            cols.push((c.clone(), agg.clone()));
-                                        } else {
-                                            cols.push((c.clone(), None));
-                                        }
-                                    }
-
-                                    // Ordered (col, val_str) pairs for z-order bound injection.
-                                    let scope_vals: Vec<(String, String)> = qc_opt
-                                        .and_then(|qc| {
-                                            metadata_obj.as_ref().map(|m| {
-                                                m.scope_columns
-                                                    .iter()
-                                                    .filter_map(|col| {
-                                                        qc.scopes.get(col).and_then(|val_tuple| match &val_tuple.0 {
-                                                            serde_json::Value::Number(n) => {
-                                                                Some((col.clone(), n.to_string()))
-                                                            }
-                                                            serde_json::Value::String(s) => {
-                                                                Some((col.clone(), s.clone()))
-                                                            }
-                                                            _ => None,
-                                                        })
-                                                    })
-                                                    .collect()
-                                            })
-                                        })
-                                        .unwrap_or_default();
-
-                                    let in_vals: Vec<(String, Vec<String>)> = Vec::new(); // Placeholder
-
-                                    let union_sql = construct_union_sql_hierarchical(
-                                        &base_table,
-                                        &segments,
-                                        &cols,
-                                        &offset_cols,
-                                        &col_types,
-                                        &scope_vals,
-                                        &in_vals,
-                                    );
-
-                                    let new_query = parse_sql_to_query(&union_sql);
-                                    if !new_query.is_null() {
-                                        (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
-                                        (*rte).subquery = new_query;
-                                        (*rte).relid = pg_sys::InvalidOid;
-                                        (*rte).perminfoindex = 0;
-
-                                        // Build column formulas map for the rewriter
-                                        let mut column_formulas = std::collections::HashMap::new();
-                                        Spi::connect(|client| {
-                                            let q = format!(
-                                                "SELECT base_column, formula FROM spiral.sources \
-                                                 WHERE view_name = (SELECT view_name FROM spiral.metadata \
-                                                                    WHERE base_view = '{}' AND frame_seconds > 0 \
-                                                                    LIMIT 1)",
-                                                base_table.replace("'", "''")
-                                            );
-                                            if let Ok(res) = client.select(&q, None, &[]) {
-                                                for row in res {
-                                                    if let (Ok(Some(bc)), Ok(Some(f))) = (row.get::<String>(1), row.get::<String>(2)) {
-                                                        column_formulas.insert(bc, f);
-                                                    }
-                                                }
-                                            }
-                                            Ok::<(), spi::Error>(())
-                                        }).unwrap_or(());
-
-                                        // Rewrite top-level aggregates to their merge equivalents
-                                        rewrite_query_aggregates(query, &column_formulas, varno);
-                                        // Neutralize consumed constraints from the outer query to avoid double verification.
-                                        if let Some(qc) = constraint_map.get(&varno) {
-                                            if let Some(node) = qc.start_node {
-                                                neutralize_op_expr(node);
-                                            }
-                                            if let Some(node) = qc.end_node {
-                                                neutralize_op_expr(node);
-                                            }
-                                            for (_, (_, node)) in &qc.scopes {
-                                                neutralize_op_expr(*node);
-                                            }
-                                        }
-
-                                        // Notice fires only after acceleration confirmed.
-                                        notice!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
-                                        continue; // Accelerated, move to next RTE
-                                    }
+                                    cols.push((c.clone(), agg.clone()));
+                                } else {
+                                    cols.push((c.clone(), None));
                                 }
                             }
 
-                            // Fallback reconstruction if not accelerated but has offset columns
-                            let is_rollup_table = metadata_obj
-                                .as_ref()
-                                .map(|m| m.frame_seconds > 0)
-                                .unwrap_or(false);
-
-                            if !offset_cols.is_empty() && is_rollup_table {
-                                let base_cols_query = format!(
-                                    "SELECT attname::text FROM pg_attribute
-                                     WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped
-                                     ORDER BY attnum",
-                                    base_table.replace("\"", "\"\"")
-                                );
-                                let all_cols = Spi::connect(|client| {
-                                    Ok::<Vec<String>, spi::Error>(
-                                        client
-                                            .select(&base_cols_query, None, &[])?
-                                            .map(|r| r.get::<String>(1).unwrap().unwrap())
-                                            .collect(),
-                                    )
+                            let scope_vals: Vec<(String, String)> = qc_opt
+                                .and_then(|qc| {
+                                    metadata_obj.as_ref().map(|m| {
+                                        m.scope_columns
+                                            .iter()
+                                            .filter_map(|col| {
+                                                qc.scopes.get(col).and_then(|val_tuple| match &val_tuple.0 {
+                                                    serde_json::Value::Number(n) => {
+                                                        Some((col.clone(), n.to_string()))
+                                                    }
+                                                    serde_json::Value::String(s) => {
+                                                        Some((col.clone(), s.clone()))
+                                                    }
+                                                    _ => None,
+                                                })
+                                            })
+                                            .collect()
+                                    })
                                 })
                                 .unwrap_or_default();
 
-                                let select_list: Vec<String> = all_cols
-                                    .iter()
-                                    .map(|col| {
-                                        if let Some(oc) =
-                                            offset_cols.iter().find(|o| &o.mat_column == col)
-                                        {
-                                            reconstruction_expr(col, &oc.formula, true)
-                                        } else {
-                                            format!("\"{}\"", col)
-                                        }
-                                    })
-                                    .collect();
+                            let in_vals: Vec<(String, Vec<String>)> = qc_opt
+                                .map(|qc| {
+                                    qc.in_clauses
+                                        .iter()
+                                        .map(|(col, (vals, _))| {
+                                            let val_strs = vals
+                                                .iter()
+                                                .filter_map(|v| match v {
+                                                    serde_json::Value::Number(n) => {
+                                                        Some(n.to_string())
+                                                    }
+                                                    serde_json::Value::String(s) => Some(s.clone()),
+                                                    _ => None,
+                                                })
+                                                .collect();
+                                            (col.clone(), val_strs)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
 
-                                let wrap_sql = format!(
-                                    "SELECT {} FROM \"{}\"",
-                                    select_list.join(", "),
-                                    base_table
-                                );
-                                let inner = parse_sql_to_query(&wrap_sql);
-                                if !inner.is_null() {
-                                    (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
-                                    (*rte).subquery = inner;
-                                    (*rte).relid = pg_sys::InvalidOid;
-                                    (*rte).perminfoindex = 0;
+                            let union_sql = construct_union_sql_hierarchical(
+                                &base_table,
+                                &segments,
+                                &cols,
+                                &offset_cols,
+                                &col_types,
+                                &scope_vals,
+                                &in_vals,
+                            );
+
+                            let new_query = parse_sql_to_query(&union_sql);
+                            if !new_query.is_null() {
+                                (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
+                                (*rte).subquery = new_query;
+                                (*rte).relid = pg_sys::InvalidOid;
+                                (*rte).perminfoindex = 0;
+
+                                let mut column_formulas = std::collections::HashMap::new();
+                                Spi::connect(|client| {
+                                    let q = format!(
+                                        "SELECT base_column, formula FROM spiral.sources \
+                                         WHERE view_name = (SELECT view_name FROM spiral.metadata \
+                                                            WHERE base_view = '{}' AND frame_seconds > 0 \
+                                                            LIMIT 1)",
+                                        base_table.replace("'", "''")
+                                    );
+                                    if let Ok(res) = client.select(&q, None, &[]) {
+                                        for row in res {
+                                            if let (Ok(Some(bc)), Ok(Some(f))) = (row.get::<String>(1), row.get::<String>(2)) {
+                                                column_formulas.insert(bc, f);
+                                            }
+                                        }
+                                    }
+                                    Ok::<(), spi::Error>(())
+                                }).unwrap_or(());
+
+                                rewrite_query_aggregates(query, &column_formulas, varno);
+                                
+                                if let Some(qc) = qc_opt {
+                                    if let Some(node) = qc.start_node { neutralize_op_expr(node); }
+                                    if let Some(node) = qc.end_node { neutralize_op_expr(node); }
+                                    for (_, (_, node)) in &qc.scopes { neutralize_op_expr(*node); }
                                 }
+
+                                notice!("Spiral: Accelerating '{}' (RTE #{}) with range {} to {} (Offset: {}s)", base_table, varno, format_epoch(ts), format_epoch(te), tz_offset);
                             }
+                        }
+                    }
+
+                    // Fallback reconstruction if not accelerated but has offset columns
+                    let is_rollup_table = metadata_obj.as_ref().map(|m| m.frame_seconds > 0).unwrap_or(false);
+                    if !offset_cols.is_empty() && is_rollup_table && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
+                        let base_cols_query = format!(
+                            "SELECT attname::text FROM pg_attribute
+                             WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped
+                             ORDER BY attnum",
+                            base_table.replace("\"", "\"\"")
+                        );
+                        let all_cols = Spi::connect(|client| {
+                            Ok::<Vec<String>, spi::Error>(
+                                client
+                                    .select(&base_cols_query, None, &[])?
+                                    .map(|r| r.get::<String>(1).unwrap().unwrap())
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or_default();
+
+                        let select_list: Vec<String> = all_cols
+                            .iter()
+                            .map(|col| {
+                                if let Some(oc) = offset_cols.iter().find(|o| &o.mat_column == col) {
+                                    reconstruction_expr(col, &oc.formula, true)
+                                } else {
+                                    format!("\"{}\"", col)
+                                }
+                            })
+                            .collect();
+
+                        let wrap_sql = format!("SELECT {} FROM \"{}\"", select_list.join(", "), base_table);
+                        let inner = parse_sql_to_query(&wrap_sql);
+                        if !inner.is_null() {
+                            (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
+                            (*rte).subquery = inner;
+                            (*rte).relid = pg_sys::InvalidOid;
+                            (*rte).perminfoindex = 0;
                         }
                     }
                 }
             }
         }
     }
-    if let Some(prev_hook) = PREV_PLANNER_HOOK {
-        prev_hook(parse, query_string, cursor_options, bound_params)
-    } else {
-        pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
-    }
-    })) // end PgTryBuilder closure
-    .finally(|| IN_HOOK.with(|h| h.set(false)))
-    .execute()
 }
 
 #[derive(Debug)]
@@ -1273,15 +1267,26 @@ fn resolve_segments(
     max_frame_secs: Option<i64>,
 ) -> Vec<Segment> {
     let mut segments = Vec::new();
+    let (raw_rows, _) = catalog::get_table_stats(base_table);
 
-    let mut sorted_hierarchy: Vec<(String, i32)> = hierarchy
+    let mut sorted_hierarchy: Vec<(String, i32, f64)> = hierarchy
         .iter()
         .filter_map(|h| catalog::get_metadata(h).map(|m| (h.clone(), m.frame_seconds)))
         .filter(|h| h.1 > 0)
-        // Never use a rollup coarser than the query's grouping granularity —
-        // that would collapse finer time buckets into a single coarse row.
         .filter(|h| max_frame_secs.is_none_or(|max| h.1 as i64 <= max))
+        .map(|(name, secs)| {
+            let (rows, _) = catalog::get_table_stats(&name);
+            (name, secs, rows)
+        })
+        // Only keep rollups that offer significant row reduction.
+        .filter(|(_, _, rows)| {
+            if raw_rows <= 0.0 || *rows <= 0.0 {
+                return true;
+            }
+            *rows < raw_rows * 0.9
+        })
         .collect();
+    
     sorted_hierarchy.sort_by_key(|h| -h.1);
 
     let mut pool = vec![(ts, te)];
@@ -1310,7 +1315,7 @@ fn resolve_segments(
         let mut curr = clean_s;
         while curr < clean_e {
             let mut found_tier = false;
-            for (h_name, frame_secs) in &sorted_hierarchy {
+            for (h_name, frame_secs, _) in &sorted_hierarchy {
                 let f_s = *frame_secs as i64;
                 if f_s <= 0 {
                     continue;
@@ -1691,7 +1696,7 @@ pub fn generate_hierarchy_internal(
     scope_columns: Vec<String>,
     custom_cols: Vec<(String, String, Option<String>)>,
     anchor_col: String,
-    offset_cols: Vec<String>,
+    _offset_cols: Vec<String>,
 ) {
     notice!("Spiral: Entering generate_hierarchy_internal for '{}', frames='{}'", base_name, frames_str);
     let mut frames = rollup::parse_frames(frames_str);
@@ -1959,7 +1964,7 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 if !is_supported_rollup_aggregate(&fn_name) { return false; }
                 if (*agg).aggstar { if fn_name == "count" { cols.push(("*".to_string(), Some("count".to_string()))); return true; } return false; }
                 let args = (*agg).args; let num_args = if args.is_null() { 0 } else { (*args).length };
-                if (fn_name == "first" || fn_name == "last") { if num_args != 2 { return false; } } else if num_args != 1 { return false; }
+                if fn_name == "first" || fn_name == "last" { if num_args != 2 { return false; } } else if num_args != 1 { return false; }
                 let target_entry = pg_sys::list_nth(args, 0) as *mut pg_sys::TargetEntry;
                 if !walk_expr((*target_entry).expr as *mut pg_sys::Node, base_table, rtable, cols) { return false; }
                 if let Some(c) = cols.last_mut() { c.1 = Some(fn_name); } true
@@ -2187,27 +2192,80 @@ pub fn spiral_explain(query_sql: &str) -> String {
         let query_list = pg_sys::pg_analyze_and_rewrite_fixedparams(raw_parse_tree, query_string.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut());
         if query_list.is_null() || (*query_list).length == 0 { return "Error: Could not analyze query.".to_string(); }
         let query = pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query;
-        let rtable = (*query).rtable;
+        
         let mut report = String::new();
-        let (constraint_map, tz_offset) = build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
-        for i in 0..(*rtable).length {
-            let varno = (i + 1) as i32;
-            let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
-            if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION { continue; }
-            let relname = pg_sys::get_rel_name((*rte).relid); if relname.is_null() { continue; }
-            let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
-            let hierarchy = catalog::get_hierarchy(&base_table);
-            if hierarchy.is_empty() { report.push_str(&format!("Table '{}': No Spiral hierarchy found.\n", base_table)); continue; }
-            if let Some(range) = constraint_map.get(&varno) {
-                if let (Some(ts), Some(te)) = (range.start, range.end) {
-                    let segments = resolve_segments(&base_table, ts, te, &hierarchy, &catalog::get_dirty_ranges(&base_table, ts, te, None), tz_offset, None);
-                    report.push_str(&format!("--- Spiral Slicing Plan for '{}' ---\nRange: {} to {} (Offset: {}s)\n", base_table, format_epoch(ts), format_epoch(te), tz_offset));
-                    for (seg_idx, seg) in segments.iter().enumerate() { report.push_str(&format!("  Segment #{}: {} -> {} | Source: {} ({})\n", seg_idx + 1, format_epoch(seg._t_start), format_epoch(seg._t_end), seg.source, if seg.source == base_table { "RAW" } else { "ROLLUP" })); }
-                } else { report.push_str(&format!("Table '{}': Time column 't' detected but range is not static/bounded.\n", base_table)); }
-            } else { report.push_str(&format!("Table '{}': No time constraints detected on 't'.\n", base_table)); }
-            report.push('\n');
-        }
+        explain_query_recursive(query, &mut report);
         report
+    }
+}
+
+unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String) {
+    if query.is_null() { return; }
+    if (*query).commandType != pg_sys::CmdType::CMD_SELECT { return; }
+    let rtable = (*query).rtable;
+    if rtable.is_null() { return; }
+
+    let (constraint_map, tz_offset) = build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
+    report.push_str(&format!("Analyzing Query with {} relations in rtable.\n", (*rtable).length));
+
+    for i in 0..(*rtable).length {
+        let varno = (i + 1) as i32;
+        let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
+        
+        if (*rte).rtekind == pg_sys::RTEKind::RTE_SUBQUERY {
+            report.push_str(&format!("Entering Subquery at RTE #{}.\n", varno));
+            explain_query_recursive((*rte).subquery, report);
+            continue;
+        }
+
+        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION { continue; }
+        
+        let relname = pg_sys::get_rel_name((*rte).relid);
+        if relname.is_null() { continue; }
+        let base_table = CStr::from_ptr(relname).to_string_lossy().into_owned();
+        let hierarchy = catalog::get_hierarchy(&base_table);
+        if hierarchy.is_empty() { 
+            report.push_str(&format!("Table '{}' (RTE #{}): No Spiral hierarchy found.\n", base_table, varno));
+            continue; 
+        }
+
+        if let Some(range) = constraint_map.get(&varno) {
+            if let (Some(ts), Some(te)) = (range.start, range.end) {
+                let metadata_obj = catalog::get_metadata(&base_table);
+                let scope_values = metadata_obj.as_ref().and_then(|m| {
+                    let mut map = serde_json::Map::new();
+                    for col in &m.scope_columns {
+                        if let Some(val_tuple) = range.scopes.get(col) {
+                            map.insert(col.clone(), val_tuple.0.clone());
+                        }
+                    }
+                    if map.is_empty() { None } else { Some(pgrx::JsonB(serde_json::Value::Object(map))) }
+                });
+
+                let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
+                let segments = resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset, None);
+                
+                if !segments.is_empty() && (segments.len() > 1 || segments[0].source != base_table) {
+                    if segments.len() > 100 {
+                        report.push_str(&format!("Table '{}': Too many segments ({}) to accelerate efficiently. Falling back to RAW.\n", base_table, segments.len()));
+                    } else {
+                        let source_counts: std::collections::HashMap<String, usize> = segments.iter().fold(std::collections::HashMap::new(), |mut acc, s| {
+                            *acc.entry(s.source.clone()).or_insert(0) += 1;
+                            acc
+                        });
+                        let summary = source_counts.iter().map(|(src, count)| format!("{}x {}", count, src)).collect::<Vec<_>>().join(", ");
+                        report.push_str(&format!("Accelerating '{}': [{}] (Range: {} to {})\n", base_table, summary, format_epoch(ts), format_epoch(te)));
+                    }
+                } else {
+                    report.push_str(&format!("Table '{}': Range [{}, {}) is fully dirty or no rollups available.\n", base_table, format_epoch(ts), format_epoch(te)));
+                }
+            } else {
+                report.push_str(&format!("Table '{}' (RTE #{}): Constraints found but no clear time range (start={:?}, end={:?}).\n", base_table, varno, range.start, range.end));
+            }
+        } else {
+            report.push_str(&format!("Table '{}' (RTE #{}): No constraints found for this relation.\n", base_table, varno));
+        }
+        report.push('\n');
     }
 }
 
