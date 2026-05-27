@@ -24,6 +24,61 @@ pub fn is_in_utility_for_test() -> bool {
     IN_UTILITY.with(|h| h.get())
 }
 
+pub fn parse_magic_comments(query: &str) -> Vec<(String, String, Option<String>)> {
+    let mut results = Vec::new();
+    let re_col = regex::Regex::new(r"(\w+)\s+[^,]+,?[ \t]*--\s*Spiral:\s*([^\n\r]+)").unwrap();
+
+    for cap in re_col.captures_iter(query) {
+        let col_name = cap[1].to_string();
+        let formula_part = cap[2].trim().to_string();
+
+        let mut formulas = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0;
+        for c in formula_part.chars() {
+            match c {
+                '(' => { depth += 1; current.push(c); }
+                ')' => { depth -= 1; current.push(c); }
+                ',' if depth == 0 => {
+                    formulas.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(c),
+            }
+        }
+        if !current.is_empty() {
+            formulas.push(current.trim().to_string());
+        }
+
+        for part in formulas {
+            if part.is_empty() { continue; }
+            let (formula_raw, alias) = if let Some((f, a)) = part.split_once(" as ") {
+                (f.trim().to_string(), Some(a.trim().to_string()))
+            } else if let Some((f, a)) = part.split_once(" AS ") {
+                (f.trim().to_string(), Some(a.trim().to_string()))
+            } else {
+                (part.trim().to_string(), None)
+            };
+
+            if formula_raw.starts_with("product(") && formula_raw.ends_with(')') {
+                let args_str = &formula_raw[8..formula_raw.len() - 1];
+                let args: Vec<&str> = args_str.split(',').map(|s| s.trim()).collect();
+                if args.len() == 2 {
+                    let default_alias = format!("{}_{}_product", args[0], args[1]);
+                    results.push((
+                        format!("{} * {}", args[0], args[1]),
+                        "sum".to_string(),
+                        alias.or(Some(default_alias)),
+                    ));
+                    continue;
+                }
+            }
+            results.push((col_name.clone(), formula_raw, alias));
+        }
+    }
+    results
+}
+
 #[pg_guard]
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C-unwind" fn spiral_process_utility_hook(
@@ -193,12 +248,15 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 query_str.len()
             );
 
+            let captured_cols = parse_magic_comments(&query_str);
+
             if !extracted_frames.is_empty()
                 || !extracted_tenant.is_empty()
                 || !extracted_cardinality.is_empty()
                 || !extracted_time_column.is_empty()
+                || !captured_cols.is_empty()
             {
-                notice!("Spiral: WITH parameters found, setting access method to 'spiral' and calling standard_ProcessUtility...");
+                notice!("Spiral: WITH parameters or magic comments found, setting access method to 'spiral' and calling standard_ProcessUtility...");
                 if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
                     prev(
                         pstmt,
@@ -266,7 +324,11 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 });
 
                 // 2. Parse frames
-                let frames_str = extracted_frames.clone();
+                let frames_str = if extracted_frames.trim().is_empty() {
+                    "1m,1d,1M".to_string()
+                } else {
+                    extracted_frames.clone()
+                };
 
                 // 3. Detect Scope (Tenant) columns via Foreign Keys or extracted tenant
                 let scope_columns = if !extracted_tenant.is_empty() {
@@ -294,53 +356,21 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                     .unwrap_or_default()
                 };
 
-                // [ \t]* (not \s*) between type and -- so the comment must be on the
-                // same line as the column definition, preventing cross-line false positives.
-                let re_col =
-                    regex::Regex::new(r"(\w+)\s+[\w\(\) ]+,?[ \t]*--\s*Spiral:\s*([^\n\r]+)").unwrap();
-                let mut captured_cols = Vec::new();
-                for cap in re_col.captures_iter(&query_str) {
-                    let col_name = cap[1].to_string();
-
-                    // col_name must be an actual column in the table — filters out
-                    // false positives where a prose comment mentions "Spiral:".
-                    if !col_types_map.contains_key(&col_name) {
-                        continue;
-                    }
-
-                    let formula_part = cap[2].trim().to_string();
-
-                    // Support multiple formulas separated by comma, and 'as alias' syntax
-                    for part in formula_part.split(',') {
-                        let part = part.trim();
-                        if part.is_empty() {
-                            continue;
+                let validated_cols: Vec<(String, String, Option<String>)> = captured_cols
+                    .into_iter()
+                    .filter_map(|(col_name, formula, alias)| {
+                        if col_name.contains('*') || col_name.contains('(') {
+                            return Some((col_name, formula, alias));
                         }
-
-                        let (formula, alias) = if let Some((f, a)) = part.split_once(" as ") {
-                            (f.trim().to_string(), Some(a.trim().to_string()))
-                        } else if let Some((f, a)) = part.split_once(" AS ") {
-                            (f.trim().to_string(), Some(a.trim().to_string()))
+                        if let Some(&oid) = col_types_map.get(&col_name) {
+                            validate_formula_column_type(&col_name, &formula, oid);
+                            Some((col_name, formula, alias))
                         } else {
-                            (part.to_string(), None)
-                        };
-
-                        // Formula must be a single identifier — rejects prose like
-                        // "id for the record" that leaks through the regex.
-                        if formula.split_whitespace().count() > 1 {
-                            error!(
-                                "Spiral: directive on column '{}' has invalid formula '{}' — must be a single identifier",
-                                col_name, formula
-                            );
+                            notice!("Spiral: magic comment on unknown column '{}', skipping", col_name);
+                            None
                         }
-
-                        // Type-compatibility check for known formulas.
-                        let col_oid = col_types_map.get(&col_name).copied().unwrap_or(pg_sys::InvalidOid);
-                        validate_formula_column_type(&col_name, &formula, col_oid);
-
-                        captured_cols.push((col_name.clone(), formula, alias));
-                    }
-                }
+                    })
+                    .collect();
 
                 // 4. Register the BASE table metadata
                 let mut base_metadata_map = serde_json::Map::new();
@@ -374,18 +404,20 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 );
                 create_reconstruction_view(&name);
 
-                install_changelog_triggers(&name, &extracted_frames);
+                install_changelog_triggers(&name, &frames_str);
 
                 // 5. Generate the entire hierarchy automatically
-                notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
-                generate_hierarchy_internal(
-                    &name,
-                    &frames_str,
-                    scope_columns,
-                    captured_cols,
-                    anchor_col,
-                    offset_cols,
-                );
+                if !validated_cols.is_empty() {
+                    notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
+                    generate_hierarchy_internal(
+                        &name,
+                        &frames_str,
+                        scope_columns,
+                        validated_cols,
+                        anchor_col,
+                        offset_cols,
+                    );
+                }
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
 
@@ -1063,7 +1095,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                         {
                             // Heuristic: If we have too many segments, the UNION ALL overhead might exceed the rollup benefit.
                             // Fall back to RAW for the whole range in this case.
-                            if segments.len() > 100 {
+                            if segments.len() > crate::PLANNER_MAX_SEGMENTS.get() as usize {
                                 notice!("Spiral: Too many segments ({}) for '{}', falling back to RAW scan.", segments.len(), base_table);
                                 continue;
                             }
@@ -2246,7 +2278,7 @@ unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String
                 let segments = resolve_segments(&base_table, ts, te, &hierarchy, &dirty_ranges, tz_offset, None);
                 
                 if !segments.is_empty() && (segments.len() > 1 || segments[0].source != base_table) {
-                    if segments.len() > 100 {
+                    if segments.len() > crate::PLANNER_MAX_SEGMENTS.get() as usize {
                         report.push_str(&format!("Table '{}': Too many segments ({}) to accelerate efficiently. Falling back to RAW.\n", base_table, segments.len()));
                     } else {
                         let source_counts: std::collections::HashMap<String, usize> = segments.iter().fold(std::collections::HashMap::new(), |mut acc, s| {

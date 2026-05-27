@@ -21,6 +21,7 @@ pub static WORKER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
 pub static WORKER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10);
 pub static ENABLE_PLANNER_HOOK: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub static PLANNER_MAX_SEGMENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
 
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
@@ -79,6 +80,17 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         c"Enable or disable the Spiral planner hook",
         c"When false, standard PostgreSQL planning path is used without Spiral-specific optimizations.",
         &ENABLE_PLANNER_HOOK,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"spiral.planner_max_segments",
+        c"Maximum segments for hierarchical UNION ALL before falling back to RAW",
+        c"Limits plan complexity by choosing RAW scan when rollups are too fragmented.",
+        &PLANNER_MAX_SEGMENTS,
+        0,
+        10000,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -872,10 +884,10 @@ mod tests {
     #[pg_test]
     fn test_hilbert_2d_correctness() {
         use crate::zorder::spiral_hilbert_2d;
-        assert_eq!(spiral_hilbert_2d(0, 0), 0);
-        assert_eq!(spiral_hilbert_2d(1, 0), 1);
-        assert_eq!(spiral_hilbert_2d(0, 1), 2);
-        assert_eq!(spiral_hilbert_2d(1, 1), 3);
+        assert_eq!(spiral_hilbert_2d(0, 0).to_string(), "0");
+        assert_eq!(spiral_hilbert_2d(1, 0).to_string(), "1");
+        assert_eq!(spiral_hilbert_2d(0, 1).to_string(), "2");
+        assert_eq!(spiral_hilbert_2d(1, 1).to_string(), "3");
     }
 
     #[pg_test]
