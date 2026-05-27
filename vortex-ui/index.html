@@ -278,11 +278,17 @@
             .cmp-spiral { background: var(--green); }
             .cmp-xor    { background: var(--purple); }
             .cmp-val   { width: 40px; text-align: right; color: var(--text); font-size: 10px; white-space: nowrap; flex-shrink: 0; }
+.three-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+}
+.four-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+}
 
-            .three-grid {
-                display: grid;
-                grid-template-columns: repeat(3, 1fr);
-                gap: 4px;
                 margin-top: 4px;
             }
             .tg-cell { text-align: center; padding: 4px 2px; }
@@ -355,14 +361,21 @@
                 z-index: 10;
             }
             .page-cell.selected {
-                opacity: 1;
-                transform: scale(1.15);
-                outline: 1.5px solid var(--text);
-                outline-offset: 1px;
-                position: relative;
-                z-index: 5;
+               opacity: 1;
+               transform: scale(1.15);
+               outline: 1.5px solid var(--text);
+               outline-offset: 1px;
+               position: relative;
+               z-index: 5;
             }
 
+            .page-loading-hint {
+               font-size: 9px;
+               color: var(--muted);
+               padding: 4px;
+               width: 100%;
+               font-style: italic;
+            }
             .ticker {
                 margin-top: auto;
                 padding-top: 8px;
@@ -424,20 +437,51 @@
                 padding-top: 8px;
             }
             .charts-meta {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
                 font-size: 9px;
                 color: var(--muted);
-                margin-bottom: 6px;
+                margin-bottom: 8px;
             }
             .charts-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+                gap: 8px;
+            }
+            .chart-item {
+                background: rgba(255,255,255,0.02);
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                padding: 6px;
+                overflow: hidden;
+            }
+            .chart-container {
                 display: flex;
                 flex-direction: column;
                 gap: 4px;
             }
-            .chart-item {
-                background: rgba(255,255,255,0.02);
-                border-radius: 3px;
-                padding: 2px;
-                overflow: hidden;
+            .chart-legend {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                padding: 4px 6px;
+                border-top: 1px solid rgba(255,255,255,0.03);
+            }
+            .legend-item {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+            }
+            .legend-dot {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                flex-shrink: 0;
+            }
+            .legend-label {
+                font-size: 9px;
+                color: var(--muted);
             }
 
             /* ─── QUERY PANEL ─────────────────────────── */

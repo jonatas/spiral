@@ -1,60 +1,24 @@
-use futures_util::stream::StreamExt;
-use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
+use futures_util::StreamExt;
+use gloo_net::websocket::Message;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsValue;
 
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format!($($t)*).into()))
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ChangelogEntry {
-    event_id: i64,
-    base_view: String,
-    scope_values: serde_json::Value,
-    t_start: i64,
-    t_end: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct SourceInfo {
-    view_name: String,
-    base_view: String,
-    frame_seconds: i32,
-    base_column: String,
-    formula: String,
-    mat_column: String,
-    rollup_gsub_strategy: Option<String>,
-    metadata: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct BlockInfo {
-    blkno: i32,
-    t_range: [i64; 2],
-    tenant_range: [i32; 2],
-    tuple_count: i64,
-    is_boundary: bool,
-    drift_records: i64,
-    alignment_pct: f64,
-    #[serde(default)]
-    t_actual_start: i64,
-    #[serde(default)]
-    t_actual_end: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct StorageStats {
-    #[serde(default)]
     base_view: String,
-    #[serde(default)]
     view_name: String,
     total_pages: i64,
     total_rows_capacity: i64,
+    #[serde(default)]
+    row_count: i64,
     tenant_scale: i64,
     spiral_size_kb: i64,
     projected_heap_size_kb: i64,
@@ -66,28 +30,29 @@ struct StorageStats {
     page_size: i64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct AggregationLevel {
     frame_seconds: i32,
     view_name: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 struct HierarchyConfig {
     base_view: String,
     raw_view_name: String,
+    time_column: String,
     aggregation_levels: Vec<AggregationLevel>,
     tenant_scale: i64,
     sources: Vec<SourceInfo>,
     kickoff_epoch: i64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 struct SystemConfig {
     hierarchies: Vec<HierarchyConfig>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", content = "data")]
 enum VortexEvent {
     ChangelogUpdate(ChangelogEntry),
@@ -95,7 +60,7 @@ enum VortexEvent {
     SystemConfig(SystemConfig),
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct SliceResponse {
     view_name: String,
     #[serde(default)]
@@ -104,9 +69,11 @@ struct SliceResponse {
     scope_col: String,
     count: usize,
     rows: Vec<serde_json::Value>,
+    #[serde(skip)]
+    fetch_ms: f64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct ExplainResult {
     ok: bool,
     #[serde(default)]
@@ -158,9 +125,7 @@ fn format_epoch_seconds(epoch: i64) -> String {
         return "—".to_string();
     }
     let date = js_sys::Date::new(&JsValue::from_f64(epoch as f64 * 1000.0));
-    // Use ISO format: 2024-01-15T00:00:00Z
     let iso = date.to_iso_string().as_string().unwrap_or_default();
-    // Trim to just the datetime without trailing .000Z
     iso.trim_end_matches('Z')
         .trim_end_matches(".000")
         .to_string()
@@ -177,19 +142,92 @@ fn format_bytes(kb: i64) -> String {
     }
 }
 
-fn extract_numeric_cols(rows: &[serde_json::Value], time_col: &str, scope_col: &str) -> Vec<String> {
-    let Some(first) = rows.first() else { return vec![] };
+fn format_short_time(epoch: f64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(epoch * 1000.0));
+    format!(
+        "{:02}:{:02}:{:02}",
+        date.get_utc_hours(),
+        date.get_utc_minutes(),
+        date.get_utc_seconds()
+    )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ChartDef {
+    Line(String),
+    Bar(String),
+    Candlestick(String),
+    Stats(String),
+}
+
+fn determine_charts(slice: &SliceResponse, sources: &[SourceInfo]) -> Vec<ChartDef> {
+    let Some(first) = slice.rows.first() else { return vec![] };
     let Some(obj) = first.as_object() else { return vec![] };
-    let mut cols: Vec<String> = obj
-        .iter()
-        .filter(|(k, v)| {
-            let s = k.as_str();
-            s != "t_epoch" && s != time_col && s != scope_col && v.as_f64().is_some()
-        })
-        .map(|(k, _)| k.clone())
-        .collect();
-    cols.sort();
-    cols
+    
+    let mut charts = Vec::new();
+    for (k, v) in obj {
+        let s = k.as_str();
+        if s == "t_epoch" || s == slice.time_col || s == slice.scope_col {
+            continue;
+        }
+        
+        // Find source formula if available
+        let formula = sources.iter()
+            .find(|src| src.mat_column == s)
+            .map(|src| src.formula.as_str())
+            .unwrap_or("");
+            
+        if let Some(o) = v.as_object() {
+            if o.contains_key("open") && o.contains_key("close") {
+                charts.push(ChartDef::Candlestick(k.clone()));
+            } else if o.contains_key("m1") && o.contains_key("m2") {
+                charts.push(ChartDef::Stats(k.clone()));
+            }
+        } else if v.as_f64().is_some() {
+            if formula == "sum" {
+                charts.push(ChartDef::Bar(k.clone()));
+            } else {
+                charts.push(ChartDef::Line(k.clone()));
+            }
+        }
+    }
+    charts.sort_by_key(|c| match c {
+        ChartDef::Line(s) => (0, s.clone()),
+        ChartDef::Bar(s) => (1, s.clone()),
+        ChartDef::Candlestick(s) => (2, s.clone()),
+        ChartDef::Stats(s) => (3, s.clone()),
+    });
+    charts
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct SourceInfo {
+    view_name: String,
+    base_column: String,
+    formula: String,
+    mat_column: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct ChangelogEntry {
+    event_id: i64,
+    base_view: String,
+    t_start: String,
+    t_end: String,
+    ops: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct BlockInfo {
+    blkno: i32,
+    tuple_count: i32,
+    alignment_pct: f64,
+    drift_records: i32,
+    t_range: [i64; 2],
+    tenant_range: [i32; 2],
+    is_boundary: bool,
+    t_actual_start: i64,
+    t_actual_end: i64,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -215,7 +253,6 @@ fn HierarchyTree(
                 .cloned()
                 .collect();
             let sources = h.sources.clone();
-            let raw_view = h.raw_view_name.clone();
             let active_tier = selected_tier.get();
 
             view! {
@@ -227,7 +264,7 @@ fn HierarchyTree(
                     >
                         <span class="node-glyph">"▸"</span>
                         <span class="node-tier node-raw">"RAW"</span>
-                        <span class="node-name">{raw_view}</span>
+                        <span class="node-name">{h.base_view.clone()}</span>
                     </div>
                     {levels.into_iter().enumerate().map(|(i, level)| {
                         let sec = level.frame_seconds;
@@ -292,25 +329,53 @@ fn PageMap(
     selected_page: Signal<Option<i32>>,
     on_click: impl Fn(i32) + 'static + Send + Clone,
 ) -> impl IntoView {
+    let visible_limit = RwSignal::new(200);
+
+    Effect::new(move |_| {
+        let _ = total_pages.get();
+        visible_limit.set(200);
+    });
+
+    Effect::new(move |_| {
+        let total = total_pages.get() as i32;
+        let current = visible_limit.get();
+        if current < total && current < 5000 {
+            gloo_timers::callback::Timeout::new(30, move || {
+                visible_limit.update(|c| *c = (*c + 400).min(total));
+            })
+            .forget();
+        }
+    });
+
     view! {
         <div class="page-map">
             {move || {
                 let total = total_pages.get();
+                let limit = visible_limit.get() as i64;
                 let scale = tenant_scale.get().max(1) as i32;
                 let sel = selected_page.get();
-                (0..total.min(800) as i32).map(|idx| {
-                    let color = get_color_for_tenant(idx % scale, scale);
-                    let on_click = on_click.clone();
-                    let is_sel = sel == Some(idx);
-                    view! {
-                        <div
-                            class=if is_sel { "page-cell selected" } else { "page-cell" }
-                            style=format!("background:{}", color)
-                            on:click=move |_| on_click(idx)
-                            title=format!("Page {}", idx)
-                        ></div>
-                    }
-                }).collect::<Vec<_>>()
+                (0..total.min(limit) as i32)
+                    .map(|idx| {
+                        let color = get_color_for_tenant(idx % scale, scale);
+                        let on_click = on_click.clone();
+                        let is_sel = sel == Some(idx);
+                        view! {
+                            <div
+                                class=if is_sel { "page-cell selected" } else { "page-cell" }
+                                style=format!("background:{}", color)
+                                on:click=move |_| on_click(idx)
+                                title=format!("Page {}", idx)
+                            ></div>
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }}
+            {move || {
+                let total = total_pages.get() as i32;
+                let current = visible_limit.get();
+                (current < total && current < 5000).then(|| {
+                    view! { <div class="page-loading-hint">"loading more..."</div> }
+                })
             }}
         </div>
     }
@@ -411,9 +476,12 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
         }
     };
 
+    let xor_rows_per_page = || {
+        (1018.0 / 16.0) * 61.0
+    };
+
     view! {
         <div class="cmp-panel">
-            // live stats from server
             {move || {
                 let s = stats.get();
                 (s.spiral_size_kb > 0).then(|| view! {
@@ -438,7 +506,6 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 })
             }}
 
-            // bytes per row bars
             <div class="cmp-section-label">"BYTES / ROW"</div>
             <div class="cmp-bar-row">
                 <span class="cmp-lbl">"Heap"</span>
@@ -464,24 +531,22 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 <span class="cmp-val">"~2.1 B"</span>
             </div>
 
-            // IO tax
-            <div class="cmp-section-label" style="margin-top:10px;">"IO TAX — PG / 1K ROWS"</div>
+            <div class="cmp-section-label" style="margin-top:10px;">"IO TAX — PAGES / 1K ROWS"</div>
             <div class="three-grid">
                 <div class="tg-cell">
                     <span class="tg-label">"HEAP"</span>
-                    <span class="tg-value tg-red">{format!("{:.0}", (1000.0_f64 / HEAP_ROWS_PER_PAGE).ceil())}</span>
+                    <span class="tg-value tg-red">{format!("{:.1}", 1000.0_f64 / HEAP_ROWS_PER_PAGE)}</span>
                 </div>
                 <div class="tg-cell">
                     <span class="tg-label">"SPIRAL"</span>
-                    <span class="tg-value tg-green">{move || format!("{:.2}", 1000.0_f64 / spiral_rows_per_page())}</span>
+                    <span class="tg-value tg-green">{move || format!("{:.1}", 1000.0_f64 / spiral_rows_per_page())}</span>
                 </div>
                 <div class="tg-cell">
-                    <span class="tg-label">"SPEEDUP"</span>
-                    <span class="tg-value tg-blue">{move || format!("{:.0}x", spiral_rows_per_page() / HEAP_ROWS_PER_PAGE)}</span>
+                    <span class="tg-label">"XOR-BK"</span>
+                    <span class="tg-value tg-purple">{format!("{:.2}", 1000.0_f64 / xor_rows_per_page())}</span>
                 </div>
             </div>
 
-            // savings calculator
             <div class="cmp-section-label" style="margin-top:10px;">"SAVINGS CALCULATOR"</div>
             <div class="slider-row">
                 <input
@@ -499,7 +564,7 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                     else { format!("{:.0}K rows", n / 1e3) }
                 }}</span>
             </div>
-            <div class="three-grid">
+            <div class="four-grid">
                 <div class="tg-cell">
                     <span class="tg-label">"HEAP"</span>
                     <span class="tg-value tg-red">{move || {
@@ -515,9 +580,408 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                     }}</span>
                 </div>
                 <div class="tg-cell">
-                    <span class="tg-label">"SAVED"</span>
-                    <span class="tg-value tg-green">{move || format!("{:.1}%", (1.0 - spiral_bpr() / HEAP_BYTES_PER_ROW) * 100.0)}</span>
+                    <span class="tg-label">"XOR"</span>
+                    <span class="tg-value tg-purple">{move || {
+                        let gb = 10.0_f64.powf(row_count_exp.get()) * XOR_BLOCK_BYTES_PER_ROW / (1024.0 * 1024.0 * 1024.0);
+                        if gb < 1.0 { format!("{:.0}MB", gb * 1024.0) } else { format!("{:.1}GB", gb) }
+                    }}</span>
                 </div>
+                <div class="tg-cell">
+                    <span class="tg-label">"SAVED"</span>
+                    <span class="tg-value tg-green">{move || format!("{:.0}%", (1.0 - XOR_BLOCK_BYTES_PER_ROW / HEAP_BYTES_PER_ROW) * 100.0)}</span>
+                </div>
+            </div>
+
+            <div class="cmp-section-label" style="margin-top:10px;">"1B ROWS PROJECTION (XOR)"</div>
+            <div class="ls-row">
+                <span class="ls-label">"Storage"</span>
+                <span class="ls-value tg-purple">"1.9 GB"</span>
+            </div>
+            <div class="ls-row">
+                <span class="ls-label">"Heap equiv"</span>
+                <span class="ls-value ls-dim">"44.7 GB"</span>
+            </div>
+            <div class="ls-row">
+                <span class="ls-label">"Mathematical Saving"</span>
+                <span class="ls-value ls-green">"95.6%"</span>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn SvgCandlestickChart(
+    rows: Vec<serde_json::Value>,
+    scope_col: String,
+    metric_col: String,
+    volume_col: Option<String>,
+) -> impl IntoView {
+    const W: f64 = 300.0;
+    const H: f64 = 140.0;
+    const MX: f64 = 6.0;
+    const MY: f64 = 16.0;
+    const MB: f64 = 24.0;
+    let plot_w = W - MX * 2.0;
+    let plot_h = H - MY - MB;
+    let main_h = if volume_col.is_some() { plot_h * 0.7 } else { plot_h };
+    let vol_h = plot_h - main_h - 4.0;
+
+    let mut t_min: f64 = 0.0;
+    let mut t_max: f64 = 1.0;
+    let mut v_min: f64 = 0.0;
+    let mut v_max: f64 = 1.0;
+    let mut vol_max: f64 = 1.0;
+    let mut has_data = false;
+    
+    struct Candle {
+        t: f64,
+        o: f64,
+        h: f64,
+        l: f64,
+        c: f64,
+        vol: f64,
+    }
+    let mut by_tenant: BTreeMap<i64, Vec<Candle>> = BTreeMap::new();
+
+    for row in &rows {
+        let Some(t) = row.get("t_epoch").and_then(|v| v.as_f64()) else { continue };
+        let Some(m) = row.get(&metric_col).and_then(|v| v.as_object()) else { continue };
+        let o = m.get("open").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let h = m.get("high").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let l = m.get("low").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let c = m.get("close").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let vol = volume_col.as_ref().and_then(|vc| row.get(vc)).and_then(|v| v.as_f64())
+            .or_else(|| m.get("volume").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        
+        let scope = row.get(&scope_col).and_then(|v| v.as_i64()).unwrap_or(0);
+        if !has_data {
+            t_min = t; t_max = t; v_min = l; v_max = h; vol_max = vol;
+            has_data = true;
+        } else {
+            if t < t_min { t_min = t; }
+            if t > t_max { t_max = t; }
+            if l < v_min { v_min = l; }
+            if h > v_max { v_max = h; }
+            if vol > vol_max { vol_max = vol; }
+        }
+        by_tenant.entry(scope).or_default().push(Candle { t, o, h, l, c, vol });
+    }
+
+    if t_max <= t_min { t_max = t_min + 1.0; }
+    if v_max <= v_min { v_max = v_min + 1.0; }
+    if vol_max <= 0.0 { vol_max = 1.0; }
+
+    let t_range = t_max - t_min;
+    let v_range = v_max - v_min;
+    let n = by_tenant.len() as i32;
+    
+    let mut tenants_legend = Vec::new();
+
+    let grid_lines = if has_data {
+        let steps = 4;
+        (0..=steps).map(|i| {
+            let t = t_min + (t_range * i as f64 / steps as f64);
+            let x = MX + (t - t_min) / t_range * plot_w;
+            view! {
+                <line x1={x} y1={MY} x2={x} y2={MY + plot_h} stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2,2" />
+            }
+        }).collect_view()
+    } else {
+        Vec::new().collect_view()
+    };
+
+    let candles_view = by_tenant.into_iter().enumerate().map(|(ti, (tenant_id, candles))| {
+        let color = get_color_for_tenant(ti as i32, n);
+        tenants_legend.push((tenant_id, color.clone()));
+        
+        let candle_w = (plot_w / (rows.len() as f64 / n as f64).max(1.0) * 0.8).clamp(1.0, 8.0);
+
+        candles.into_iter().map(|candle| {
+            let x = MX + (candle.t - t_min) / t_range * plot_w;
+            
+            let y_h = MY + (1.0 - (candle.h - v_min) / v_range) * main_h;
+            let y_l = MY + (1.0 - (candle.l - v_min) / v_range) * main_h;
+            let y_o = MY + (1.0 - (candle.o - v_min) / v_range) * main_h;
+            let y_c = MY + (1.0 - (candle.c - v_min) / v_range) * main_h;
+            
+            let rect_y = y_o.min(y_c);
+            let rect_h = (y_o - y_c).abs().max(1.0);
+            let is_up = candle.c >= candle.o;
+            
+            let v_bar_h = (candle.vol / vol_max) * vol_h;
+            let v_bar_y = MY + plot_h - v_bar_h;
+
+            view! {
+                <g>
+                    <line x1={x} y1={y_h} x2={x} y2={y_l} stroke={color.clone()} stroke-width="1" opacity="0.6" />
+                    <rect 
+                        x={x - candle_w/2.0} 
+                        y={rect_y} 
+                        width={candle_w} 
+                        height={rect_h} 
+                        fill={if is_up { color.clone() } else { "none".to_string() }} 
+                        stroke={color.clone()} 
+                        stroke-width="1" 
+                        opacity="0.9" 
+                    />
+                    {(volume_col.is_some()).then(|| view! {
+                        <rect 
+                            x={x - candle_w/2.0} 
+                            y={v_bar_y} 
+                            width={candle_w} 
+                            height={v_bar_h} 
+                            fill={color.clone()} 
+                            opacity="0.3" 
+                        />
+                    })}
+                </g>
+            }
+        }).collect_view()
+    }).collect_view();
+
+    let label = if let Some(ref v) = volume_col {
+        format!("{} + {}", metric_col, v)
+    } else {
+        format!("{} (candles)", metric_col)
+    };
+    let vmax_s = if has_data { format!("{:.1}", v_max) } else { "—".to_string() };
+    let vmin_s = if has_data { format!("{:.1}", v_min) } else { "—".to_string() };
+    let tstart_s = if has_data { format_short_time(t_min) } else { "".to_string() };
+    let tend_s = if has_data { format_short_time(t_max) } else { "".to_string() };
+    
+    let vb = format!("0 0 {} {}", W, H);
+
+    view! {
+        <div class="chart-container">
+            <svg viewBox={vb} style="width:100%; height:140px; display:block; overflow:visible;">
+                <text x="4" y="11" font-size="9" font-weight="700" fill="var(--muted)">{label}</text>
+                <text x="296" y="11" font-size="8" fill="var(--muted)" text-anchor="end">{vmax_s}</text>
+                <text x="296" y={MY + main_h} font-size="8" fill="var(--muted)" text-anchor="end">{vmin_s}</text>
+                
+                {grid_lines}
+                
+                <text x={MX} y={H - 4.0} font-size="7" fill="var(--blue)">{tstart_s}</text>
+                <text x={W - MX} y={H - 4.0} font-size="7" fill="var(--blue)" text-anchor="end">{tend_s}</text>
+
+                {(!has_data).then(|| view! {
+                    <text x="150" y="70" font-size="10" fill="var(--muted)" text-anchor="middle">"no data"</text>
+                })}
+                {candles_view}
+                
+                <line x1={MX} y1={MY} x2={MX} y2={MY + plot_h} stroke="var(--blue)" stroke-width="1" opacity="0.4" />
+                <line x1={W - MX} y1={MY} x2={W - MX} y2={MY + plot_h} stroke="var(--blue)" stroke-width="1" opacity="0.4" />
+            </svg>
+            <div class="chart-legend">
+                {tenants_legend.into_iter().map(|(id, color)| {
+                    view! {
+                        <div class="legend-item">
+                            <span class="legend-dot" style={format!("background: {}", color)}></span>
+                            <span class="legend-label">{id}</span>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn SvgBarChart(
+    rows: Vec<serde_json::Value>,
+    scope_col: String,
+    metric_col: String,
+) -> impl IntoView {
+    const W: f64 = 300.0;
+    const H: f64 = 120.0;
+    const MX: f64 = 6.0;
+    const MY: f64 = 16.0;
+    const MB: f64 = 24.0;
+    let plot_w = W - MX * 2.0;
+    let plot_h = H - MY - MB;
+
+    let mut by_time: BTreeMap<i64, BTreeMap<i64, f64>> = BTreeMap::new();
+    let mut v_max: f64 = 1.0;
+    let mut t_min: f64 = 0.0;
+    let mut t_max: f64 = 1.0;
+    let mut has_data = false;
+
+    for row in &rows {
+        let Some(t) = row.get("t_epoch").and_then(|v| v.as_f64()) else { continue };
+        let Some(v) = row.get(&metric_col).and_then(|v| v.as_f64()) else { continue };
+        let scope = row.get(&scope_col).and_then(|v| v.as_i64()).unwrap_or(0);
+        
+        let t_i = t as i64;
+        let entry = by_time.entry(t_i).or_default();
+        *entry.entry(scope).or_default() += v;
+        
+        if !has_data {
+            t_min = t; t_max = t;
+            has_data = true;
+        } else {
+            if t < t_min { t_min = t; }
+            if t > t_max { t_max = t; }
+        }
+    }
+    
+    for scopes_map in by_time.values() {
+        let sum: f64 = scopes_map.values().sum();
+        if sum > v_max { v_max = sum; }
+    }
+
+    let mut unique_scopes: Vec<i64> = rows.iter()
+        .map(|r| r.get(&scope_col).and_then(|v| v.as_i64()).unwrap_or(0))
+        .collect();
+    unique_scopes.sort();
+    unique_scopes.dedup();
+    let n_scopes = unique_scopes.len() as i32;
+    let scope_colors: BTreeMap<i64, String> = unique_scopes.into_iter().enumerate()
+        .map(|(i, s)| (s, get_color_for_tenant(i as i32, n_scopes)))
+        .collect();
+
+    if t_max <= t_min { t_max = t_min + 1.0; }
+    let t_range = t_max - t_min;
+    let bar_w = (plot_w / (by_time.len() as f64).max(1.0) * 0.8).clamp(1.0, 15.0);
+
+    let mut tenants_legend = Vec::new();
+    for (id, color) in &scope_colors {
+        tenants_legend.push((*id, color.clone()));
+    }
+
+    let grid_lines = if has_data {
+        let steps = 4;
+        (0..=steps).map(|i| {
+            let t = t_min + (t_range * i as f64 / steps as f64);
+            let x = MX + (t - t_min) / t_range * plot_w;
+            view! {
+                <line x1={x} y1={MY} x2={x} y2={MY + plot_h} stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2,2" />
+            }
+        }).collect_view()
+    } else {
+        Vec::new().collect_view()
+    };
+
+    let bars = by_time.into_iter().map(|(t, scopes_map)| {
+        let x = MX + (t as f64 - t_min) / t_range * plot_w;
+        let mut y_offset = 0.0;
+        
+        scopes_map.into_iter().map(|(scope, v)| {
+            let h = (v / v_max) * plot_h;
+            let y = MY + plot_h - y_offset - h;
+            y_offset += h;
+            let color = scope_colors.get(&scope).cloned().unwrap_or_else(|| "#888".to_string());
+            view! {
+                <rect x={x - bar_w/2.0} y={y} width={bar_w} height={h} fill={color} opacity="0.8" />
+            }
+        }).collect_view()
+    }).collect_view();
+
+    let label = format!("{} (sum)", metric_col);
+    let vmax_s = if has_data { format!("{:.1}", v_max) } else { "—".to_string() };
+    let tstart_s = if has_data { format_short_time(t_min) } else { "".to_string() };
+    let tend_s = if has_data { format_short_time(t_max) } else { "".to_string() };
+    let vb = format!("0 0 {} {}", W, H);
+
+    view! {
+        <div class="chart-container">
+            <svg viewBox={vb} style="width:100%; height:120px; display:block; overflow:visible;">
+                <text x="4" y="11" font-size="9" font-weight="700" fill="var(--muted)">{label}</text>
+                <text x="296" y="11" font-size="8" fill="var(--muted)" text-anchor="end">{vmax_s}</text>
+                
+                {grid_lines}
+                
+                <text x={MX} y={H - 4.0} font-size="7" fill="var(--blue)">{tstart_s}</text>
+                <text x={W - MX} y={H - 4.0} font-size="7" fill="var(--blue)" text-anchor="end">{tend_s}</text>
+
+                {(!has_data).then(|| view! {
+                    <text x="150" y="60" font-size="10" fill="var(--muted)" text-anchor="middle">"no data"</text>
+                })}
+                {bars}
+                
+                <line x1={MX} y1={MY} x2={MX} y2={MY + plot_h} stroke="var(--blue)" stroke-width="1" opacity="0.4" />
+                <line x1={W - MX} y1={MY} x2={W - MX} y2={MY + plot_h} stroke="var(--blue)" stroke-width="1" opacity="0.4" />
+            </svg>
+            <div class="chart-legend">
+                {tenants_legend.into_iter().map(|(id, color)| {
+                    view! {
+                        <div class="legend-item">
+                            <span class="legend-dot" style={format!("background: {}", color)}></span>
+                            <span class="legend-label">{id}</span>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn SvgStatsChart(
+    rows: Vec<serde_json::Value>,
+    scope_col: String,
+    metric_col: String,
+) -> impl IntoView {
+    let mut rows_mean = Vec::new();
+    let mut rows_var = Vec::new();
+    let mut rows_max = Vec::new();
+    let mut rows_min = Vec::new();
+    
+    for row in &rows {
+        let Some(t_epoch) = row.get("t_epoch").cloned() else { continue };
+        let Some(scope) = row.get(&scope_col).cloned() else { continue };
+        let Some(obj) = row.get(&metric_col).and_then(|v| v.as_object()) else { continue };
+        
+        let n = obj.get("n").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let m1 = obj.get("m1").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let m2 = obj.get("m2").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let max = obj.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let min = obj.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        
+        let variance = if n > 1.0 { m2 / (n - 1.0) } else { 0.0 };
+        
+        let mut r_mean = serde_json::Map::new();
+        r_mean.insert("t_epoch".to_string(), t_epoch.clone());
+        r_mean.insert(scope_col.clone(), scope.clone());
+        r_mean.insert("val".to_string(), serde_json::json!(m1));
+        rows_mean.push(serde_json::Value::Object(r_mean));
+        
+        let mut r_var = serde_json::Map::new();
+        r_var.insert("t_epoch".to_string(), t_epoch.clone());
+        r_var.insert(scope_col.clone(), scope.clone());
+        r_var.insert("val".to_string(), serde_json::json!(variance));
+        rows_var.push(serde_json::Value::Object(r_var));
+        
+        let mut r_max = serde_json::Map::new();
+        r_max.insert("t_epoch".to_string(), t_epoch.clone());
+        r_max.insert(scope_col.clone(), scope.clone());
+        r_max.insert("val".to_string(), serde_json::json!(max));
+        rows_max.push(serde_json::Value::Object(r_max));
+        
+        let mut r_min = serde_json::Map::new();
+        r_min.insert("t_epoch".to_string(), t_epoch.clone());
+        r_min.insert(scope_col.clone(), scope.clone());
+        r_min.insert("val".to_string(), serde_json::json!(min));
+        rows_min.push(serde_json::Value::Object(r_min));
+    }
+
+    view! {
+        <div class="stats-group" style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; border: 1px solid var(--border); padding: 8px; border-radius: 4px; grid-column: 1 / -1;">
+            <div style="grid-column: 1 / -1; font-size: 10px; font-weight: 700; color: var(--muted); margin-bottom: 4px;">{format!("{} (stats breakdown)", metric_col)}</div>
+            <div class="chart-item">
+                <SvgLineChart rows={rows_mean} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"MEAN"</div>
+            </div>
+            <div class="chart-item">
+                <SvgLineChart rows={rows_var} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"VARIANCE"</div>
+            </div>
+            <div class="chart-item">
+                <SvgLineChart rows={rows_max} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"MAX"</div>
+            </div>
+            <div class="chart-item">
+                <SvgLineChart rows={rows_min} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"MIN"</div>
             </div>
         </div>
     }
@@ -530,10 +994,10 @@ fn SvgLineChart(
     metric_col: String,
 ) -> impl IntoView {
     const W: f64 = 300.0;
-    const H: f64 = 70.0;
+    const H: f64 = 120.0;
     const MX: f64 = 6.0;
-    const MY: f64 = 14.0;
-    const MB: f64 = 4.0;
+    const MY: f64 = 16.0;
+    const MB: f64 = 24.0;
     let plot_w = W - MX * 2.0;
     let plot_h = H - MY - MB;
 
@@ -567,8 +1031,24 @@ fn SvgLineChart(
     let v_range = v_max - v_min;
     let n = by_tenant.len() as i32;
 
-    let polylines = by_tenant.into_iter().enumerate().map(|(i, (_, pts))| {
+    let mut tenants_legend = Vec::new();
+
+    let grid_lines = if has_data {
+        let steps = 4;
+        (0..=steps).map(|i| {
+            let t = t_min + (t_range * i as f64 / steps as f64);
+            let x = MX + (t - t_min) / t_range * plot_w;
+            view! {
+                <line x1={x} y1={MY} x2={x} y2={MY + plot_h} stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2,2" />
+            }
+        }).collect_view()
+    } else {
+        Vec::new().collect_view()
+    };
+
+    let polylines = by_tenant.into_iter().enumerate().map(|(i, (tenant_id, pts))| {
         let color = get_color_for_tenant(i as i32, n);
+        tenants_legend.push((tenant_id, color.clone()));
         let pts_str: String = pts
             .iter()
             .map(|(t, v)| {
@@ -586,38 +1066,37 @@ fn SvgLineChart(
     let label = metric_col;
     let vmax_s = if has_data { format!("{:.1}", v_max) } else { "—".to_string() };
     let vmin_s = if has_data { format!("{:.1}", v_min) } else { "—".to_string() };
+    let tstart_s = if has_data { format_short_time(t_min) } else { "".to_string() };
+    let tend_s = if has_data { format_short_time(t_max) } else { "".to_string() };
+    
     let vb = format!("0 0 {} {}", W, H);
 
     view! {
-        <svg viewBox={vb} style="width:100%; height:70px; display:block; overflow:visible;">
-            <text x="4" y="9" font-size="8" fill="var(--muted)">{label}</text>
-            <text x="296" y="9" font-size="7" fill="var(--muted)" text-anchor="end">{vmax_s}</text>
-            <text x="296" y="67" font-size="7" fill="var(--muted)" text-anchor="end">{vmin_s}</text>
-            {(!has_data).then(|| view! {
-                <text x="150" y="42" font-size="9" fill="var(--muted)" text-anchor="middle">"no data"</text>
-            })}
-            {polylines}
-        </svg>
-    }
-}
+        <div class="chart-container">
+            <svg viewBox={vb} style="width:100%; height:120px; display:block; overflow:visible;">
+                <text x="4" y="11" font-size="9" font-weight="700" fill="var(--muted)">{label}</text>
+                <text x="296" y="11" font-size="8" fill="var(--muted)" text-anchor="end">{vmax_s}</text>
+                <text x="296" y={MY + plot_h} font-size="8" fill="var(--muted)" text-anchor="end">{vmin_s}</text>
+                
+                {grid_lines}
 
-#[component]
-fn PageDataCharts(slice: SliceResponse) -> impl IntoView {
-    let cols = extract_numeric_cols(&slice.rows, &slice.time_col, &slice.scope_col);
-    let rows = slice.rows;
-    let sc = slice.scope_col;
-    let count = slice.count;
+                <text x={MX} y={H - 4.0} font-size="7" fill="var(--blue)">{tstart_s}</text>
+                <text x={W - MX} y={H - 4.0} font-size="7" fill="var(--blue)" text-anchor="end">{tend_s}</text>
 
-    view! {
-        <div class="charts-section">
-            <div class="charts-meta">{format!("{} rows · {} columns", count, cols.len())}</div>
-            <div class="charts-grid">
-                {cols.into_iter().map(|col| {
-                    let rows_c = rows.clone();
-                    let sc_c = sc.clone();
+                {(!has_data).then(|| view! {
+                    <text x="150" y="60" font-size="10" fill="var(--muted)" text-anchor="middle">"no data"</text>
+                })}
+                {polylines}
+                
+                <line x1={MX} y1={MY} x2={MX} y2={MY + plot_h} stroke="var(--blue)" stroke-width="1" opacity="0.4" />
+                <line x1={W - MX} y1={MY} x2={W - MX} y2={MY + plot_h} stroke="var(--blue)" stroke-width="1" opacity="0.4" />
+            </svg>
+            <div class="chart-legend">
+                {tenants_legend.into_iter().map(|(id, color)| {
                     view! {
-                        <div class="chart-item">
-                            <SvgLineChart rows=rows_c scope_col=sc_c metric_col=col />
+                        <div class="legend-item">
+                            <span class="legend-dot" style={format!("background: {}", color)}></span>
+                            <span class="legend-label">{id}</span>
                         </div>
                     }
                 }).collect_view()}
@@ -627,11 +1106,57 @@ fn PageDataCharts(slice: SliceResponse) -> impl IntoView {
 }
 
 #[component]
+fn PageDataCharts(slice: SliceResponse, sources: Vec<SourceInfo>) -> impl IntoView {
+    let charts = determine_charts(&slice, &sources);
+    let rows = slice.rows;
+    let sc = slice.scope_col;
+    let count = slice.count;
+    let fetch_ms = slice.fetch_ms;
+
+    view! {
+        <div class="charts-section">
+            <div class="charts-meta">
+                <span>{format!("{} rows · {} charts", count, charts.len())}</span>
+                <span style="margin-left: 12px; color: var(--green); opacity: 0.8;">{format!("{:.1}ms fetch", fetch_ms)}</span>
+            </div>
+            <div class="charts-grid">
+                {charts.into_iter().map(|chart| {
+                    let rows_c = rows.clone();
+                    let sc_c = sc.clone();
+                    match chart {
+                        ChartDef::Line(col) => view! {
+                            <div class="chart-item">
+                                <SvgLineChart rows=rows_c scope_col=sc_c metric_col=col />
+                            </div>
+                        }.into_any(),
+                        ChartDef::Bar(col) => view! {
+                            <div class="chart-item">
+                                <SvgBarChart rows=rows_c scope_col=sc_c metric_col=col />
+                            </div>
+                        }.into_any(),
+                        ChartDef::Candlestick(col) => view! {
+                            <div class="chart-item" style="grid-column: 1 / -1;">
+                                <SvgCandlestickChart rows=rows_c scope_col=sc_c metric_col=col volume_col=None />
+                            </div>
+                        }.into_any(),
+                        ChartDef::Stats(col) => view! {
+                            <div class="chart-item" style="grid-column: 1 / -1;">
+                                <SvgStatsChart rows=rows_c scope_col=sc_c metric_col=col />
+                            </div>
+                        }.into_any(),
+                    }
+                }).collect_view()}
+            </div>
+        </div>
+    }
+}
+
+#[component]
 fn App() -> impl IntoView {
-    let stats_by_base = RwSignal::new(BTreeMap::<String, StorageStats>::new());
+    let stats_by_view = RwSignal::new(BTreeMap::<String, StorageStats>::new());
     let config = RwSignal::new(SystemConfig::default());
     let selected_base_view = RwSignal::new(String::new());
-    let selected_tier_view = RwSignal::new(Option::<String>::None); // None = raw
+    let selected_tier_view = RwSignal::new(Option::<String>::None);
     let last_event = RwSignal::new(None::<String>);
     let selected_block = RwSignal::new(None::<BlockInfo>);
     let selected_page_no = RwSignal::new(None::<i32>);
@@ -666,18 +1191,21 @@ fn App() -> impl IntoView {
                             match serde_json::from_str::<VortexEvent>(&text) {
                                 Ok(event) => match event {
                                     VortexEvent::StorageStats(s) => {
-                                        stats_by_base.update(|stats| {
-                                            stats.insert(s.base_view.clone(), s);
+                                        last_event.set(Some(format!("stats: {}/{} updated", s.base_view, s.view_name)));
+                                        stats_by_view.update(|stats| {
+                                            stats.insert(s.view_name.clone(), s);
                                         });
                                     }
                                     VortexEvent::SystemConfig(c) => {
+                                        last_event.set(Some(format!("system config: {} hierarchies", c.hierarchies.len())));
                                         let selected = selected_base_view.get_untracked();
                                         let first_base = c
                                             .hierarchies
                                             .first()
                                             .map(|h| h.base_view.clone())
                                             .unwrap_or_default();
-                                        if !c.hierarchies.iter().any(|h| h.base_view == selected) {
+                                        
+                                        if selected.is_empty() || !c.hierarchies.iter().any(|h| h.base_view == selected) {
                                             selected_base_view.set(first_base);
                                             selected_block.set(None);
                                             selected_page_no.set(None);
@@ -702,23 +1230,35 @@ fn App() -> impl IntoView {
         }
     });
 
+    Effect::new(move |_| {
+        let _ = selected_tier_view.get();
+        selected_block.set(None);
+        selected_page_no.set(None);
+        slice_data.set(None);
+    });
+
     let api_base_clone = Arc::clone(&api_base);
     let fetch_block_info = move |blkno: i32| {
+        selected_block.set(None);
+        slice_data.set(None);
+        selected_page_no.set(Some(blkno));
+
         let selected = selected_base_view.get_untracked();
-        // Use selected tier view if set, otherwise fall back to base view's raw view
         let view_name = selected_tier_view
             .get_untracked()
             .unwrap_or_else(|| {
-                stats_by_base
+                config
                     .get_untracked()
-                    .get(&selected)
-                    .map(|s| s.view_name.clone())
+                    .hierarchies
+                    .iter()
+                    .find(|h| h.base_view == selected)
+                    .map(|h| h.raw_view_name.clone())
                     .unwrap_or_default()
             });
         if view_name.is_empty() {
             return;
         }
-        selected_page_no.set(Some(blkno));
+
         let url = format!(
             "{}/api/storage/{}/block/{}",
             api_base_clone, view_name, blkno
@@ -733,9 +1273,20 @@ fn App() -> impl IntoView {
     };
 
     let current_stats = Signal::derive(move || {
-        stats_by_base
+        let selected_base = selected_base_view.get();
+        let view_name = selected_tier_view.get().unwrap_or_else(|| {
+            config
+                .get()
+                .hierarchies
+                .iter()
+                .find(|h| h.base_view == selected_base)
+                .map(|h| h.raw_view_name.clone())
+                .unwrap_or_default()
+        });
+
+        stats_by_view
             .get()
-            .get(&selected_base_view.get())
+            .get(&view_name)
             .cloned()
             .unwrap_or_default()
     });
@@ -758,28 +1309,28 @@ fn App() -> impl IntoView {
             .unwrap_or(0)
     });
 
-    // Auto-fetch slice data when a block is selected
     let api_base_slice = Arc::clone(&api_base);
     Effect::new(move |_| {
         let block = selected_block.get();
-        let selected = selected_base_view.get_untracked();
+        let selected = selected_base_view.get();
         let view_name = selected_tier_view
-            .get_untracked()
+            .get()
             .unwrap_or_else(|| {
-                stats_by_base
-                    .get_untracked()
-                    .get(&selected)
-                    .map(|s| s.view_name.clone())
+                config
+                    .get()
+                    .hierarchies
+                    .iter()
+                    .find(|h| h.base_view == selected)
+                    .map(|h| h.raw_view_name.clone())
                     .unwrap_or_default()
             });
-        let k = kickoff.get_untracked();
+        let k = kickoff.get();
 
         let Some(b) = block else {
             slice_data.set(None);
             return;
         };
 
-        // Use actual timestamps from the block if available; fall back to kickoff+t_range
         let (t_start, t_end) = if b.t_actual_start > 0 {
             (b.t_actual_start as f64, (b.t_actual_end + 120) as f64)
         } else {
@@ -794,6 +1345,7 @@ fn App() -> impl IntoView {
         ));
 
         if view_name.is_empty() {
+            slice_data.set(None);
             return;
         }
 
@@ -802,8 +1354,10 @@ fn App() -> impl IntoView {
             api_base_slice, view_name, t_start, t_end
         );
         leptos::task::spawn_local(async move {
+            let start = js_sys::Date::now();
             if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
-                if let Ok(sr) = resp.json::<SliceResponse>().await {
+                if let Ok(mut sr) = resp.json::<SliceResponse>().await {
+                    sr.fetch_ms = js_sys::Date::now() - start;
                     slice_data.set(Some(sr));
                 }
             }
@@ -842,34 +1396,32 @@ fn App() -> impl IntoView {
                     {move || {
                         let current_config = config.get();
                         if current_config.hierarchies.is_empty() {
-                            leptos::either::Either::Left(view! {
+                            view! {
                                 <span class="no-tables">"connecting..."</span>
-                            })
+                            }.into_any()
                         } else {
-                            leptos::either::Either::Right(
-                                current_config.hierarchies.into_iter().map(|h| {
-                                    let t = h.base_view.clone();
-                                    let is_active = selected_base_view.get() == t;
-                                    view! {
-                                        <button
-                                            class=if is_active { "tab tab-active" } else { "tab" }
-                                            on:click=move |_| {
-                                                selected_base_view.set(t.clone());
-                                                selected_block.set(None);
-                                                selected_page_no.set(None);
-                                            }
-                                        >{h.base_view.to_uppercase()}</button>
-                                    }
-                                }).collect_view()
-                            )
+                            current_config.hierarchies.into_iter().map(|h| {
+                                let t = h.base_view.clone();
+                                let is_active = selected_base_view.get() == t;
+                                view! {
+                                    <button
+                                        class=if is_active { "tab tab-active" } else { "tab" }
+                                        on:click=move |_| {
+                                            selected_base_view.set(t.clone());
+                                            selected_block.set(None);
+                                            selected_page_no.set(None);
+                                        }
+                                    >{h.base_view.to_uppercase()}</button>
+                                }
+                            }).collect_view().into_any()
                         }
                     }}
                 </div>
                 <div class="topbar-spacer"></div>
                 <div class="topbar-stats">
                     <div class="ts-item">
-                        <span class="ts-label">"PAGES"</span>
-                        <span class="ts-value">{move || current_stats.get().total_pages}</span>
+                        <span class="ts-label">"COUNT"</span>
+                        <span class="ts-value">{move || current_stats.get().row_count}</span>
                     </div>
                     <div class="ts-item">
                         <span class="ts-label">"COMP"</span>
@@ -925,12 +1477,13 @@ fn App() -> impl IntoView {
                         on_click=fetch_block_info
                     />
 
-                    // Data charts for selected page
-                    {move || slice_data.get().map(|sr| view! {
-                        <PageDataCharts slice=sr />
-                    })}
+                    {move || {
+                        let sources = current_hierarchy_opt.get().map(|h| h.sources).unwrap_or_default();
+                        slice_data.get().map(|sr| view! {
+                            <PageDataCharts slice=sr sources=sources />
+                        })
+                    }}
 
-                    // Query / Explain panel (shown when a block is selected)
                     {move || selected_block.get().map(|_| {
                         let run = run_explain.clone();
                         view! {
@@ -997,17 +1550,9 @@ fn App() -> impl IntoView {
                     {move || {
                         let block = selected_block.get();
                         let k = kickoff.get();
-                        match block {
-                            Some(b) => leptos::either::Either::Left(view! {
-                                <div class="panel-block">
-                                    <div class="panel-hdr">"BLOCK INSPECTOR"</div>
-                                    <BlockInspector block=b kickoff=k />
-                                </div>
-                            }),
-                            None => leptos::either::Either::Right(view! {
-                                <div class="empty-state">"Click a page cell to inspect"</div>
-                            }),
-                        }
+                        block.map(|b| view! {
+                            <BlockInspector block=b kickoff=k />
+                        })
                     }}
                 </aside>
             </div>
