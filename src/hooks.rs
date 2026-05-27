@@ -1135,6 +1135,10 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                 col_types.insert(name.clone(), typ.clone());
                             }
 
+                            if query_cols.iter().any(|(name, agg)| name == "*" && agg.as_deref() == Some("count")) {
+                                cols.push(("*".to_string(), Some("count".to_string())));
+                            }
+
                             for (c, _typ) in &base_table_columns {
                                 if c == "t" {
                                     continue;
@@ -2079,6 +2083,7 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
     let is_state_derived = matches!(agg_lower.as_str(), "sum" | "count" | "avg" | "first" | "last" | "min" | "max") || is_json_agg;
     if !is_rollup {
         if is_state_derived {
+            if mapped_col == "*" && agg_lower == "count" { return "spiral_stats_accum(NULL, 0.0)".to_string(); }
             let accum_fn = match formula { "stats" => "spiral_stats_accum", "ohlcv" => "spiral_ohlcv_accum", "tdigest" => "spiral_tdigest_accum", "sketch" => "spiral_sketch_accum", _ => if is_json_agg { &format!("{}_accum", agg_lower) } else { return format!("\"{}\"", mapped_col); } };
             return if formula == "ohlcv" { format!("{}(NULL, \"{}\", spiral(t))", accum_fn, mapped_col) } else { format!("{}(NULL, \"{}\")", accum_fn, mapped_col) };
         }
@@ -2091,6 +2096,7 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
         ("first", "ohlcv") => format!("(\"{}\"->>'o')::float8", mapped_col),
         ("last", "ohlcv") => format!("(\"{}\"->>'c')::float8", mapped_col),
         ("count", "stats") | ("sum", "stats") | ("avg", "stats") | ("spiral_stats", "stats") => format!("\"{}\"", mapped_col),
+        ("count", "count") if is_rollup => format!("spiral_stats_from_count(\"{}\"::float8)", mapped_col),
         ("min", "stats") => format!("(\"{}\"->>'min')::numeric", mapped_col),
         ("max", "stats") => format!("(\"{}\"->>'max')::numeric", mapped_col),
         _ => format!("\"{}\"", mapped_col),
@@ -2103,7 +2109,7 @@ fn format_epoch(epoch: i64) -> String {
 
 fn reconstruction_expr(col: &str, formula: &str, is_rollup: bool) -> String {
     if !is_rollup { return format!("\"{}\"", col); }
-    match formula { "range_max_end" | "range_merge" => format!("t + make_interval(secs => \"{}\"::double precision) AS \"{}\"", col, col), _ => format!("\"{}\"", col) }
+    match formula { "range_max_end" | "range_merge" => format!("t + make_interval(secs => \"{}\"::double precision)", col), _ => format!("\"{}\"", col) }
 }
 
 fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols: &[(String, Option<String>)], offset_cols: &[catalog::OffsetColumn], col_types: &std::collections::HashMap<String, String>, scope_vals: &[(String, String)], in_vals: &[(String, Vec<String>)], z_box: Option<pg_sys::BOX>) -> String {
@@ -2124,18 +2130,20 @@ fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols
                 let (formula_for_col, mapped) = if is_rollup {
                     Spi::connect(|client| -> Result<(String, String), spi::Error> {
                         let formula_filter = match agg_fn.to_lowercase().as_str() { "spiral_stats" | "spiral_stats_merge" | "avg" => "stats", "spiral_tdigest" | "spiral_tdigest_merge" => "tdigest", "spiral_sketch" | "spiral_sketch_merge" => "sketch", "first" | "last" => "ohlcv", "sum" | "min" | "max" => "sum", "count" => "stats", _ => "" };
-                        let mut sql = if formula_filter.is_empty() { format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1", src.replace("'", "''"), col.replace("'", "''")) }
+                        let mut sql = if col == "*" && agg_fn.to_lowercase() == "count" {
+                            format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND (formula = 'stats' OR formula = 'count') LIMIT 1", src.replace("'", "''"))
+                        } else if formula_filter.is_empty() { format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1", src.replace("'", "''"), col.replace("'", "''")) }
                                       else { format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' AND (formula = '{}' OR formula = 'ohlcv') LIMIT 1", src.replace("'", "''"), col.replace("'", "''"), formula_filter) };
                         let mut rows = client.select(&sql, Some(1), &[])?;
-                        if rows.is_empty() && !formula_filter.is_empty() { sql = format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1", src.replace("'", "''"), col.replace("'", "''")); rows = client.select(&sql, Some(1), &[])?; }
+                        if rows.is_empty() && !formula_filter.is_empty() && col != "*" { sql = format!("SELECT formula, mat_column FROM spiral.sources WHERE view_name = '{}' AND base_column = '{}' LIMIT 1", src.replace("'", "''"), col.replace("'", "''")); rows = client.select(&sql, Some(1), &[])?; }
                         if let Some(row) = rows.next() { return Ok((row.get::<String>(1)?.unwrap_or_default(), row.get::<String>(2)?.unwrap_or_default())); }
                         Ok((String::new(), col.clone()))
                     }).unwrap_or_else(|_| (String::new(), col.clone()))
                 } else { (String::new(), col.clone()) };
-                if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) { inner_select.push(if orig_type.is_empty() { format!("NULL AS \"{}\"", col) } else { format!("NULL::{} AS \"{}\"", orig_type, col) }); continue; }
+                if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) { inner_select.push(if orig_type.is_empty() { format!("NULL::jsonb AS \"{}\"", col) } else { format!("NULL::{} AS \"{}\"", orig_type, col) }); continue; }
                 let col_expr = if let Some(oc) = offset_cols.iter().find(|o| o.mat_column == *col) { reconstruction_expr(&mapped, &oc.formula, is_rollup) } else { map_agg_inner(agg_fn, &mapped, is_rollup, &formula_for_col) };
-                let is_json_target = matches!(agg_fn.to_lowercase().as_str(), "spiral_stats" | "spiral_tdigest" | "spiral_sketch" | "spiral_ohlcv" | "spiral_stats_merge" | "spiral_tdigest_merge" | "spiral_sketch_merge" | "spiral_ohlcv_merge") || (matches!(agg_fn.to_lowercase().as_str(), "sum" | "count" | "avg") && (formula_for_col == "stats" || formula_for_col == "ohlcv" || !is_rollup));
-                inner_select.push(if !orig_type.is_empty() && !is_json_target { format!("({})::{} AS \"{}\"", col_expr, orig_type, col) } else { format!("{} AS \"{}\"", col_expr, col) });
+                let is_json_target = matches!(agg_fn.to_lowercase().as_str(), "spiral_stats" | "spiral_tdigest" | "spiral_sketch" | "spiral_ohlcv" | "spiral_stats_merge" | "spiral_tdigest_merge" | "spiral_sketch_merge" | "spiral_ohlcv_merge") || (matches!(agg_fn.to_lowercase().as_str(), "sum" | "count" | "avg") && (formula_for_col == "stats" || formula_for_col == "ohlcv" || (formula_for_col == "count" && is_rollup) || !is_rollup));
+                inner_select.push(if !orig_type.is_empty() && !is_json_target { format!("({})::{} AS \"{}\"", col_expr, orig_type, col) } else { format!("({})::jsonb AS \"{}\"", col_expr, col) });
             } else {
                 if col == "t" { continue; }
                 let col_sql = if is_rollup && !rollup_cols.contains(col.as_str()) { if orig_type.is_empty() { format!("NULL AS \"{}\"", col) } else { format!("NULL::{} AS \"{}\"", orig_type, col) } }

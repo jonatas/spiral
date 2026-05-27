@@ -557,6 +557,45 @@
             .er-index   { color: var(--blue)  !important; }
             .er-buffers { color: var(--yellow) !important; }
 
+            /* ─── DATA TABLE ──────────────────────────── */
+            .data-table-container {
+                width: 100%;
+                max-height: 400px;
+                overflow: auto;
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                background: rgba(255,255,255,0.01);
+                margin-top: 8px;
+            }
+            .data-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 10px;
+                color: var(--muted);
+            }
+            .data-table th {
+                text-align: left;
+                padding: 6px 10px;
+                background: rgba(255,255,255,0.03);
+                border-bottom: 1px solid var(--border);
+                color: var(--text);
+                font-weight: 700;
+                white-space: nowrap;
+                position: sticky;
+                top: 0;
+            }
+            .data-table td {
+                padding: 4px 10px;
+                border-bottom: 1px solid rgba(255,255,255,0.03);
+                white-space: nowrap;
+            }
+            .data-table tr:hover td {
+                background: rgba(255,255,255,0.02);
+                color: var(--text);
+            }
+            .td-num { color: var(--blue); text-align: right; }
+            .td-obj { color: var(--purple); font-size: 9px; }
+
             /* scrollbar */
             ::-webkit-scrollbar { width: 4px; height: 4px; }
             ::-webkit-scrollbar-track { background: transparent; }

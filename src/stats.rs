@@ -321,6 +321,13 @@ impl OHLCVState {
 }
 
 #[pg_extern(immutable, parallel_safe)]
+pub fn spiral_stats_from_count(count: f64) -> pgrx::JsonB {
+    let mut s = StatsState::default();
+    s.n = count;
+    pgrx::JsonB(serde_json::to_value(s).unwrap())
+}
+
+#[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
     let mut s = state
         .map(|j| serde_json::from_value::<StatsState>(j.0).unwrap())
@@ -332,10 +339,10 @@ pub fn spiral_stats_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB {
     let mut s1 = state
-        .map(|j| serde_json::from_value::<StatsState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<StatsState>(j.0).ok())
         .unwrap_or_default();
     let s2 = other
-        .map(|j| serde_json::from_value::<StatsState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<StatsState>(j.0).ok())
         .unwrap_or_default();
     s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
@@ -344,55 +351,71 @@ pub fn spiral_stats_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::Json
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_mean(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0)
-        .unwrap()
+        .ok()
+        .unwrap_or_default()
         .mean()
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_count_final(state: pgrx::JsonB) -> i64 {
-    serde_json::from_value::<StatsState>(state.0).unwrap().n as i64
+    serde_json::from_value::<StatsState>(state.0)
+        .ok()
+        .unwrap_or_default()
+        .n as i64
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_sum_final(state: pgrx::JsonB) -> f64 {
-    let s = serde_json::from_value::<StatsState>(state.0).unwrap();
+    let s = serde_json::from_value::<StatsState>(state.0)
+        .ok()
+        .unwrap_or_default();
     s.m1 * s.n
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_min_final(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0).unwrap().min
+    serde_json::from_value::<StatsState>(state.0)
+        .ok()
+        .unwrap_or_default()
+        .min
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_max_final(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0).unwrap().max
+    serde_json::from_value::<StatsState>(state.0)
+        .ok()
+        .unwrap_or_default()
+        .max
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_variance(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0)
-        .unwrap()
+        .ok()
+        .unwrap_or_default()
         .variance()
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_stddev(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0)
-        .unwrap()
+        .ok()
+        .unwrap_or_default()
         .stddev()
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_skewness(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0)
-        .unwrap()
+        .ok()
+        .unwrap_or_default()
         .skewness()
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<StatsState>(state.0)
-        .unwrap()
+        .ok()
+        .unwrap_or_default()
         .kurtosis()
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
     let mut s = state
-        .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<SketchState>(j.0).ok())
         .unwrap_or_default();
     s.add(val);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
@@ -404,10 +427,10 @@ pub fn spiral_sketch_combine(
     other: Option<pgrx::JsonB>,
 ) -> pgrx::JsonB {
     let mut s1 = state
-        .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<SketchState>(j.0).ok())
         .unwrap_or_default();
     let s2 = other
-        .map(|j| serde_json::from_value::<SketchState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<SketchState>(j.0).ok())
         .unwrap_or_default();
     s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
@@ -416,7 +439,8 @@ pub fn spiral_sketch_combine(
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
     serde_json::from_value::<SketchState>(state.0)
-        .unwrap()
+        .ok()
+        .unwrap_or_default()
         .quantile(q)
 }
 
@@ -436,7 +460,7 @@ pub fn spiral_tdigest_combine(
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_accum(state: Option<pgrx::JsonB>, val: f64, t: i64) -> pgrx::JsonB {
     let mut s = state
-        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<OHLCVState>(j.0).ok())
         .unwrap_or_default();
     s.add(val, t);
     pgrx::JsonB(serde_json::to_value(s).unwrap())
@@ -445,10 +469,10 @@ pub fn spiral_ohlcv_accum(state: Option<pgrx::JsonB>, val: f64, t: i64) -> pgrx:
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB {
     let mut s1 = state
-        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<OHLCVState>(j.0).ok())
         .unwrap_or_default();
     let s2 = other
-        .map(|j| serde_json::from_value::<OHLCVState>(j.0).unwrap())
+        .and_then(|j| serde_json::from_value::<OHLCVState>(j.0).ok())
         .unwrap_or_default();
     s1.merge(&s2);
     pgrx::JsonB(serde_json::to_value(s1).unwrap())
@@ -456,30 +480,45 @@ pub fn spiral_ohlcv_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::Json
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_open(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0).unwrap().open
+    serde_json::from_value::<OHLCVState>(state.0)
+        .ok()
+        .unwrap_or_default()
+        .open
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_high(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0).unwrap().high
+    serde_json::from_value::<OHLCVState>(state.0)
+        .ok()
+        .unwrap_or_default()
+        .high
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_low(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0).unwrap().low
+    serde_json::from_value::<OHLCVState>(state.0)
+        .ok()
+        .unwrap_or_default()
+        .low
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_close(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0).unwrap().close
+    serde_json::from_value::<OHLCVState>(state.0)
+        .ok()
+        .unwrap_or_default()
+        .close
 }
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_volume(state: pgrx::JsonB) -> f64 {
     serde_json::from_value::<OHLCVState>(state.0)
-        .unwrap()
+        .ok()
+        .unwrap_or_default()
         .volume
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_to_array(state: pgrx::JsonB) -> Vec<f64> {
-    let s = serde_json::from_value::<OHLCVState>(state.0).unwrap();
+    let s = serde_json::from_value::<OHLCVState>(state.0)
+        .ok()
+        .unwrap_or_default();
     vec![s.open, s.high, s.low, s.close, s.volume]
 }
 
@@ -519,6 +558,7 @@ extension_sql!(
     requires = [
         spiral_stats_accum,
         spiral_stats_combine,
+        spiral_stats_from_count,
         spiral_stats_mean,
         spiral_stats_count_final,
         spiral_stats_sum_final,

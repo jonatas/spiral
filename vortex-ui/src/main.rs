@@ -105,7 +105,8 @@ fn format_timespan(sec: i32) -> String {
     } else if sec < 31536000 {
         format!("{}mo", sec / 2592000)
     } else {
-        format!("{}y", sec / 31536000)
+        let years = sec as f64 / 31536000.0;
+        if years < 1.1 { "1 year".into() } else { format!("{:.1}y", years) }
     }
 }
 
@@ -121,7 +122,7 @@ fn get_color_for_tenant(id: i32, total: i32) -> String {
 }
 
 fn format_epoch_seconds(epoch: i64) -> String {
-    if epoch == 0 {
+    if epoch <= 0 {
         return "—".to_string();
     }
     let date = js_sys::Date::new(&JsValue::from_f64(epoch as f64 * 1000.0));
@@ -1515,6 +1516,7 @@ fn App() -> impl IntoView {
                                         class=if is_active { "tab tab-active" } else { "tab" }
                                         on:click=move |_| {
                                             selected_base_view.set(t.clone());
+                                            selected_tier_view.set(None);
                                             selected_block.set(None);
                                             selected_page_no.set(None);
                                         }
@@ -1576,16 +1578,35 @@ fn App() -> impl IntoView {
                                 format!("{} pages · {} tenant scale", s.total_pages, s.tenant_scale)
                             }}
                         </span>
-                        {move || selected_block.get().map(|b| {
+                        {move || {
                             let k = kickoff.get();
-                            let start_t = if b.t_actual_start > 0 { b.t_actual_start } else { k + b.t_range[0] };
-                            let end_t = if b.t_actual_end > 0 { b.t_actual_end } else { k + b.t_range[1] };
-                            view! {
-                                <span class="page-meta" style="margin-left:auto; color:var(--blue); font-weight:700;">
-                                    {format!("{} → {}", format_epoch_seconds(start_t), format_epoch_seconds(end_t))}
-                                </span>
+                            let s = current_stats.get();
+                            let fs = current_frame_seconds.get().max(1) as i64;
+                            let scale = s.tenant_scale.max(1);
+
+                            if let Some(b) = selected_block.get() {
+                                let start_t = if b.t_actual_start > 0 { b.t_actual_start } else { k + b.t_range[0] };
+                                let end_t = if b.t_actual_end > 0 { b.t_actual_end } else { k + b.t_range[1] };
+                                let span = (end_t - start_t).abs() as i32;
+                                view! {
+                                    <span class="page-meta" style="margin-left:auto; color:var(--blue); font-weight:700;">
+                                        {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(span))}
+                                    </span>
+                                }.into_any()
+                            } else if s.total_pages > 0 && k > 0 {
+                                let num_steps = (s.total_pages + scale - 1) / scale;
+                                let total_duration = num_steps * fs;
+                                let start_t = k;
+                                let end_t = k + total_duration;
+                                view! {
+                                    <span class="page-meta" style="margin-left:auto; color:var(--blue); opacity: 0.8;">
+                                        {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(total_duration as i32))}
+                                    </span>
+                                }.into_any()
+                            } else {
+                                view! { <span class="page-meta" style="margin-left:auto;"></span> }.into_any()
                             }
-                        })}
+                        }}
                     </div>
                     <PageMap
                         total_pages=Signal::derive(move || current_stats.get().total_pages)
