@@ -129,25 +129,30 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
         let val = *(ptr as *const f64);
 
         if val != 0.0 {
-            let mut tenant_scale = 1024;
             let rel_name_ptr = pg_sys::get_rel_name((*rel).rd_id);
+            let mut kickoff = crate::get_kickoff_epoch();
+            let mut tenant_scale = 1024;
             if !rel_name_ptr.is_null() {
                 let rel_name = std::ffi::CStr::from_ptr(rel_name_ptr).to_string_lossy();
                 if let Some(m) = crate::catalog::get_metadata(&rel_name) {
                     tenant_scale = crate::catalog::get_tenant_scale(&m);
+                    kickoff = crate::catalog::get_kickoff(&m);
                 }
             }
 
             let idx = (blkno as i64 * crate::storage::DATA_PER_PAGE as i64) + (posid as i64 - 1);
-            let t = idx / tenant_scale;
+            let t_rel = idx / tenant_scale;
             let tenant_id = (idx % tenant_scale) as i32;
+
+            // Convert to Postgres internal timestamp (micros since 2000)
+            let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
 
             pg_sys::ExecClearTuple(slot);
             let values = (*slot).tts_values;
             let isnull = (*slot).tts_isnull;
 
             if !values.is_null() && !isnull.is_null() {
-                *values.add(0) = t.into_datum().unwrap();
+                *values.add(0) = t_abs.into_datum().unwrap();
                 *isnull.add(0) = false;
                 *values.add(1) = tenant_id.into_datum().unwrap();
                 *isnull.add(1) = false;
@@ -687,6 +692,7 @@ use std::ffi::CStr;
 
 struct SpiralScanState {
     tenant_scale: i64,
+    kickoff: i64,
     current_blkno: pg_sys::BlockNumber,
     total_blks: pg_sys::BlockNumber,
     /// First page that could contain data within the query's time range.
@@ -748,37 +754,44 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     let oid = (*rel).rd_id;
     let mut tenant_scale = 1024;
     let relname_ptr = pg_sys::get_rel_name(oid);
-    if !relname_ptr.is_null() {
+    let mut kickoff = crate::get_kickoff_epoch();
+    let mut total_blks = 0;
+    let (scan_first_blk, scan_last_blk) = if !relname_ptr.is_null() {
         let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
-        if let Some(m) = crate::catalog::get_metadata(&name) {
+        let k = if let Some(m) = crate::catalog::get_metadata(&name) {
             tenant_scale = crate::catalog::get_tenant_scale(&m);
+            crate::catalog::get_kickoff(&m)
+        } else {
+            crate::get_kickoff_epoch()
+        };
+        kickoff = k;
+
+        let smgr = unsafe { pg_sys::RelationGetSmgr(rel) };
+        total_blks = unsafe { pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
+
+        // Consume the time range set by the planner hook (None → full scan).
+        let time_range = crate::SCAN_TIME_RANGE.with(|r| r.take());
+        if let Some((ts, te)) = time_range {
+            let dpg = crate::storage::DATA_PER_PAGE as i64;
+            let ts_rel = ts - k;
+            let te_rel = te - k;
+
+            // Calculate block bounds based on physical layout
+            let first = (ts_rel.saturating_mul(tenant_scale) / dpg).max(0) as u32;
+            let last = ((te_rel.saturating_mul(tenant_scale) / dpg) + 1)
+                .min(total_blks as i64)
+                .max(0) as u32;
+            (first, last)
+        } else {
+            (0, total_blks)
         }
-    }
-
-    let smgr = unsafe { pg_sys::RelationGetSmgr(rel) };
-    let total_blks = unsafe { pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
-
-    let kickoff = crate::get_kickoff_epoch();
-
-    // Consume the time range set by the planner hook (None → full scan).
-    let time_range = crate::SCAN_TIME_RANGE.with(|r| r.take());
-    let (scan_first_blk, scan_last_blk) = if let Some((ts, te)) = time_range {
-        let dpg = crate::storage::DATA_PER_PAGE as i64;
-        let ts_rel = ts - kickoff;
-        let te_rel = te - kickoff;
-
-        // Calculate block bounds based on physical layout
-        let first = (ts_rel.saturating_mul(tenant_scale) / dpg).max(0) as u32;
-        let last = ((te_rel.saturating_mul(tenant_scale) / dpg) + 1)
-            .min(total_blks as i64)
-            .max(0) as u32;
-        (first, last)
     } else {
         (0, total_blks)
     };
 
     let state = pg_sys::palloc0(std::mem::size_of::<SpiralScanState>()) as *mut SpiralScanState;
     (*state).tenant_scale = tenant_scale;
+    (*state).kickoff = kickoff;
     (*state).current_blkno = scan_first_blk;
     (*state).total_blks = total_blks;
     (*state).scan_first_blk = scan_first_blk;
@@ -877,15 +890,18 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                     * crate::storage::DATA_PER_PAGE as i64)
                     + items_before as i64;
 
-                let t = idx / state.tenant_scale;
+                let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
+
+                // Convert to Postgres internal timestamp (micros since 2000)
+                let t_abs = (t_rel + state.kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t.into_datum().unwrap();
+                    *values.add(0) = t_abs.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;
@@ -1030,15 +1046,19 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64)
                     + items_before as i64;
 
-                let t = idx / state.tenant_scale;
+                let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
+
+                // Convert to Postgres internal timestamp (micros since 2000)
+                let kickoff = crate::get_kickoff_epoch();
+                let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t.into_datum().unwrap();
+                    *values.add(0) = t_abs.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;

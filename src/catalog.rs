@@ -310,6 +310,17 @@ pub fn get_tenant_scale(metadata: &Metadata) -> i64 {
     1024
 }
 
+pub fn get_kickoff(metadata: &Metadata) -> i64 {
+    if let serde_json::Value::Object(map) = &metadata.columns_metadata {
+        if let Some(val) = map.get("kickoff_epoch") {
+            if let Some(n) = val.as_i64() {
+                return n;
+            }
+        }
+    }
+    crate::get_kickoff_epoch()
+}
+
 #[derive(Clone)]
 pub struct OffsetColumn {
     pub mat_column: String,

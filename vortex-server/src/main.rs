@@ -66,6 +66,8 @@ struct BlockInfo {
     pending_changes: i32,
     #[serde(default)]
     is_stale: bool,
+    #[serde(default)]
+    kickoff_epoch: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -83,6 +85,10 @@ struct StorageStats {
     projected_heap_size_kb: i64,
     compression_ratio: f64,
     kickoff_epoch: i64,
+    #[serde(default)]
+    min_t: i64,
+    #[serde(default)]
+    max_t: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -325,9 +331,9 @@ async fn get_block_info(
     // time_col comes from our own metadata — safe to interpolate after identifier check
     if valid_identifier(&time_col) {
         let time_sql = format!(
-            "SELECT extract(epoch from min({tc}))::bigint, \
-                    extract(epoch from max({tc}))::bigint \
-             FROM {view} \
+            "SELECT extract(epoch from min("{tc}"))::bigint, \
+                    extract(epoch from max("{tc}"))::bigint \
+             FROM "{view}" \
              WHERE (ctid::text::point)[0]::int = $1",
             tc = time_col,
             view = name,

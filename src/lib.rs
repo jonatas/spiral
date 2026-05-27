@@ -101,7 +101,7 @@ fn spiral_is_loaded() -> bool {
     true
 }
 
-const POSTGRES_EPOCH_JDATE: i64 = 946684800; // seconds between 1970-01-01 and 2000-01-01
+pub const POSTGRES_EPOCH_JDATE: i64 = 946684800; // seconds between 1970-01-01 and 2000-01-01
 
 #[pg_extern(immutable, parallel_safe)]
 fn spiral(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
@@ -493,6 +493,10 @@ fn spiral_register_view(
         }
     }
 
+    let kickoff = get_kickoff_epoch();
+    let mut cols_meta = serde_json::Map::new();
+    cols_meta.insert("kickoff_epoch".to_string(), serde_json::Value::Number(kickoff.into()));
+
     // Ensure base table has a frame_seconds=0 metadata row so track_changes_stmt
     // can look up scope_columns via "WHERE view_name = base_view".
     if view_name != base_view {
@@ -502,7 +506,7 @@ fn spiral_register_view(
             0,
             base_view,
             scope_columns.clone(),
-            pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
+            pgrx::JsonB(serde_json::Value::Object(cols_meta.clone())),
         );
     }
     catalog::insert_metadata(
@@ -511,7 +515,7 @@ fn spiral_register_view(
         frame_seconds,
         base_view,
         scope_columns.clone(),
-        pgrx::JsonB(serde_json::Value::Object(serde_json::Map::new())),
+        pgrx::JsonB(serde_json::Value::Object(cols_meta)),
     );
     notice!("Spiral: view '{}' metadata inserted", view_name);
     for src in sources {

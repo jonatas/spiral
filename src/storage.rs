@@ -497,8 +497,20 @@ pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id:
 
 #[pg_extern]
 pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
-    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
-    let kickoff = crate::get_kickoff_epoch();
+    let mut tenant_scale = 1024;
+    let mut kickoff = crate::get_kickoff_epoch();
+    unsafe {
+        let relname_ptr = pg_sys::get_rel_name((main_rel_oid as u32).into());
+        if !relname_ptr.is_null() {
+            let name = std::ffi::CStr::from_ptr(relname_ptr)
+                .to_string_lossy()
+                .into_owned();
+            if let Some(m) = crate::catalog::get_metadata(&name) {
+                tenant_scale = crate::catalog::get_tenant_scale(&m);
+                kickoff = crate::catalog::get_kickoff(&m);
+            }
+        }
+    }
 
     unsafe {
         let pg_rel = PgRelation::with_lock(
@@ -519,6 +531,35 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
             0.0
         };
 
+        let (min_t, max_t) = Spi::connect(|client| {
+            let relname_ptr = pg_sys::get_rel_name((main_rel_oid as u32).into());
+            if relname_ptr.is_null() {
+                return Ok::<(i64, i64), spi::Error>((0, 0));
+            }
+            let name = std::ffi::CStr::from_ptr(relname_ptr).to_string_lossy();
+            let mut time_col = "t".to_string();
+            if let Some(m) = crate::catalog::get_metadata(&name) {
+                if let serde_json::Value::Object(map) = &m.columns_metadata {
+                    if let Some(val) = map.get("time_column") {
+                        if let Some(s) = val.as_str() {
+                            time_col = s.to_string();
+                        }
+                    }
+                }
+            }
+
+            let query = format!(
+                "SELECT extract(epoch from min({0}))::bigint, extract(epoch from max({0}))::bigint FROM {1}",
+                time_col, name
+            );
+            let table = client.select(&query, Some(1), &[])?;
+            if let Some(row) = table.into_iter().next() {
+                Ok((row.get::<i64>(1)?.unwrap_or(0), row.get::<i64>(2)?.unwrap_or(0)))
+            } else {
+                Ok((0, 0))
+            }
+        }).unwrap_or((0, 0));
+
         let stats = serde_json::json!({
             "total_pages": nblocks,
             "total_rows_capacity": total_rows,
@@ -528,7 +569,9 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
             "compression_ratio": compression_ratio,
             "page_size": BLCKSZ,
             "data_per_page": DATA_PER_PAGE,
-            "kickoff_epoch": kickoff
+            "kickoff_epoch": kickoff,
+            "min_t": min_t,
+            "max_t": max_t
         });
 
         pgrx::JsonB(stats)
@@ -537,7 +580,21 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
 
 #[pg_extern]
 pub fn spiral_blkno_to_tenant_range(main_rel_oid: i32, blkno: i32) -> pgrx::JsonB {
-    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+    let mut tenant_scale = 1024;
+    let mut kickoff = crate::get_kickoff_epoch();
+    unsafe {
+        let relname_ptr = pg_sys::get_rel_name((main_rel_oid as u32).into());
+        if !relname_ptr.is_null() {
+            let name = std::ffi::CStr::from_ptr(relname_ptr)
+                .to_string_lossy()
+                .into_owned();
+            if let Some(m) = crate::catalog::get_metadata(&name) {
+                tenant_scale = crate::catalog::get_tenant_scale(&m);
+                kickoff = crate::catalog::get_kickoff(&m);
+            }
+        }
+    }
+
     let start_idx = blkno as i64 * DATA_PER_PAGE as i64;
     let end_idx = (blkno + 1) as i64 * DATA_PER_PAGE as i64 - 1;
 
@@ -557,6 +614,7 @@ pub fn spiral_blkno_to_tenant_range(main_rel_oid: i32, blkno: i32) -> pgrx::Json
         "tuple_count": DATA_PER_PAGE,
         "is_boundary": is_boundary,
         "drift_records": drift,
-        "alignment_pct": (DATA_PER_PAGE as f64 / tenant_scale as f64 * 100.0)
+        "alignment_pct": (DATA_PER_PAGE as f64 / tenant_scale as f64 * 100.0),
+        "kickoff_epoch": kickoff
     }))
 }
