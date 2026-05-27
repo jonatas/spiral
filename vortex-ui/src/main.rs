@@ -272,12 +272,11 @@ fn HierarchyTree(
                 .cloned()
                 .collect();
             let sources = h.sources.clone();
-            let active_tier = selected_tier.get();
 
             view! {
                 <div class="tree">
                     <div
-                        class=if active_tier.is_none() { "tree-node tree-node-active" } else { "tree-node" }
+                        class=move || if selected_tier.get().is_none() { "tree-node tree-node-active" } else { "tree-node" }
                         on:click=move |_| selected_tier.set(None)
                         style="cursor:pointer;"
                     >
@@ -290,16 +289,16 @@ fn HierarchyTree(
                         let tier_label = format_timespan(sec);
                         let view_name = level.view_name.clone();
                         let vn_click = view_name.clone();
+                        let vn_class = view_name.clone();
                         let level_sources: Vec<_> = sources.iter()
                             .filter(|s| s.view_name == view_name)
                             .cloned()
                             .collect();
                         let indent = (i + 1) * 10;
-                        let is_active = active_tier.as_deref() == Some(&view_name);
                         view! {
                             <div>
                                 <div
-                                    class=if is_active { "tree-node tree-node-active" } else { "tree-node" }
+                                    class=move || if selected_tier.get().as_deref() == Some(vn_class.as_str()) { "tree-node tree-node-active" } else { "tree-node" }
                                     style={format!("padding-left: {}px; cursor:pointer;", indent)}
                                     on:click=move |_| selected_tier.set(Some(vn_click.clone()))
                                 >
@@ -354,69 +353,83 @@ fn PageMap(
     dirty_blocks: Signal<BTreeSet<i32>>,
     on_click: impl Fn(i32) + 'static + Send + Clone,
 ) -> impl IntoView {
-    let visible_limit = RwSignal::new(200);
+    const PAGE_WINDOW: i32 = 1000;
+    let page_offset = RwSignal::new(0i32);
 
     Effect::new(move |_| {
         let _ = total_pages.get();
-        visible_limit.set(200);
-    });
-
-    Effect::new(move |_| {
-        let total = total_pages.get() as i32;
-        let current = visible_limit.get();
-        if current < total && current < 5000 {
-            gloo_timers::callback::Timeout::new(30, move || {
-                visible_limit.update(|c| *c = (*c + 400).min(total));
-            })
-            .forget();
-        }
+        page_offset.set(0);
     });
 
     view! {
-        <div class="page-map">
-            {move || {
-                let total = total_pages.get();
-                let limit = visible_limit.get() as i64;
-                let scale = tenant_scale.get().max(1) as i32;
-                let k = kickoff.get();
-                let fs = frame_seconds.get().max(1);
-                let sel = selected_page.get();
-                let dirty = dirty_blocks.get();
-                (0..total.min(limit) as i32)
-                    .map(|idx| {
-                        let color = get_color_for_tenant(idx % scale, scale);
-                        let on_click = on_click.clone();
-                        let is_sel = sel == Some(idx);
-                        let tenant_id = idx % scale;
-                        let time_step = idx / scale;
-                        let est_t = k + (time_step as i64 * fs as i64);
-                        let t_str = if k > 0 { format!("\nEst. Time: {}", format_epoch_seconds(est_t)) } else { "".into() };
-                        let is_dirty = dirty.contains(&idx);
-                        let class = if is_sel {
-                            "page-cell selected"
-                        } else if is_dirty {
-                            "page-cell dirty"
-                        } else {
-                            "page-cell"
-                        };
-                        view! {
-                            <div
-                                class=class
-                                style=format!("background:{}", color)
-                                on:click=move |_| on_click(idx)
-                                title=format!("Page {}\nTenant: {}{}", idx, tenant_id, t_str)
-                            ></div>
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            }}
+        <div class="page-map-wrap">
             {move || {
                 let total = total_pages.get() as i32;
-                let current = visible_limit.get();
-                (current < total && current < 5000).then(|| {
-                    view! { <div class="page-loading-hint">"loading more..."</div> }
+                let offset = page_offset.get();
+                (total > PAGE_WINDOW).then(|| {
+                    let end = (offset + PAGE_WINDOW).min(total);
+                    view! {
+                        <div class="paginator">
+                            <button
+                                class="pag-btn"
+                                disabled=move || page_offset.get() == 0
+                                on:click=move |_| page_offset.update(|o| *o = (*o - PAGE_WINDOW).max(0))
+                            >"◀"</button>
+                            <span class="pag-info">
+                                {format!("pages {}–{} of {}", offset, end - 1, total)}
+                            </span>
+                            <button
+                                class="pag-btn"
+                                disabled=move || page_offset.get() + PAGE_WINDOW >= total_pages.get() as i32
+                                on:click=move |_| {
+                                    let total = total_pages.get() as i32;
+                                    page_offset.update(|o| *o = (*o + PAGE_WINDOW).min(total - PAGE_WINDOW).max(0))
+                                }
+                            >"▶"</button>
+                        </div>
+                    }
                 })
             }}
+            <div class="page-map">
+                <For
+                    each=move || {
+                        let total = total_pages.get() as i32;
+                        let offset = page_offset.get();
+                        let end = (offset + PAGE_WINDOW).min(total);
+                        (offset..end).collect::<Vec<i32>>()
+                    }
+                    key=|idx| *idx
+                    children=move |idx| {
+                        let on_click = on_click.clone();
+                        view! {
+                            <div
+                                class=move || {
+                                    if selected_page.get() == Some(idx) { "page-cell selected" }
+                                    else if dirty_blocks.get().contains(&idx) { "page-cell dirty" }
+                                    else { "page-cell" }
+                                }
+                                style=move || {
+                                    let scale = tenant_scale.get().max(1) as i32;
+                                    format!("background:{}", get_color_for_tenant(idx % scale, scale))
+                                }
+                                on:click=move |_| on_click(idx)
+                                title=move || {
+                                    let scale = tenant_scale.get().max(1) as i32;
+                                    let k = kickoff.get();
+                                    let fs = frame_seconds.get().max(1);
+                                    let tenant_id = idx % scale;
+                                    let time_step = idx / scale;
+                                    let est_t = k + (time_step as i64 * fs as i64);
+                                    let t_str = if k > 0 {
+                                        format!("\nEst. Time: {}", format_epoch_seconds(est_t))
+                                    } else { "".into() };
+                                    format!("Page {}\nTenant: {}{}", idx, tenant_id, t_str)
+                                }
+                            ></div>
+                        }
+                    }
+                />
+            </div>
         </div>
     }
 }
@@ -1292,6 +1305,8 @@ fn App() -> impl IntoView {
     let explain_result = RwSignal::new(None::<ExplainResult>);
     let explain_query = RwSignal::new(String::new());
     let explain_running = RwSignal::new(false);
+    let explain_user_edited = RwSignal::new(false);
+    let explain_last_block = RwSignal::new(None::<BlockInfo>);
     let dirty_page_nos = RwSignal::new(BTreeSet::<i32>::new());
 
     let hostname = web_sys::window()
@@ -1531,12 +1546,18 @@ fn App() -> impl IntoView {
             ((kb + b.t_range[0]) as f64, (kb + b.t_range[1] + 120) as f64)
         };
 
-        explain_query.set(format!(
+        let new_query = format!(
             "SELECT * FROM {} WHERE t >= to_timestamp({}) AND t < to_timestamp({})",
             view_name,
             t_start as i64,
             t_end as i64
-        ));
+        );
+        let block_changed = explain_last_block.get_untracked().as_ref() != Some(&b);
+        explain_last_block.set(Some(b));
+        if block_changed || !explain_user_edited.get_untracked() {
+            explain_query.set(new_query);
+            explain_user_edited.set(false);
+        }
 
         if view_name.is_empty() {
             slice_data.set(None);
@@ -1596,10 +1617,10 @@ fn App() -> impl IntoView {
                         } else {
                             current_config.hierarchies.into_iter().map(|h| {
                                 let t = h.base_view.clone();
-                                let is_active = selected_base_view.get() == t;
+                                let t_class = t.clone();
                                 view! {
                                     <button
-                                        class=if is_active { "tab tab-active" } else { "tab" }
+                                        class=move || if selected_base_view.get() == t_class { "tab tab-active" } else { "tab" }
                                         on:click=move |_| {
                                             selected_base_view.set(t.clone());
                                             selected_tier_view.set(None);
@@ -1700,6 +1721,31 @@ fn App() -> impl IntoView {
                             }
                         }}
                     </div>
+                    <div class="map-legend">
+                        <span class="legend-title">"COLORS:"</span>
+                        {move || {
+                            let scale = tenant_scale.get().max(1) as i32;
+                            let steps = 8.min(scale);
+                            (0..steps).map(|i| {
+                                let idx = if steps == 1 { 0 } else { i * (scale - 1) / (steps - 1) };
+                                let color = get_color_for_tenant(idx, scale);
+                                view! {
+                                    <span
+                                        class="legend-swatch"
+                                        style=format!("background:{}", color)
+                                        title=format!("tenant {}", idx)
+                                    ></span>
+                                }
+                            }).collect_view()
+                        }}
+                        <span class="legend-label">"tenant id"</span>
+                        <span class="legend-sep">"·"</span>
+                        <span class="legend-swatch legend-dirty-swatch"></span>
+                        <span class="legend-label">"dirty"</span>
+                        <span class="legend-sep">"·"</span>
+                        <span class="legend-swatch legend-selected-swatch"></span>
+                        <span class="legend-label">"selected"</span>
+                    </div>
                     <PageMap
                         total_pages=Signal::derive(move || current_stats.get().total_pages)
                         tenant_scale=tenant_scale
@@ -1734,7 +1780,10 @@ fn App() -> impl IntoView {
                                 <textarea
                                     class="query-input"
                                     prop:value=move || explain_query.get()
-                                    on:input=move |ev| explain_query.set(event_target_value(&ev))
+                                    on:input=move |ev| {
+                                        explain_query.set(event_target_value(&ev));
+                                        explain_user_edited.set(true);
+                                    }
                                     rows="4"
                                     spellcheck="false"
                                 />
