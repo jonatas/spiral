@@ -487,6 +487,7 @@ struct QueryConstraints {
     end_node: Option<*mut pg_sys::Node>,
     scopes: std::collections::HashMap<String, (serde_json::Value, *mut pg_sys::Node)>,
     in_clauses: std::collections::HashMap<String, (Vec<serde_json::Value>, *mut pg_sys::Node)>,
+    z_box: Option<(pg_sys::BOX, *mut pg_sys::Node)>,
 }
 
 enum AstOpportunity {
@@ -1196,6 +1197,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                 &col_types,
                                 &scope_vals,
                                 &in_vals,
+                                qc_opt.and_then(|qc| qc.z_box.map(|(b, _)| b)),
                             );
 
                             let new_query = parse_sql_to_query(&union_sql);
@@ -2104,7 +2106,7 @@ fn reconstruction_expr(col: &str, formula: &str, is_rollup: bool) -> String {
     match formula { "range_max_end" | "range_merge" => format!("t + make_interval(secs => \"{}\"::double precision) AS \"{}\"", col, col), _ => format!("\"{}\"", col) }
 }
 
-fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols: &[(String, Option<String>)], offset_cols: &[catalog::OffsetColumn], col_types: &std::collections::HashMap<String, String>, scope_vals: &[(String, String)], in_vals: &[(String, Vec<String>)]) -> String {
+fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols: &[(String, Option<String>)], offset_cols: &[catalog::OffsetColumn], col_types: &std::collections::HashMap<String, String>, scope_vals: &[(String, String)], in_vals: &[(String, Vec<String>)], z_box: Option<pg_sys::BOX>) -> String {
     let mut sources: Vec<String> = segments.iter().map(|s| s.source.clone()).collect();
     sources.sort(); sources.dedup();
     let mut sources_with_seconds: Vec<(String, i32)> = sources.into_iter().map(|s| { let secs = if s == base_table { 0 } else { catalog::get_metadata(&s).map(|m| m.frame_seconds).unwrap_or(0) }; (s, secs) }).collect();
@@ -2145,6 +2147,21 @@ fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols
         let src_segs: Vec<&Segment> = segments.iter().filter(|s| s.source == src).collect(); if src_segs.is_empty() { continue; }
         let time_pred = if src_segs.len() == 1 { let s = src_segs[0]; format!("t >= '{}'::timestamptz AND t < '{}'::timestamptz", format_epoch(s._t_start), format_epoch(s._t_end)) }
                         else { format!("t <@ '{{ {} }}'::tstzmultirange", src_segs.iter().map(|s| format!("[\"{}\", \"{}\")", format_epoch(s._t_start), format_epoch(s._t_end))).collect::<Vec<_>>().join(", ")) };
+        let mut spatial_pred = String::new();
+        if let Some(b) = z_box {
+            let min_x = b.low.x as u64;
+            let max_x = b.high.x as u64;
+            let min_y = b.low.y as u64;
+            let max_y = b.high.y as u64;
+            let ranges = crate::zorder::generate_z_ranges_2d(min_x, min_y, max_x, max_y);
+            if !ranges.is_empty() {
+                let mut range_clauses = Vec::new();
+                for (start, end) in ranges {
+                    range_clauses.push(format!("(spiral_zorder(spiral(t), ARRAY['sensor_id']) BETWEEN {} AND {})", start, end));
+                }
+                spatial_pred = format!(" AND ({})", range_clauses.join(" OR "));
+            }
+        }
         let zorder_pred = if is_rollup && !scope_vals.is_empty() {
             let min_t = src_segs.iter().map(|s| s._t_start).min().unwrap_or(0); let max_t = src_segs.iter().map(|s| s._t_end).max().unwrap_or(0);
             let lo = crate::zorder::spiral_zorder(min_t, scope_vals.iter().map(|(_, v)| Some(v.clone())).collect()); let hi = crate::zorder::spiral_zorder(max_t, scope_vals.iter().map(|(_, v)| Some(v.clone())).collect());
@@ -2152,7 +2169,7 @@ fn construct_union_sql_hierarchical(base_table: &str, segments: &[Segment], cols
         } else { String::new() };
         let scope_pred = scope_vals.iter().filter(|(col, _)| is_rollup && rollup_cols.contains(col)).map(|(col, val)| format!(" AND \"{}\" = '{}'", col.replace("\"", "\"\""), val.replace("'", "''"))).collect::<String>();
         let in_pred = in_vals.iter().filter(|(col, _)| is_rollup && rollup_cols.contains(col)).map(|(col, vals)| format!(" AND \"{}\" IN ({})", col.replace("\"", "\"\""), vals.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", "))).collect::<String>();
-        select_parts.push(format!("SELECT {} FROM {} WHERE {}{}{}{}", inner_select.join(", "), src, time_pred, zorder_pred, scope_pred, in_pred));
+        select_parts.push(format!("SELECT {} FROM {} WHERE {}{}{}{}{}", inner_select.join(", "), src, time_pred, spatial_pred, zorder_pred, scope_pred, in_pred));
     }
     if select_parts.is_empty() { return String::new(); }
     select_parts.join(" UNION ALL ")
