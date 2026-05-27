@@ -1,0 +1,29 @@
+{
+  "name": "spiral",
+  "version": "1.0.0",
+  "description": "**Spiral** is a PostgreSQL extension for experimenting with time-series data at scale. It serves as a playground for learning PostgreSQL internals while testing ideas for storage footprints and hierarchical rollups.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jonatas/spiral.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/jonatas/spiral/issues"
+  },
+  "homepage": "https://github.com/jonatas/spiral#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
+  }
+}
