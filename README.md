@@ -342,13 +342,24 @@ For certain hooks to function correctly, you must add `spiral` to your `shared_p
 shared_preload_libraries = 'spiral'
 ```
 
-### Background Worker Configuration
-Spiral's background worker is fully autonomous. It automatically starts for any database where a table is created using `WITH (spiral.frames = ...)`. No manual database name configuration is required. The worker polls the `spiral.changelog` every 1 second and seamlessly triggers cascading incremental view maintenance across all registered hierarchies.
+### Configuration (GUCs)
 
-You can control the background worker using standard PostgreSQL custom variables (GUCs). These can be set in `postgresql.conf` or dynamically via `ALTER SYSTEM`:
+Spiral provides several standard PostgreSQL custom variables (GUCs) to tune the background worker and the query planner. These can be set in `postgresql.conf` or dynamically via `ALTER SYSTEM` (or `SET` for session-local overrides where applicable).
+
+#### Background Worker Settings
+
+Spiral's background worker is fully autonomous. It automatically starts for any database where a table is created using `WITH (spiral.frames = ...)`. No manual database name configuration is required. The worker polls `spiral.changelog` every 1 second and seamlessly triggers cascading incremental view maintenance across all registered hierarchies.
 
 - **`spiral.worker_enabled` (boolean, default `true`)**: Allows you to pause the autonomous worker. This is particularly useful during massive data migrations, schema refactorings, or special maintenance windows where you prefer to delay view refreshes until all transactions are completely finalized.
 - **`spiral.worker_debug` (boolean, default `false`)**: By default, the worker logs standard `INFO` messages to the PostgreSQL log when refreshing views. Setting this to `true` switches the output to `DEBUG2` level, silencing the standard logs unless your `log_min_messages` is configured to capture deep debug traces.
+- **`spiral.max_workers` (int, default `1`)**: Caps the number of background workers that can refresh materialized views concurrently. Increase this value (e.g., to 2-4) if you have many active tables or high write throughput, provided you have sufficient CPU cores.
+- **`spiral.worker_batch_size` (int, default `10`)**: The maximum number of `(base_view, scope)` pairs a worker will process per 1-second tick. Increase this if you have many partitioned tenants/scopes receiving updates simultaneously and want the worker to catch up faster.
+
+#### Query Planner Settings
+
+- **`spiral.enable_planner_hook` (boolean, default `true`)**: Enables or disables Spiral's query planner optimizations. When `false`, the standard PostgreSQL planner is used without sub-query flattening, Z-order pushdowns, or Cost-Based Slicing. Useful for debugging plan performance. Can be overridden per-session using `SET spiral.enable_planner_hook = off;`.
+- **`spiral.planner_max_segments` (int, default `100`)**: Spiral uses Cost-Based Slicing to rewrite queries into a `UNION ALL` of pre-aggregated rollup segments and raw data. This setting limits the maximum number of fragments the planner will generate. If a query requires more segments than this limit (e.g., querying across many fragmented time ranges), the planner falls back to scanning the RAW table to avoid query complexity and `UNION ALL` overhead.
+  - **How to estimate:** A value of `100` works well for most typical dashboards. If you observe long query planning times or PostgreSQL memory limits being hit when querying very wide time ranges, try reducing this number to force the planner to use the RAW table sooner. If your queries consistently span hundreds of fragmented time buckets and you want to enforce strict rollup usage (accepting slightly slower planning times to save I/O), you can increase this value (e.g., to `500` or `1000`).
 
 **Example Configuration:**
 ```sql
@@ -361,6 +372,9 @@ SELECT pg_reload_conf();
 -- Re-enable the worker and let it catch up autonomously
 ALTER SYSTEM SET spiral.worker_enabled = true;
 SELECT pg_reload_conf();
+
+-- Temporarily bypass the planner in the current session for debugging
+SET spiral.enable_planner_hook = false;
 ```
 
 ---
