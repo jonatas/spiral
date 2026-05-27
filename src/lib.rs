@@ -92,13 +92,13 @@ fn spiral_is_loaded() -> bool {
 const POSTGRES_EPOCH_JDATE: i64 = 946684800; // seconds between 1970-01-01 and 2000-01-01
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
+fn spiral(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
     let micros = unsafe { i64::from_datum(t.into_datum().unwrap(), false).unwrap() };
     (micros / 1000000) + POSTGRES_EPOCH_JDATE
 }
 
 #[pg_extern(immutable, parallel_safe, name = "spiral")]
-pub fn spiral_bigint(t: i64) -> i64 {
+fn spiral_bigint(t: i64) -> i64 {
     t
 }
 
@@ -339,7 +339,7 @@ fn refresh_incremental(
 }
 
 #[pg_extern]
-pub fn spiral_to_epoch(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
+fn spiral_to_epoch(t: pgrx::datum::TimestampWithTimeZone) -> i64 {
     spiral(t)
 }
 
@@ -543,19 +543,7 @@ fn spiral_register_view(
 }
 
 pub fn get_kickoff_epoch() -> i64 {
-    let kickoff_str = Spi::get_one::<String>("SELECT current_setting('spiral.kickoff_date', true)")
-        .unwrap_or(None)
-        .unwrap_or_else(|| "2000-01-01".to_string());
-    
-    let kickoff_val = if kickoff_str.is_empty() { "2000-01-01".to_string() } else { kickoff_str };
-
-    Spi::connect(|client| {
-        let ts = client.select(&format!("SELECT '{}'::timestamptz", kickoff_val.replace("'", "''")), Some(1), &[])?
-            .first()
-            .get::<pgrx::datum::TimestampWithTimeZone>(1)?
-            .unwrap();
-        Ok::<i64, spi::Error>(spiral_to_epoch(ts))
-    }).unwrap_or(0)
+    Spi::get_one::<i64>("SELECT spiral(COALESCE(NULLIF(current_setting('spiral.kickoff_date', true), ''), '2000-01-01')::timestamptz)").unwrap_or(Some(0)).unwrap_or(0)
 }
 
 pub fn get_minimal_pace() -> f64 {
@@ -884,10 +872,10 @@ mod tests {
     #[pg_test]
     fn test_hilbert_2d_correctness() {
         use crate::zorder::spiral_hilbert_2d;
-        assert_eq!(spiral_hilbert_2d(0, 0).to_string(), "0");
-        assert_eq!(spiral_hilbert_2d(1, 0).to_string(), "1");
-        assert_eq!(spiral_hilbert_2d(0, 1).to_string(), "2");
-        assert_eq!(spiral_hilbert_2d(1, 1).to_string(), "3");
+        assert_eq!(spiral_hilbert_2d(0, 0), 0);
+        assert_eq!(spiral_hilbert_2d(1, 0), 1);
+        assert_eq!(spiral_hilbert_2d(0, 1), 2);
+        assert_eq!(spiral_hilbert_2d(1, 1), 3);
     }
 
     #[pg_test]
