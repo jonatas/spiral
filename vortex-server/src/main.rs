@@ -331,9 +331,9 @@ async fn get_block_info(
     // time_col comes from our own metadata — safe to interpolate after identifier check
     if valid_identifier(&time_col) {
         let time_sql = format!(
-            "SELECT extract(epoch from min("{tc}"))::bigint, \
-                    extract(epoch from max("{tc}"))::bigint \
-             FROM "{view}" \
+            "SELECT extract(epoch from min(\"{tc}\"))::bigint, \
+                    extract(epoch from max(\"{tc}\"))::bigint \
+             FROM \"{view}\" \
              WHERE (ctid::text::point)[0]::int = $1",
             tc = time_col,
             view = name,
