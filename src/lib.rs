@@ -22,7 +22,7 @@ pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
 pub static WORKER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10);
 pub static ENABLE_PLANNER_HOOK: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static PLANNER_MAX_SEGMENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
-pub static KICKOFF_DATE: GucSetting<Option<&'static std::ffi::CStr>> = GucSetting::<Option<&'static std::ffi::CStr>>::new(None);
+pub static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
 pub static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(60.0);
 
 thread_local! {
@@ -239,12 +239,6 @@ fn refresh_incremental(
         return false;
     }
 
-    let update_cols: Vec<String> = all_cols
-        .iter()
-        .filter(|&c| c != "t" && !scope_cols_raw.contains(c))
-        .map(|c| format!("\"{}\"", c))
-        .collect();
-
     if frame_seconds > 0 {
         let (sql_child, _) = rollup::derive_child_sql(
             view_name,
@@ -265,59 +259,41 @@ fn refresh_incremental(
             .unwrap()
             .trim();
 
-        let mut on_clause = vec!["target.t::timestamptz = source.t::timestamptz".to_string()];
-        for col in &scope_cols {
-            on_clause.push(format!("target.{} = source.{}", col, col));
-        }
-        let update_set = update_cols
-            .iter()
-            .map(|c| format!("{} = source.{}", c, c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
         let safe_key = changelog_key.replace('\'', "''");
-        let mut source_where = if let Some(ref sj) = scope_json {
-            // Per-scope refresh: exact JSONB match — tight changelog JOIN, no cross-scope fan-out.
+        let (changelog_scope_match, target_scope_where) = if let Some(ref sj) = scope_json {
             let safe_sj = sj.replace('\'', "''");
-            format!(
-                "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
-                    AND (c.t_start IS NULL OR spiral(t) >= (c.t_start/{0})*{0})
-                    AND (c.t_end IS NULL OR spiral(t) < ((c.t_end/{0})+1)*{0})
-                    AND c.scope_values = '{safe_sj}'::jsonb",
-                frame_seconds,
-            )
+            let tsw = scope_json_to_where(sj).unwrap_or_else(|| "1=1".to_string());
+            (format!("c.scope_values = '{}'::jsonb", safe_sj), tsw)
         } else if scope_cols_raw.is_empty() {
-            format!(
-                "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
-                    AND (c.t_start IS NULL OR spiral(t) >= (c.t_start/{0})*{0})
-                    AND (c.t_end IS NULL OR spiral(t) < ((c.t_end/{0})+1)*{0})
-                    AND c.scope_values = '{{}}'::jsonb",
-                frame_seconds,
-            )
+            ("c.scope_values = '{}'::jsonb".to_string(), "1=1".to_string())
         } else {
             let scope_cols_json = scope_cols_raw
                 .iter()
-                .map(|s| format!("'{}', \"{}\"", s, s))
+                .map(|s| format!("'{}', target.\"{}\"", s, s))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
-                    AND (c.t_start IS NULL OR spiral(t) >= (c.t_start/{0})*{0})
-                    AND (c.t_end IS NULL OR spiral(t) < ((c.t_end/{0})+1)*{0})
-                    AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
-                frame_seconds,
-                scope_cols_json,
+            (
+                format!("(c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({}))", scope_cols_json),
+                "1=1".to_string()
             )
         };
 
-        // Base table WHERE: scope_json-derived filter for index pushdown, else extra_where.
-        let base_where = scope_json
-            .as_deref()
-            .and_then(scope_json_to_where)
-            .or_else(|| extra_where.clone());
-        if let Some(ref w) = base_where {
-            source_where.push_str(&format!(" WHERE ({})", w));
-        }
+        let delete_sql = format!(
+            "DELETE FROM \"{view_name}\" AS target
+             WHERE {target_scope_where}
+               AND EXISTS (
+                 SELECT 1 FROM spiral.changelog c
+                 WHERE c.base_view = '{safe_key}'
+                   AND {changelog_scope_match}
+                   AND (c.t_start IS NULL OR spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds})
+                   AND (c.t_end IS NULL OR spiral(target.t) < ((c.t_end/{frame_seconds})+1)*{frame_seconds})
+               )",
+            view_name = view_name,
+            target_scope_where = target_scope_where,
+            safe_key = safe_key,
+            changelog_scope_match = changelog_scope_match,
+            frame_seconds = frame_seconds
+        );
 
         let group_by_clause = if scope_cols.is_empty() {
             "1".to_string()
@@ -325,46 +301,72 @@ fn refresh_incremental(
             format!("1, {}", scope_cols.join(", "))
         };
 
-        let merge_sql = format!(
-            "MERGE INTO \"{view_name}\" AS target
-                USING (
-                    SELECT {select_part} FROM \"{source_table}\"
-                    {source_where}
-                    GROUP BY {group_by_clause}
-                ) AS source
-                ON ({on_clause})
-                WHEN MATCHED THEN UPDATE SET {update_set}
-                WHEN NOT MATCHED THEN INSERT ({all_cols_joined}) VALUES ({source_cols_joined})",
+        let base_where = scope_json
+            .as_deref()
+            .and_then(scope_json_to_where)
+            .or_else(|| extra_where.clone());
+
+        let base_metadata_owned = catalog::get_metadata(&metadata.base_view);
+        let source_time_col = if parent_view == "BASE" {
+            base_metadata_owned.as_ref()
+                .and_then(|m| m.columns_metadata.get("time_column").and_then(|v| v.as_str()))
+                .unwrap_or("t")
+        } else {
+            "t"
+        };
+
+        let source_changelog_scope_match = if let Some(ref sj) = scope_json {
+            let safe_sj = sj.replace('\'', "''");
+            format!("c.scope_values = '{}'::jsonb", safe_sj)
+        } else if scope_cols_raw.is_empty() {
+            "c.scope_values = '{}'::jsonb".to_string()
+        } else {
+            let scope_cols_json = scope_cols_raw
+                .iter()
+                .map(|s| format!("'{}', s.\"{}\"", s, s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("(c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({}))", scope_cols_json)
+        };
+
+        let all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
+        let insert_sql = format!(
+            "INSERT INTO \"{view_name}\" ({all_cols_joined})
+             SELECT {select_part} FROM \"{source_table}\" AS s
+             WHERE EXISTS (
+                 SELECT 1 FROM spiral.changelog c
+                 WHERE c.base_view = '{safe_key}'
+                   AND {source_changelog_scope_match}
+                   AND (c.t_start IS NULL OR spiral(s.\"{source_time_col}\") >= (c.t_start/{frame_seconds})*{frame_seconds})
+                   AND (c.t_end IS NULL OR spiral(s.\"{source_time_col}\") < ((c.t_end/{frame_seconds})+1)*{frame_seconds})
+             )
+             {extra_filter}
+             GROUP BY {group_by_clause}",
             view_name = view_name,
+            all_cols_joined = all_cols_joined,
             select_part = select_part,
             source_table = source_table,
-            source_where = source_where,
-            group_by_clause = group_by_clause,
-            on_clause = on_clause.join(" AND "),
-            update_set = if update_set.is_empty() {
-                "t = source.t"
-            } else {
-                &update_set
-            },
-            all_cols_joined = all_cols
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", "),
-            source_cols_joined = all_cols
-                .iter()
-                .map(|c| format!("source.\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ")
+            safe_key = safe_key,
+            source_changelog_scope_match = source_changelog_scope_match,
+            source_time_col = source_time_col,
+            frame_seconds = frame_seconds,
+            extra_filter = if let Some(ref w) = base_where { format!("AND ({})", w) } else { "".to_string() },
+            group_by_clause = group_by_clause
         );
 
         SKIP_ACCELERATION.with(|s| s.set(true));
-        let run_result = Spi::run(&merge_sql);
+        let run_delete = Spi::run(&delete_sql);
+        let run_result = if run_delete.is_ok() {
+            Spi::run(&insert_sql)
+        } else {
+            run_delete
+        };
         SKIP_ACCELERATION.with(|s| s.set(false));
+
         if let Err(e) = run_result {
             notice!(
                 "Spiral: refresh_incremental failed for '{}': {:?}\nSQL: {}",
-                view_name, e, merge_sql
+                view_name, e, insert_sql
             );
             return false;
         }
@@ -1865,6 +1867,41 @@ mod tests {
             "changelog must be unchanged after a failed refresh — got {} rows, expected {}",
             after, before
         );
+    }
+
+    #[pg_test]
+    fn test_issue_67_repro_delete_leaves_stale_rows() {
+        Spi::run("SET spiral.kickoff_date = '2026-04-15';").unwrap();
+        Spi::run("CREATE TABLE metrics_repro (
+            t timestamptz NOT NULL,
+            device_id text NOT NULL,
+            val double precision -- Spiral: sum
+        ) WITH (
+            spiral.frames = '1m',
+            spiral.tenant = 'device_id'
+        );").unwrap();
+
+        // 1. Ingest initial data
+        Spi::run("INSERT INTO metrics_repro (t, device_id, val) VALUES
+            ('2026-04-15 10:00:05Z', 'A', 10.0),
+            ('2026-04-15 10:00:55Z', 'A', 20.0);").unwrap();
+
+        // 2. Refresh
+        Spi::run("SELECT spiral_refresh('metrics_repro');").unwrap();
+
+        // Check metrics_repro_1m (should have 1 row for A at 10:00:00)
+        let count: i64 = Spi::get_one("SELECT count(*) FROM metrics_repro_1m").unwrap().unwrap();
+        assert_eq!(count, 1, "Initial refresh should produce 1 row");
+
+        // 3. Delete ALL data for that bucket
+        Spi::run("DELETE FROM metrics_repro WHERE device_id = 'A';").unwrap();
+
+        // 4. Refresh again
+        Spi::run("SELECT spiral_refresh('metrics_repro');").unwrap();
+
+        // 5. Check metrics_repro_1m (it SHOULD BE EMPTY)
+        let count: i64 = Spi::get_one("SELECT count(*) FROM metrics_repro_1m").unwrap().unwrap();
+        assert_eq!(count, 0, "Refresh after delete should result in 0 rows in rollup");
     }
 }
 
