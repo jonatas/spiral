@@ -848,7 +848,7 @@ fn SvgCandlestickChart(
     let vmax_s = if has_data { format!("{:.1}", v_max) } else { "—".to_string() };
     let vmin_s = if has_data { format!("{:.1}", v_min) } else { "—".to_string() };
     let tstart_s = if has_data { format_short_time(t_min) } else { "".to_string() };
-    let tend_s = if has_data { format_short_time(t_max) } else { "".to_string() };
+    let tend_s = if has_data && t_max > t_min { format_short_time(t_max) } else { "".to_string() };
     
     let vb = format!("0 0 {} {}", W, H);
 
@@ -979,7 +979,7 @@ fn SvgBarChart(
     let label = format!("{} (sum)", metric_col);
     let vmax_s = if has_data { format!("{:.1}", v_max) } else { "—".to_string() };
     let tstart_s = if has_data { format_short_time(t_min) } else { "".to_string() };
-    let tend_s = if has_data { format_short_time(t_max) } else { "".to_string() };
+    let tend_s = if has_data && t_max > t_min { format_short_time(t_max) } else { "".to_string() };
     let vb = format!("0 0 {} {}", W, H);
 
     view! {
@@ -1167,7 +1167,7 @@ fn SvgLineChart(
     let vmax_s = if has_data { format!("{:.1}", v_max) } else { "—".to_string() };
     let vmin_s = if has_data { format!("{:.1}", v_min) } else { "—".to_string() };
     let tstart_s = if has_data { format_short_time(t_min) } else { "".to_string() };
-    let tend_s = if has_data { format_short_time(t_max) } else { "".to_string() };
+    let tend_s = if has_data && t_max > t_min { format_short_time(t_max) } else { "".to_string() };
     
     let vb = format!("0 0 {} {}", W, H);
 
@@ -1498,6 +1498,13 @@ fn App() -> impl IntoView {
         selected_block.set(None);
         selected_page_no.set(None);
         slice_data.set(None);
+    });
+
+    Effect::new(move |_| {
+        let stats = current_stats.get();
+        if selected_page_no.get().is_none() && stats.total_pages > 0 {
+            selected_page_no.set(Some(0));
+        }
     });
 
     let api_base_clone = Arc::clone(&api_base);
@@ -1848,11 +1855,15 @@ fn App() -> impl IntoView {
                                 let start_t = if b.t_actual_start > 0 { b.t_actual_start } else { kb + b.t_range[0] };
                                 let end_t = if b.t_actual_end > 0 { b.t_actual_end } else { kb + b.t_range[1] };
                                 let span = (end_t - start_t).abs() as i32;
-                                view! {
-                                    <span class="page-meta" style="margin-left:auto; color:var(--blue); font-weight:700;">
-                                        {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(span))}
-                                    </span>
-                                }.into_any()
+                                if start_t > 0 || end_t > 0 {
+                                    view! {
+                                        <span class="page-meta" style="margin-left:auto; color:var(--blue); font-weight:700;">
+                                            {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(span))}
+                                        </span>
+                                    }.into_any()
+                                } else {
+                                    view! { <span class="page-meta" style="margin-left:auto;"></span> }.into_any()
+                                }
                             } else if s.total_pages > 0 && (k > 0 || s.min_t > 0) {
                                 let (start_t, end_t, duration) = if s.min_t > 0 && s.max_t > 0 {
                                     (s.min_t, s.max_t, (s.max_t - s.min_t) as i32)
@@ -1862,11 +1873,15 @@ fn App() -> impl IntoView {
                                     (k, k + total_duration, total_duration as i32)
                                 };
 
-                                view! {
-                                    <span class="page-meta" style="margin-left:auto; color:var(--blue); opacity: 0.8;">
-                                        {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(duration))}
-                                    </span>
-                                }.into_any()
+                                if start_t > 0 || end_t > 0 {
+                                    view! {
+                                        <span class="page-meta" style="margin-left:auto; color:var(--blue); opacity: 0.8;">
+                                            {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(duration))}
+                                        </span>
+                                    }.into_any()
+                                } else {
+                                    view! { <span class="page-meta" style="margin-left:auto;"></span> }.into_any()
+                                }
                             } else {
                                 view! { <span class="page-meta" style="margin-left:auto;"></span> }.into_any()
                             }

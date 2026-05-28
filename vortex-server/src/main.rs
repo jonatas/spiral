@@ -344,16 +344,16 @@ async fn get_block_info(
     // time_col comes from our own metadata — safe to interpolate after identifier check
     if valid_identifier(&time_col) {
         let time_sql = format!(
-            "SELECT extract(epoch from min(\"{tc}\"))::bigint, \
-                    extract(epoch from max(\"{tc}\"))::bigint \
-             FROM \"{view}\" \
-             WHERE (ctid::text::point)[0]::int = $1",
+            "SELECT 
+                (SELECT extract(epoch from \"{tc}\")::bigint FROM \"{view}\" WHERE ctid >= '({blkno},0)'::tid AND ctid < '({next_blkno},0)'::tid ORDER BY \"{tc}\" ASC LIMIT 1),
+                (SELECT extract(epoch from \"{tc}\")::bigint FROM \"{view}\" WHERE ctid >= '({blkno},0)'::tid AND ctid < '({next_blkno},0)'::tid ORDER BY \"{tc}\" DESC LIMIT 1)",
             tc = time_col,
             view = name,
+            blkno = blkno,
+            next_blkno = blkno + 1
         );
 
         match sqlx::query(&time_sql)
-            .bind(blkno)
             .fetch_one(&state.pool)
             .await
         {
@@ -724,7 +724,7 @@ async fn get_slice_data(
            FROM {view_name}
            WHERE {time_col} >= to_timestamp($1)
              AND {time_col} < to_timestamp($2)
-           ORDER BY {time_col}
+           ORDER BY {time_col}, {scope_col}
            LIMIT $3
          ) d",
         time_col = time_col,
