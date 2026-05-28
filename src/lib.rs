@@ -305,7 +305,7 @@ fn refresh_incremental(
                  WHERE c.base_view = '{safe_key}'
                    AND {changelog_scope_match}
                    AND (c.t_start IS NULL OR spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds})
-                   AND (c.t_end IS NULL OR spiral(target.t) < ((c.t_end/{frame_seconds})+1)*{frame_seconds})
+                   AND (c.t_end IS NULL OR spiral(target.t) < c.t_end)
                )",
             view_name = view_name,
             target_scope_where = target_scope_where,
@@ -369,7 +369,7 @@ fn refresh_incremental(
                  WHERE c.base_view = '{safe_key}'
                    AND {source_changelog_scope_match}
                    AND (c.t_start IS NULL OR spiral(s.\"{source_time_col}\") >= (c.t_start/{frame_seconds})*{frame_seconds})
-                   AND (c.t_end IS NULL OR spiral(s.\"{source_time_col}\") < ((c.t_end/{frame_seconds})+1)*{frame_seconds})
+                   AND (c.t_end IS NULL OR spiral(s.\"{source_time_col}\") < c.t_end)
              )
              {extra_filter}
              GROUP BY {group_by_clause}",
@@ -542,20 +542,26 @@ fn spiral_register_view(
                 .map(|s| format!("\"{}\"", s.trim()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let index_sql = if scope_columns.is_empty() {
-                format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{view_name} ON {view_name}(t)")
-            } else {
-                format!(
-                    "CREATE INDEX IF NOT EXISTS idx_z_{view_name} ON {view_name} \
-                     (spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[]))"
-                )
-            };
             let create_table_sql = format!(
                 "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM ({}) s LIMIT 0",
                 view_name, select_part
             );
             let _ = Spi::run(&create_table_sql);
-            let _ = Spi::run(&index_sql);
+            let unique_sql = if scope_columns.is_empty() {
+                format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{view_name} ON {view_name}(t)")
+            } else {
+                format!(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{view_name} ON {view_name}(t, {scope_cols_str})"
+                )
+            };
+            let _ = Spi::run(&unique_sql);
+            if !scope_columns.is_empty() {
+                let zorder_sql = format!(
+                    "CREATE INDEX IF NOT EXISTS idx_z_{view_name} ON {view_name} \
+                     (spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[]))"
+                );
+                let _ = Spi::run(&zorder_sql);
+            }
         }
     }
 
@@ -2011,6 +2017,81 @@ mod tests {
             count, 0,
             "Refresh after delete should result in 0 rows in rollup"
         );
+    }
+
+    // issue #66: scoped rollups must have a unique index on (t, scope_cols)
+    #[pg_test]
+    fn test_scoped_rollup_unique_index() {
+        Spi::run(
+            "CREATE TABLE scoped_u (t timestamptz NOT NULL, tenant int NOT NULL, val double precision)",
+        )
+        .unwrap();
+        Spi::run("SELECT accelerate('scoped_u', frames => '1h', tenant => ARRAY['tenant'])").unwrap();
+
+        let has_unique: bool = Spi::get_one::<bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'scoped_u_1h'
+                  AND indexdef LIKE '%UNIQUE%'
+                  AND indexdef LIKE '%tenant%'
+            )",
+        )
+        .unwrap()
+        .unwrap_or(false);
+        assert!(has_unique, "scoped rollup must have UNIQUE index on (t, tenant)");
+
+    }
+
+    // issue #68: dirty range [t, t+bucket) must not mark the next frame dirty
+    #[pg_test]
+    fn test_dirty_range_no_overexpansion() {
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run(
+            "CREATE TABLE boundary_ticks (t timestamptz NOT NULL, val float)",
+        )
+        .unwrap();
+        Spi::run("SELECT accelerate('boundary_ticks', frames => '1h')").unwrap();
+
+        // Insert into last minute of hour 0 (frame [0h, 1h))
+        Spi::run(
+            "INSERT INTO boundary_ticks VALUES ('2026-01-01 00:59:00+00', 1.0)",
+        )
+        .unwrap();
+
+        // Refresh — only frame [0h, 1h) should be touched
+        Spi::run("SELECT spiral_refresh('boundary_ticks')").unwrap();
+
+        // After refresh, changelog must be empty (no stale dirty entries for hour 1+)
+        let dirty: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'boundary_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(dirty, 0, "changelog must be empty after refresh — no over-expanded dirty range");
+
+        // Insert into first minute of hour 1 (frame [1h, 2h))
+        Spi::run(
+            "INSERT INTO boundary_ticks VALUES ('2026-01-01 01:00:00+00', 2.0)",
+        )
+        .unwrap();
+
+        Spi::run("SELECT spiral_refresh('boundary_ticks')").unwrap();
+
+        // Both hours should have exactly 1 rollup row each
+        let hour0: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM boundary_ticks_1h
+             WHERE t = '2026-01-01 00:00:00+00'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        let hour1: i64 = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM boundary_ticks_1h
+             WHERE t = '2026-01-01 01:00:00+00'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert_eq!(hour0, 1, "hour 0 rollup row must exist");
+        assert_eq!(hour1, 1, "hour 1 rollup row must exist");
     }
 }
 

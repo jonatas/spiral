@@ -348,9 +348,9 @@ pub fn derive_child_sql(
         let index_sql = if scope_columns.is_empty() {
             format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t)")
         } else {
-            // Use Z-Order for clustered multi-tenant access
             format!(
-                "CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t, {scope_cols_str});
+                 CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (
                     spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[])
                 )"
             )
