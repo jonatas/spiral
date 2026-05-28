@@ -2220,7 +2220,7 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     let success = if is_root && scope_filter.is_none() {
         let scopes: Vec<String> = Spi::connect(|client| Ok::<Vec<String>, spi::Error>(client.select(&format!("SELECT DISTINCT scope_values::text FROM spiral.changelog WHERE base_view = '{}'", real_base.replace('\'', "''")), None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap_or_else(|| "{}".to_string())).collect())).unwrap_or_default();
         if scopes.is_empty() { crate::refresh_incremental(base_name, None, 0, None) }
-        else { let mut any_ok = false; for s in scopes { any_ok |= crate::refresh_incremental(base_name, None, 0, Some(s)); } any_ok }
+        else { let mut all_ok = true; for s in scopes { if !crate::refresh_incremental(base_name, None, 0, Some(s)) { all_ok = false; } } all_ok }
     } else { crate::refresh_incremental(base_name, where_clause.clone(), 0, None) };
 
     if success && is_root { let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)"); }
