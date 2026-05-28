@@ -1500,13 +1500,6 @@ fn App() -> impl IntoView {
         slice_data.set(None);
     });
 
-    Effect::new(move |_| {
-        let stats = current_stats.get();
-        if selected_page_no.get().is_none() && stats.total_pages > 0 {
-            selected_page_no.set(Some(0));
-        }
-    });
-
     let api_base_clone = Arc::clone(&api_base);
     let fetch_block_info = move |blkno: i32| {
         selected_block.set(None);
@@ -1599,6 +1592,14 @@ fn App() -> impl IntoView {
             .cloned()
             .unwrap_or_default()
     }).into();
+
+    // Auto-select first page when table loads and no page pending from URL
+    Effect::new(move |_| {
+        let stats = current_stats.get();
+        if selected_page_no.get().is_none() && stats.total_pages > 0 {
+            selected_page_no.set(Some(0));
+        }
+    });
 
     let current_hierarchy_opt: Signal<Option<HierarchyConfig>> = Memo::new(move |_| {
         current_hierarchy(&config.get(), &selected_base_view.get())
