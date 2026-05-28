@@ -340,15 +340,20 @@ async fn get_block_info(
             view = name,
         );
 
-        if let Ok(time_row) = sqlx::query(&time_sql)
+        match sqlx::query(&time_sql)
             .bind(blkno)
             .fetch_one(&state.pool)
             .await
         {
-            let t_min: Option<i64> = time_row.get(0);
-            let t_max: Option<i64> = time_row.get(1);
-            block_info.t_actual_start = t_min.unwrap_or(0);
-            block_info.t_actual_end = t_max.unwrap_or(0);
+            Ok(time_row) => {
+                let t_min: Option<i64> = time_row.get(0);
+                let t_max: Option<i64> = time_row.get(1);
+                block_info.t_actual_start = t_min.unwrap_or(0);
+                block_info.t_actual_end = t_max.unwrap_or(0);
+            }
+            Err(e) => {
+                tracing::error!("time_sql failed: {}", e);
+            }
         }
     }
 
