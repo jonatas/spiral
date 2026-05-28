@@ -11,9 +11,9 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, Pool, Postgres, Row};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -124,6 +124,7 @@ enum VortexEvent {
 struct AppState {
     pool: Pool<Postgres>,
     tx: broadcast::Sender<VortexEvent>,
+    recent_changelog: Mutex<VecDeque<ChangelogEntry>>,
 }
 
 #[tokio::main]
@@ -155,6 +156,7 @@ async fn main() {
     let state = Arc::new(AppState {
         pool: pool.clone(),
         tx: tx.clone(),
+        recent_changelog: Mutex::new(VecDeque::with_capacity(500)),
     });
 
     // Start background polling task
@@ -184,6 +186,14 @@ async fn main() {
                             entries.len(),
                             last_processed_event_id
                         );
+                        
+                        if let Ok(mut buffer) = polling_state.recent_changelog.lock() {
+                            for entry in &entries {
+                                buffer.push_front(entry.clone());
+                            }
+                            buffer.truncate(500);
+                        }
+
                         for entry in entries {
                             last_processed_event_id = last_processed_event_id.max(entry.event_id);
                             let _ = polling_state.tx.send(VortexEvent::ChangelogUpdate(entry));
@@ -308,22 +318,22 @@ async fn get_block_info(
             .map(|s| s.to_string())
     });
 
-    if time_col.is_none() {
-        if let Some(ref row) = meta_row {
-            let base_view: String = row.get("base_view");
-            if let Ok(Some(base_meta)) = sqlx::query(
-                "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1",
-            )
-            .bind(&base_view)
-            .fetch_optional(&state.pool)
-            .await
-            {
-                let cm: serde_json::Value = base_meta.get("columns_metadata");
-                time_col = cm
-                    .get("time_column")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
+    if time_col.is_none()
+        && let Some(ref row) = meta_row
+    {
+        let base_view: String = row.get("base_view");
+        if let Ok(Some(base_meta)) = sqlx::query(
+            "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1",
+        )
+        .bind(&base_view)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            let cm: serde_json::Value = base_meta.get("columns_metadata");
+            time_col = cm
+                .get("time_column")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
     }
 
@@ -363,8 +373,8 @@ async fn get_block_info(
         .ok()
         .flatten();
 
-        if let Some(base_view) = base_view_opt {
-            if let Ok(cl_row) = sqlx::query(
+        if let Some(base_view) = base_view_opt
+            && let Ok(cl_row) = sqlx::query(
                 "SELECT COUNT(*)::int FROM spiral.changelog
                  WHERE base_view = $1
                    AND t_start <= $2
@@ -375,11 +385,10 @@ async fn get_block_info(
             .bind(block_info.t_actual_start)
             .fetch_one(&state.pool)
             .await
-            {
-                let count: i32 = cl_row.get(0);
-                block_info.pending_changes = count;
-                block_info.is_stale = count > 0;
-            }
+        {
+            let count: i32 = cl_row.get(0);
+            block_info.pending_changes = count;
+            block_info.is_stale = count > 0;
         }
     }
 
@@ -418,15 +427,13 @@ async fn get_metadata(
 async fn get_changelog(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ChangelogEntry>>, (axum::http::StatusCode, String)> {
-    let rows = sqlx::query_as::<_, ChangelogEntry>(
-        "SELECT event_id, base_view, scope_values, t_start, t_end
-         FROM spiral.changelog
-         ORDER BY event_id DESC
-         LIMIT 100",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows = state
+        .recent_changelog
+        .lock()
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .iter()
+        .cloned()
+        .collect();
 
     Ok(Json(rows))
 }
@@ -451,21 +458,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             if let Ok(Some(storage_stats)) =
                 load_storage_stats(&state.pool, &hierarchy.base_view, &hierarchy.raw_view_name)
                     .await
+                && let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
             {
-                if let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats)) {
-                    let _ = sender.send(Message::Text(msg.into())).await;
-                }
+                let _ = sender.send(Message::Text(msg.into())).await;
             }
 
             // Stats for all aggregation levels
             for level in &hierarchy.aggregation_levels {
                 if let Ok(Some(storage_stats)) =
                     load_storage_stats(&state.pool, &hierarchy.base_view, &level.view_name).await
+                    && let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
                 {
-                    if let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
-                    {
-                        let _ = sender.send(Message::Text(msg.into())).await;
-                    }
+                    let _ = sender.send(Message::Text(msg.into())).await;
                 }
             }
         }
@@ -473,11 +477,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut rx = state.tx.subscribe();
     while let Ok(event) = rx.recv().await {
-        if let Ok(msg) = serde_json::to_string(&event) {
-            if sender.send(Message::Text(msg.into())).await.is_err() {
-                tracing::info!("WebSocket client disconnected");
-                break;
-            }
+        if let Ok(msg) = serde_json::to_string(&event)
+            && sender.send(Message::Text(msg.into())).await.is_err()
+        {
+            tracing::info!("WebSocket client disconnected");
+            break;
         }
     }
 }
