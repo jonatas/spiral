@@ -1553,10 +1553,13 @@ pub fn accelerate(
     // Register metadata
     let mut base_metadata_map = serde_json::Map::new();
     base_metadata_map.insert(
-        "time_column".to_string(),
-        serde_json::Value::String(anchor_col.clone()),
+        "kickoff_epoch".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(crate::get_kickoff_epoch())),
     );
     base_metadata_map.insert(
+        "time_column".to_string(),
+        serde_json::Value::String(anchor_col.clone()),
+    );    base_metadata_map.insert(
         "offset_columns".to_string(),
         serde_json::Value::Array(
             offset_cols

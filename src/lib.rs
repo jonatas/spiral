@@ -22,6 +22,8 @@ pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
 pub static WORKER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10);
 pub static ENABLE_PLANNER_HOOK: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static PLANNER_MAX_SEGMENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
+pub static KICKOFF_DATE: GucSetting<Option<&'static std::ffi::CStr>> = GucSetting::<Option<&'static std::ffi::CStr>>::new(None);
+pub static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(60.0);
 
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
@@ -91,6 +93,26 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         &PLANNER_MAX_SEGMENTS,
         0,
         10000,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"spiral.kickoff_date",
+        c"Base date for time-relative indexing",
+        c"Timestamps are stored as offsets from this date. Defaults to 2000-01-01.",
+        &KICKOFF_DATE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_float_guc(
+        c"spiral.minimal_pace",
+        c"Minimum seconds per bucket for dirty tracking",
+        c"Smaller values increase precision but also changelog churn.",
+        &MINIMAL_PACE,
+        1.0,
+        3600.0 * 24.0,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -259,16 +281,16 @@ fn refresh_incremental(
             let safe_sj = sj.replace('\'', "''");
             format!(
                 "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
-                    AND spiral(t) >= (c.t_start/{0})*{0}
-                    AND spiral(t) < ((c.t_end/{0})+1)*{0}
+                    AND (c.t_start IS NULL OR spiral(t) >= (c.t_start/{0})*{0})
+                    AND (c.t_end IS NULL OR spiral(t) < ((c.t_end/{0})+1)*{0})
                     AND c.scope_values = '{safe_sj}'::jsonb",
                 frame_seconds,
             )
         } else if scope_cols_raw.is_empty() {
             format!(
                 "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
-                    AND spiral(t) >= (c.t_start/{0})*{0}
-                    AND spiral(t) < ((c.t_end/{0})+1)*{0}
+                    AND (c.t_start IS NULL OR spiral(t) >= (c.t_start/{0})*{0})
+                    AND (c.t_end IS NULL OR spiral(t) < ((c.t_end/{0})+1)*{0})
                     AND c.scope_values = '{{}}'::jsonb",
                 frame_seconds,
             )
@@ -280,8 +302,8 @@ fn refresh_incremental(
                 .join(", ");
             format!(
                 "JOIN spiral.changelog c ON c.base_view = '{safe_key}'
-                    AND spiral(t) >= (c.t_start/{0})*{0}
-                    AND spiral(t) < ((c.t_end/{0})+1)*{0}
+                    AND (c.t_start IS NULL OR spiral(t) >= (c.t_start/{0})*{0})
+                    AND (c.t_end IS NULL OR spiral(t) < ((c.t_end/{0})+1)*{0})
                     AND (c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({1}))",
                 frame_seconds,
                 scope_cols_json,

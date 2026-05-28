@@ -216,26 +216,30 @@ pub fn insert_source(
 }
 
 pub fn unify_changelog(base_view: &str) {
-    // Snapshot existing rows with their ctids first. Any concurrent inserts that
-    // arrive after this point will have new ctids and won't be touched by the
-    // subsequent DELETE, preserving them for the next refresh cycle.
+    // Snapshot existing rows with their ctids first.
     let _ = Spi::run(&format!(
         "CREATE TEMP TABLE changelog_snapshot AS SELECT ctid AS old_ctid, * FROM spiral.changelog WHERE base_view = '{}'",
         base_view.replace("'", "''")
     ));
+    
+    // Unify logic using sentinels for NULLs (unbounded ranges)
     let _ = Spi::run("CREATE TEMP TABLE temp_unified AS
-         SELECT base_view, scope_values, MIN(t_start) as ts, MAX(t_end) as te
+         SELECT base_view, scope_values, 
+                NULLIF(MIN(ts_safe), -9223372036854775808) as ts,
+                NULLIF(MAX(te_safe), 9223372036854775807) as te
          FROM (
             SELECT *,
-                COUNT(*) FILTER (WHERE prev_end < t_start OR prev_end IS NULL) OVER (PARTITION BY base_view, scope_values ORDER BY t_start) as grp
+                COUNT(*) FILTER (WHERE prev_end < ts_safe OR prev_end IS NULL) OVER (PARTITION BY base_view, scope_values ORDER BY ts_safe) as grp
             FROM (
                 SELECT *,
-                    MAX(t_end) OVER (PARTITION BY base_view, scope_values ORDER BY t_start ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
+                    COALESCE(t_start, -9223372036854775808) as ts_safe,
+                    COALESCE(t_end, 9223372036854775807) as te_safe,
+                    MAX(COALESCE(t_end, 9223372036854775807)) OVER (PARTITION BY base_view, scope_values ORDER BY COALESCE(t_start, -9223372036854775808) ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
                 FROM changelog_snapshot
             ) s1
          ) s2
          GROUP BY base_view, scope_values, grp");
-    // Only delete the rows we snapshotted; concurrent inserts survive.
+
     let _ = Spi::run(
         "DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM changelog_snapshot)",
     );
@@ -257,9 +261,10 @@ pub fn get_dirty_ranges(
             format!(
                 "SELECT t_start, t_end FROM spiral.changelog
                          WHERE base_view = '{}'
-                           AND NOT (t_end < {} OR t_start > {})
+                           AND (t_end IS NULL OR t_end >= {})
+                           AND (t_start IS NULL OR t_start <= {})
                            AND (scope_values = '{{}}'::jsonb OR scope_values = '{}'::jsonb)
-                         ORDER BY t_start",
+                         ORDER BY t_start NULLS FIRST",
                 base_view.replace("'", "''"),
                 ts,
                 te,
@@ -269,8 +274,9 @@ pub fn get_dirty_ranges(
             format!(
                 "SELECT t_start, t_end FROM spiral.changelog
                          WHERE base_view = '{}'
-                           AND NOT (t_end < {} OR t_start > {})
-                         ORDER BY t_start",
+                           AND (t_end IS NULL OR t_end >= {})
+                           AND (t_start IS NULL OR t_start <= {})
+                         ORDER BY t_start NULLS FIRST",
                 base_view.replace("'", "''"),
                 ts,
                 te

@@ -45,8 +45,8 @@ struct ChangelogEntry {
     event_id: i64,
     base_view: String,
     scope_values: serde_json::Value,
-    t_start: i64,
-    t_end: i64,
+    t_start: Option<i64>,
+    t_end: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
