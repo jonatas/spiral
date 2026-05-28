@@ -404,6 +404,21 @@
                 border-radius: 50%;
                 background: #f97316;
             }
+            .legend-stale-swatch {
+                background: var(--surface);
+                outline: 1px solid #ef4444;
+                position: relative;
+            }
+            .legend-stale-swatch::after {
+                content: '';
+                position: absolute;
+                top: 1px;
+                right: 1px;
+                width: 3px;
+                height: 3px;
+                border-radius: 50%;
+                background: #ef4444;
+            }
             .legend-selected-swatch {
                 background: var(--surface);
                 outline: 1.5px solid var(--text);
@@ -444,6 +459,21 @@
                 height: 3px;
                 border-radius: 50%;
                 background: #f97316;
+                pointer-events: none;
+            }
+            .page-cell.stale {
+                outline: 1px solid #ef4444;
+                outline-offset: 0px;
+            }
+            .page-cell.stale::after {
+                content: '';
+                position: absolute;
+                top: 1px;
+                right: 1px;
+                width: 3px;
+                height: 3px;
+                border-radius: 50%;
+                background: #ef4444;
                 pointer-events: none;
             }
             .page-cell:hover {

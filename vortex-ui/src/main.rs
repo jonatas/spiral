@@ -255,6 +255,8 @@ struct BlockInfo {
     pending_changes: i32,
     #[serde(default)]
     is_stale: bool,
+    #[serde(default)]
+    last_changelog_ts: i64,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -360,6 +362,7 @@ fn PageMap(
     frame_seconds: Signal<i32>,
     selected_page: Signal<Option<i32>>,
     dirty_blocks: Signal<BTreeSet<i32>>,
+    stale_blocks: Signal<BTreeSet<i32>>,
     on_click: impl Fn(i32) + 'static + Send + Clone,
 ) -> impl IntoView {
     const PAGE_WINDOW: i32 = 1000;
@@ -414,6 +417,7 @@ fn PageMap(
                             <div
                                 class=move || {
                                     if selected_page.get() == Some(idx) { "page-cell selected" }
+                                    else if stale_blocks.get().contains(&idx) { "page-cell stale" }
                                     else if dirty_blocks.get().contains(&idx) { "page-cell dirty" }
                                     else { "page-cell" }
                                 }
@@ -498,6 +502,12 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
                     {block.pending_changes} " changes"
                 </span>
             </div>
+            {(block.last_changelog_ts > 0).then(|| view! {
+                <div class="irow-full">
+                    <span class="ilabel">"last change"</span>
+                    <div class="ivalue ivalue-ts">{format_epoch_seconds(block.last_changelog_ts)}</div>
+                </div>
+            })}
             <div class="irow">
                 <span class="ilabel">"span"</span>
                 <span class="ivalue">{duration_fmt}</span>
@@ -1317,6 +1327,7 @@ fn App() -> impl IntoView {
     let explain_user_edited = RwSignal::new(false);
     let explain_last_block = RwSignal::new(None::<BlockInfo>);
     let dirty_page_nos = RwSignal::new(BTreeSet::<i32>::new());
+    let stale_blocks = RwSignal::new(BTreeSet::<i32>::new());
     let changelog_buffer = RwSignal::new(VecDeque::<ChangelogEntry>::new());
     let changelog_expanded = RwSignal::new(false);
     let pending_page_restore = RwSignal::new(None::<i32>);
@@ -1549,6 +1560,18 @@ fn App() -> impl IntoView {
         });
     });
 
+    // Sync stale_blocks from server-confirmed is_stale on each block inspect (#60)
+    Effect::new(move |_| {
+        if let Some(b) = selected_block.get() {
+            if b.is_stale {
+                stale_blocks.update(|s| { s.insert(b.blkno); });
+            } else {
+                stale_blocks.update(|s| { s.remove(&b.blkno); });
+                dirty_page_nos.update(|s| { s.remove(&b.blkno); });
+            }
+        }
+    });
+
     // Memo: only propagates to subscribers when the value actually changes (PartialEq check).
     // Without Memo, Signal::derive re-notifies ALL subscribers on every stats_by_view update,
     // causing 1000+ cell re-renders per StorageStats WS event.
@@ -1754,6 +1777,7 @@ fn App() -> impl IntoView {
                                             selected_block.set(None);
                                             selected_page_no.set(None);
                                             dirty_page_nos.set(BTreeSet::new());
+                                            stale_blocks.set(BTreeSet::new());
                                         }
                                     >{h.base_view.to_uppercase()}</button>
                                 }
@@ -1870,6 +1894,9 @@ fn App() -> impl IntoView {
                         <span class="legend-swatch legend-dirty-swatch"></span>
                         <span class="legend-label">"dirty"</span>
                         <span class="legend-sep">"·"</span>
+                        <span class="legend-swatch legend-stale-swatch"></span>
+                        <span class="legend-label">"stale"</span>
+                        <span class="legend-sep">"·"</span>
                         <span class="legend-swatch legend-selected-swatch"></span>
                         <span class="legend-label">"selected"</span>
                     </div>
@@ -1915,6 +1942,7 @@ fn App() -> impl IntoView {
                         frame_seconds=current_frame_seconds
                         selected_page=Signal::derive(move || selected_page_no.get())
                         dirty_blocks=Signal::derive(move || dirty_page_nos.get())
+                        stale_blocks=Signal::derive(move || stale_blocks.get())
                         on_click=fetch_block_info
                     />
 

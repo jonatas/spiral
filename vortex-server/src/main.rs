@@ -67,6 +67,8 @@ struct BlockInfo {
     #[serde(default)]
     is_stale: bool,
     #[serde(default)]
+    last_changelog_ts: i64,
+    #[serde(default)]
     kickoff_epoch: i64,
 }
 
@@ -380,7 +382,8 @@ async fn get_block_info(
 
         if let Some(base_view) = base_view_opt
             && let Ok(cl_row) = sqlx::query(
-                "SELECT COUNT(*)::int FROM spiral.changelog
+                "SELECT COUNT(*)::int, COALESCE(MAX(t_end), 0)::bigint
+                 FROM spiral.changelog
                  WHERE base_view = $1
                    AND t_start <= $2
                    AND t_end >= $3",
@@ -392,8 +395,10 @@ async fn get_block_info(
             .await
         {
             let count: i32 = cl_row.get(0);
+            let last_ts: i64 = cl_row.get(1);
             block_info.pending_changes = count;
             block_info.is_stale = count > 0;
+            block_info.last_changelog_ts = last_ts;
         }
     }
 
