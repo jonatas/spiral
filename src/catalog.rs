@@ -261,8 +261,8 @@ pub fn get_dirty_ranges(
             format!(
                 "SELECT t_start, t_end FROM spiral.changelog
                          WHERE base_view = '{}'
-                           AND (t_end IS NULL OR t_end >= {})
-                           AND (t_start IS NULL OR t_start <= {})
+                           AND (t_end IS NULL OR t_end > {})
+                           AND (t_start IS NULL OR t_start < {})
                            AND (scope_values = '{{}}'::jsonb OR scope_values = '{}'::jsonb)
                          ORDER BY t_start NULLS FIRST",
                 base_view.replace("'", "''"),
@@ -274,8 +274,8 @@ pub fn get_dirty_ranges(
             format!(
                 "SELECT t_start, t_end FROM spiral.changelog
                          WHERE base_view = '{}'
-                           AND (t_end IS NULL OR t_end >= {})
-                           AND (t_start IS NULL OR t_start <= {})
+                           AND (t_end IS NULL OR t_end > {})
+                           AND (t_start IS NULL OR t_start < {})
                          ORDER BY t_start NULLS FIRST",
                 base_view.replace("'", "''"),
                 ts,

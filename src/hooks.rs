@@ -1993,17 +1993,25 @@ pub fn generate_hierarchy_internal(
             .map(|s| format!("\"{}\"", s.trim()))
             .collect::<Vec<_>>()
             .join(", ");
-        let index_sql = if scope_columns.is_empty() {
+
+        let create_table_sql = format!("CREATE TABLE IF NOT EXISTS {child_name} AS SELECT {select_cols} FROM {parent_name} WHERE 1=0 GROUP BY {group_by}",
+            child_name = child_name, select_cols = select_parts.join(", "), parent_name = current_parent, group_by = group_parts.join(", "));
+
+        let unique_index_sql = if scope_columns.is_empty() {
             format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t)")
         } else {
-            format!("CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[]))")
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t, {scope_cols_str})")
         };
 
-        let sql = format!("CREATE TABLE IF NOT EXISTS {child_name} AS SELECT {select_cols} FROM {parent_name} WHERE 1=0 GROUP BY {group_by}; {index_sql};",
-            child_name = child_name, select_cols = select_parts.join(", "), parent_name = current_parent, group_by = group_parts.join(", "), index_sql = index_sql);
-
-        match Spi::run(&sql) {
+        match Spi::run(&create_table_sql) {
             Ok(_) => {
+                if let Err(e) = Spi::run(&unique_index_sql) {
+                    error!("Spiral: failed to create unique index for '{}': {:?}", child_name, e);
+                }
+                if !scope_columns.is_empty() {
+                    let zorder_sql = format!("CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[]))");
+                    let _ = Spi::run(&zorder_sql);
+                }
                 catalog::insert_metadata(
                     &child_name,
                     &current_parent,
