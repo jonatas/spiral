@@ -1781,6 +1781,69 @@ mod tests {
         assert!(!explain.contains("sparse_1h"), "Should not use rollup if it doesn't reduce rows significantly");
         assert!(explain.contains("no rollups available"), "Should report no rollups available (due to cost model rejection)");
     }
+
+    #[pg_test]
+    fn test_changelog_preserved_on_failed_refresh() {
+        // If the merge SQL fails (e.g. rollup schema is corrupted), the changelog
+        // rows must survive so the planner keeps falling back to raw data and the
+        // background worker can retry later.
+        Spi::run("CREATE TABLE fail_ticks (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('fail_ticks', 'BASE', 0, 'fail_ticks', '{}')")
+            .unwrap();
+        Spi::run("SELECT spiral_register_view('fail_ticks_1h', 'fail_ticks', 3600, 'fail_ticks', '{}')")
+            .unwrap();
+
+        Spi::run(
+            "INSERT INTO fail_ticks (t, val)
+             SELECT now() - interval '2 hours' + (i * interval '20 minutes'), 1.0
+             FROM generate_series(0, 5) i",
+        )
+        .unwrap();
+
+        let before: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'fail_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert!(before > 0, "changelog must have entries before refresh");
+
+        // Break the rollup so MERGE SQL will fail at runtime.
+        // A trigger that always raises ensures any INSERT/UPDATE on the rollup aborts.
+        Spi::run(
+            "CREATE FUNCTION fail_ticks_1h_blocker() RETURNS trigger LANGUAGE plpgsql AS \
+             'BEGIN RAISE EXCEPTION ''intentional test failure in rollup''; END'",
+        )
+        .unwrap();
+        Spi::run(
+            "CREATE TRIGGER fail_ticks_1h_block BEFORE INSERT OR UPDATE ON fail_ticks_1h \
+             FOR EACH ROW EXECUTE FUNCTION fail_ticks_1h_blocker()",
+        )
+        .unwrap();
+
+        // pgrx converts PostgreSQL ERROR to a Rust panic, which propagates out of
+        // spiral_refresh rather than returning Err. Wrap the call in a PL/pgSQL
+        // EXCEPTION block so the subtransaction (including refreshing_changelog DDL)
+        // rolls back while the outer transaction — and the changelog rows — survive.
+        Spi::run(
+            "DO $$ BEGIN \
+               PERFORM spiral_refresh('fail_ticks'); \
+             EXCEPTION WHEN OTHERS THEN \
+               NULL; \
+             END $$",
+        )
+        .unwrap();
+
+        let after: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'fail_ticks'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(
+            after, before,
+            "changelog must be unchanged after a failed refresh — got {} rows, expected {}",
+            after, before
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1897,49 +1960,6 @@ mod zorder_tests {
         let za = spiral_zorder_core(0, vec![Some("tenant_a".to_string())]);
         let zb = spiral_zorder_core(0, vec![Some("tenant_b".to_string())]);
         assert_ne!(za, zb, "different tenant strings must not collide");
-    }
-
-    #[pg_test]
-    fn test_changelog_preserved_on_failed_refresh() {
-        // If the merge SQL fails (e.g. rollup schema is corrupted), the changelog
-        // rows must survive so the planner keeps falling back to raw data and the
-        // background worker can retry later.
-        Spi::run("CREATE TABLE fail_ticks (t timestamptz NOT NULL, val numeric)").unwrap();
-        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('fail_ticks', 'BASE', 0, 'fail_ticks', '{}')")
-            .unwrap();
-        Spi::run("SELECT spiral_register_view('fail_ticks_1h', 'fail_ticks', 3600, 'fail_ticks', '{}')")
-            .unwrap();
-
-        Spi::run(
-            "INSERT INTO fail_ticks (t, val)
-             SELECT now() - interval '2 hours' + (i * interval '20 minutes'), 1.0
-             FROM generate_series(0, 5) i",
-        )
-        .unwrap();
-
-        let before: i64 = Spi::get_one(
-            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'fail_ticks'",
-        )
-        .unwrap()
-        .unwrap_or(0);
-        assert!(before > 0, "changelog must have entries before refresh");
-
-        // Break the rollup so MERGE SQL will fail at runtime.
-        Spi::run("ALTER TABLE fail_ticks_1h DROP COLUMN val").unwrap();
-
-        // Refresh must not panic, and changelog rows must remain intact.
-        let _ = Spi::run("SELECT spiral_refresh('fail_ticks')");
-
-        let after: i64 = Spi::get_one(
-            "SELECT COUNT(*)::bigint FROM spiral.changelog WHERE base_view = 'fail_ticks'",
-        )
-        .unwrap()
-        .unwrap_or(-1);
-        assert_eq!(
-            after, before,
-            "changelog must be unchanged after a failed refresh — got {} rows, expected {}",
-            after, before
-        );
     }
 
     #[test]
