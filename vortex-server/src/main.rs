@@ -139,15 +139,16 @@ async fn main() {
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/postgres".into());
 
+    let connect_opts = database_url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("Invalid DATABASE_URL")
+        .options([("lock_timeout", "3000"), ("statement_timeout", "30000")]);
+
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&database_url)
+        .connect_with(connect_opts)
         .await
         .expect("Failed to connect to Postgres");
-
-    ensure_changelog_event_ids(&pool)
-        .await
-        .expect("Failed to prepare changelog schema");
 
     let (tx, _rx) = broadcast::channel(100);
 
@@ -189,7 +190,7 @@ async fn main() {
                         }
                     }
                 }
-                Err(e) => tracing::error!("Changelog polling error: {}", e),
+                Err(e) => log_db_error("changelog poll", &e),
             }
 
             // 2. Poll for storage stats and metadata
@@ -233,7 +234,7 @@ async fn main() {
                         }
                     }
                 }
-                Err(e) => tracing::error!("Metadata polling error: {}", e),
+                Err(e) => log_db_error("metadata poll", &e),
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -481,48 +482,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-async fn ensure_changelog_event_ids(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
-    sqlx::query("CREATE SEQUENCE IF NOT EXISTS spiral.changelog_event_id_seq")
-        .execute(pool)
-        .await?;
-    sqlx::query("ALTER TABLE spiral.changelog ADD COLUMN IF NOT EXISTS event_id BIGINT")
-        .execute(pool)
-        .await?;
 
-    // Skip SET DEFAULT if event_id is already an identity column — ALTER fails on identity columns.
-    let is_identity: bool = sqlx::query_scalar(
-        "SELECT attidentity != '' FROM pg_attribute a
-         JOIN pg_class c ON c.oid = a.attrelid
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = 'spiral' AND c.relname = 'changelog' AND a.attname = 'event_id'",
-    )
-    .fetch_optional(pool)
-    .await?
-    .unwrap_or(false);
-
-    if !is_identity {
-        sqlx::query(
-            "ALTER TABLE spiral.changelog
-             ALTER COLUMN event_id SET DEFAULT nextval('spiral.changelog_event_id_seq')",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "UPDATE spiral.changelog
-             SET event_id = nextval('spiral.changelog_event_id_seq')
-             WHERE event_id IS NULL",
-        )
-        .execute(pool)
-        .await?;
+fn log_db_error(context: &str, e: &sqlx::Error) {
+    let msg = e.to_string();
+    if msg.contains("lock timeout") || msg.contains("55P03") {
+        tracing::warn!("Lock timeout in {context} — another session holds a lock. Will retry next poll cycle.");
+    } else if msg.contains("statement timeout") || msg.contains("57014") {
+        tracing::warn!("Statement timeout in {context} — query exceeded 30s limit.");
+    } else {
+        tracing::error!("DB error in {context}: {e}");
     }
-
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_spiral_changelog_event_id
-         ON spiral.changelog (event_id)",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 async fn load_metadata(pool: &Pool<Postgres>) -> Result<Vec<Metadata>, sqlx::Error> {

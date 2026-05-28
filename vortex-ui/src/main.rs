@@ -1330,12 +1330,18 @@ fn App() -> impl IntoView {
                             match serde_json::from_str::<VortexEvent>(&text) {
                                 Ok(event) => match event {
                                     VortexEvent::StorageStats(s) => {
-                                        last_event.set(Some(format!("stats: {}/{} updated", s.base_view, s.view_name)));
+                                        let t0 = js_sys::Date::now();
                                         stats_by_view.update(|stats| {
-                                            stats.insert(s.view_name.clone(), s);
+                                            stats.insert(s.view_name.clone(), s.clone());
                                         });
+                                        let dt = js_sys::Date::now() - t0;
+                                        if dt > 5.0 {
+                                            console_log!("PERF StorageStats {} took {:.0}ms", s.view_name, dt);
+                                        }
+                                        last_event.set(Some(format!("stats: {}/{} updated", s.base_view, s.view_name)));
                                     }
                                     VortexEvent::SystemConfig(c) => {
+                                        let t0 = js_sys::Date::now();
                                         last_event.set(Some(format!("system config: {} hierarchies", c.hierarchies.len())));
                                         let selected = selected_base_view.get_untracked();
                                         let first_base = c
@@ -1343,15 +1349,18 @@ fn App() -> impl IntoView {
                                             .first()
                                             .map(|h| h.base_view.clone())
                                             .unwrap_or_default();
-                                        
+
                                         if selected.is_empty() || !c.hierarchies.iter().any(|h| h.base_view == selected) {
                                             selected_base_view.set(first_base);
                                             selected_block.set(None);
                                             selected_page_no.set(None);
                                         }
                                         config.set(c);
+                                        let dt = js_sys::Date::now() - t0;
+                                        console_log!("PERF SystemConfig took {:.0}ms", dt);
                                     }
                                     VortexEvent::ChangelogUpdate(entry) => {
+                                        let t0 = js_sys::Date::now();
                                         last_event.set(Some(format!(
                                             "#{} {} @ {}",
                                             entry.event_id, entry.base_view, entry.t_start
@@ -1374,11 +1383,18 @@ fn App() -> impl IntoView {
                                                 let t_rel_end = (entry.t_end - kickoff).max(0);
                                                 let blkno_start = ((t_rel_start * tenant_scale) / data_per_page).max(0) as i32;
                                                 let blkno_end = ((t_rel_end * tenant_scale) / data_per_page + 1) as i32;
+                                                let dirty_before = dirty_page_nos.get_untracked().len();
                                                 dirty_page_nos.update(|set| {
+                                                    const MAX_DIRTY: usize = 200;
                                                     for b in blkno_start..=blkno_end {
+                                                        if set.len() >= MAX_DIRTY { break; }
                                                         set.insert(b);
                                                     }
                                                 });
+                                                let dt = js_sys::Date::now() - t0;
+                                                if dt > 2.0 {
+                                                    console_log!("PERF ChangelogUpdate blks {}-{} dirty_before={} took {:.0}ms", blkno_start, blkno_end, dirty_before, dt);
+                                                }
                                             }
                                         }
                                     }
@@ -1437,7 +1453,10 @@ fn App() -> impl IntoView {
         });
     };
 
-    let current_stats = Signal::derive(move || {
+    // Memo: only propagates to subscribers when the value actually changes (PartialEq check).
+    // Without Memo, Signal::derive re-notifies ALL subscribers on every stats_by_view update,
+    // causing 1000+ cell re-renders per StorageStats WS event.
+    let current_stats: Signal<StorageStats> = Memo::new(move |_| {
         let selected_base = selected_base_view.get();
         let view_name = selected_tier_view.get().unwrap_or_else(|| {
             config
@@ -1454,27 +1473,31 @@ fn App() -> impl IntoView {
             .get(&view_name)
             .cloned()
             .unwrap_or_default()
-    });
+    }).into();
 
-    let current_hierarchy_opt = Signal::derive(move || {
+    let current_hierarchy_opt: Signal<Option<HierarchyConfig>> = Memo::new(move |_| {
         current_hierarchy(&config.get(), &selected_base_view.get())
-    });
+    }).into();
 
-    let tenant_scale = Signal::derive(move || {
+    let tenant_scale: Signal<i64> = Memo::new(move |_| {
         current_hierarchy_opt
             .get()
             .map(|h| h.tenant_scale.max(1))
             .unwrap_or(1)
-    });
+    }).into();
 
-    let kickoff = Signal::derive(move || {
+    // kickoff_epoch is stable per session; Memo prevents 1000-cell title re-renders on each
+    // StorageStats poll cycle even when the epoch value hasn't changed.
+    let kickoff: Signal<i64> = Memo::new(move |_| {
         let h_kickoff = current_hierarchy_opt
             .get()
             .map(|h| h.kickoff_epoch)
             .unwrap_or(0);
         let stats = current_stats.get();
         let s_kickoff = stats.kickoff_epoch;
-        
+
+        const PG_EPOCH: i64 = 946684800; // 2000-01-01
+
         // If we have a selected block with actual time or explicit kickoff, we can infer the real kickoff
         if let Some(b) = selected_block.get() {
             if b.kickoff_epoch > 0 && b.kickoff_epoch != PG_EPOCH {
@@ -1488,20 +1511,16 @@ fn App() -> impl IntoView {
             }
         }
 
-        const PG_EPOCH: i64 = 946684800; // 2000-01-01
-
-        if s_kickoff > 0 && s_kickoff != PG_EPOCH { 
-            s_kickoff 
+        if s_kickoff > 0 && s_kickoff != PG_EPOCH {
+            s_kickoff
         } else if h_kickoff > 0 && h_kickoff != PG_EPOCH {
             h_kickoff
         } else {
-            // If both are 2000 or 0, we might be in a default state.
-            // But we prefer the stats kickoff if it's all we have.
             if s_kickoff > 0 { s_kickoff } else { h_kickoff }
         }
-    });
+    }).into();
 
-    let current_frame_seconds = Signal::derive(move || {
+    let current_frame_seconds: Signal<i32> = Memo::new(move |_| {
         let tier = selected_tier_view.get();
         let h = current_hierarchy_opt.get();
         match (tier, h) {
@@ -1511,24 +1530,27 @@ fn App() -> impl IntoView {
                 .unwrap_or(0),
             _ => 0,
         }
-    });
+    }).into();
 
     let api_base_slice = Arc::clone(&api_base);
     Effect::new(move |_| {
+        // Only track selected_block and selected_tier_view — not config or kickoff.
+        // kickoff derives from stats_by_view, so tracking it would re-fire this effect
+        // (and spawn a new HTTP request) on every StorageStats WS event.
         let block = selected_block.get();
-        let selected = selected_base_view.get();
+        let selected = selected_base_view.get_untracked();
         let view_name = selected_tier_view
             .get()
             .unwrap_or_else(|| {
                 config
-                    .get()
+                    .get_untracked()
                     .hierarchies
                     .iter()
                     .find(|h| h.base_view == selected)
                     .map(|h| h.raw_view_name.clone())
                     .unwrap_or_default()
             });
-        let k = kickoff.get();
+        let k = kickoff.get_untracked();
 
         let Some(b) = block else {
             slice_data.set(None);
