@@ -84,7 +84,7 @@ pub fn get_hierarchy(base_table: &str) -> Vec<String> {
 
 pub fn get_table_stats(relname: &str) -> (f64, i32) {
     let (t, p) = Spi::get_two::<f64, i32>(&format!(
-        "SELECT reltuples::float8, relpages FROM pg_class WHERE oid = '\"{}\"'::regclass",
+        "SELECT reltuples::float8, relpages FROM pg_class WHERE oid = to_regclass('\"{}\"')",
         relname.replace("\"", "\"\"")
     ))
     .unwrap_or_default();
@@ -221,7 +221,7 @@ pub fn unify_changelog(base_view: &str) {
         "CREATE TEMP TABLE changelog_snapshot AS SELECT ctid AS old_ctid, * FROM spiral.changelog WHERE base_view = '{}'",
         base_view.replace("'", "''")
     ));
-    
+
     // Unify logic using sentinels for NULLs (unbounded ranges)
     let _ = Spi::run("CREATE TEMP TABLE temp_unified AS
          SELECT base_view, scope_values, 

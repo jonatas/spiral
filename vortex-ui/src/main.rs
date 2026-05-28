@@ -1444,12 +1444,11 @@ fn App() -> impl IntoView {
             api_base_clone, view_name, blkno
         );
         leptos::task::spawn_local(async move {
-            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
-                if let Ok(info) = resp.json::<BlockInfo>().await {
+            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await
+                && let Ok(info) = resp.json::<BlockInfo>().await {
                     console_log!("FETCHED BLOCK INFO: {:?}", info);
                     selected_block.set(Some(info));
                 }
-            }
         });
     };
 
@@ -1589,15 +1588,14 @@ fn App() -> impl IntoView {
         );
         leptos::task::spawn_local(async move {
             let start = js_sys::Date::now();
-            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
-                if let Ok(mut sr) = resp.json::<SliceResponse>().await {
+            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await
+                && let Ok(mut sr) = resp.json::<SliceResponse>().await {
                     sr.fetch_ms = js_sys::Date::now() - start;
                     if let Some(first) = sr.rows.first() {
                         console_log!("SLICE DATA (first row): {:?}", first);
                     }
                     slice_data.set(Some(sr));
                 }
-            }
         });
     });
 
@@ -1617,11 +1615,10 @@ fn App() -> impl IntoView {
                 .send()
                 .await;
             explain_running.set(false);
-            if let Ok(r) = res {
-                if let Ok(er) = r.json::<ExplainResult>().await {
+            if let Ok(r) = res
+                && let Ok(er) = r.json::<ExplainResult>().await {
                     explain_result.set(Some(er));
                 }
-            }
         });
     };
 

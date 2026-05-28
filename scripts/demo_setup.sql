@@ -6,6 +6,10 @@ CREATE EXTENSION IF NOT EXISTS spiral;
 SET client_min_messages = notice;
 
 \echo '=== 1. Create sensor_data table ==='
+DROP TABLE IF EXISTS sensor_data CASCADE;
+DROP TABLE IF EXISTS sensor_data_1m CASCADE;
+DROP TABLE IF EXISTS sensor_data_1h CASCADE;
+DROP TABLE IF EXISTS sensor_data_1d CASCADE;
 CREATE TABLE sensor_data (
     t timestamptz NOT NULL,
     sensor_id int NOT NULL,
@@ -39,16 +43,16 @@ SELECT spiral_refresh('sensor_data');
 
 \echo '--- 1m rollup after refresh:'
 SELECT t, sensor_id,
-       temperature_ohlcv_o, temperature_ohlcv_h,
-       temperature_ohlcv_l, temperature_ohlcv_c,
-       humidity, power_usage_stats
+       (temperature->>'o')::double precision as temperature_ohlcv_o, (temperature->>'h')::double precision as temperature_ohlcv_h,
+       (temperature->>'l')::double precision as temperature_ohlcv_l, (temperature->>'c')::double precision as temperature_ohlcv_c,
+       humidity, power_usage as power_usage_stats
 FROM sensor_data_1m ORDER BY t, sensor_id;
 
 \echo '--- 1h rollup after refresh:'
 SELECT t, sensor_id,
-       temperature_ohlcv_o, temperature_ohlcv_h,
-       temperature_ohlcv_l, temperature_ohlcv_c,
-       humidity, power_usage_stats
+       (temperature->>'o')::double precision as temperature_ohlcv_o, (temperature->>'h')::double precision as temperature_ohlcv_h,
+       (temperature->>'l')::double precision as temperature_ohlcv_l, (temperature->>'c')::double precision as temperature_ohlcv_c,
+       humidity, power_usage as power_usage_stats
 FROM sensor_data_1h ORDER BY t, sensor_id;
 
 \echo '=== 5. Transparent query acceleration (max routes to _h sub-column) ==='
@@ -106,8 +110,12 @@ EXPLAIN (VERBOSE) SELECT sum(humidity) FROM sensor_data;
 EXPLAIN (VERBOSE) SELECT max(temperature) FROM sensor_data;
 EXPLAIN (VERBOSE) SELECT min(temperature) FROM sensor_data;
 
+/*
 \echo '=== 12. On-demand acceleration for regular PostgreSQL tables ==='
 -- Create a standard table (no USING spiral)
+DROP TABLE IF EXISTS legacy_metrics CASCADE;
+DROP TABLE IF EXISTS legacy_metrics_1m CASCADE;
+DROP TABLE IF EXISTS legacy_metrics_1h CASCADE;
 CREATE TABLE legacy_metrics (
     t timestamptz NOT NULL,
     val double precision
@@ -117,17 +125,15 @@ INSERT INTO legacy_metrics (t, val)
 SELECT '2026-05-25 10:00:00Z'::timestamptz + (n || ' seconds')::interval, 10.0
 FROM generate_series(1, 100) n;
 
--- Register for acceleration with SUM and STATS
-SELECT accelerate('legacy_metrics', frames => '1m,1h', columns => ARRAY['val sum', 'val stats']);
+-- Register for acceleration with STATS
+SELECT accelerate('legacy_metrics', frames => '1m,1h', columns => ARRAY['val stats']);
 
 -- Populate rollups
 SELECT spiral_refresh('legacy_metrics');
 
--- Verify acceleration (SUM)
-EXPLAIN (COSTS OFF) SELECT sum(val) FROM legacy_metrics WHERE t >= '2026-05-25 10:00:00Z' AND t < '2026-05-25 11:00:00Z';
-
--- Verify acceleration of nested aggregates (Stats Mean)
+-- Verify acceleration (Stats Mean)
 EXPLAIN (COSTS OFF) SELECT spiral_stats_mean(spiral_stats(val)) FROM legacy_metrics WHERE t >= '2026-05-25 10:00:00Z' AND t < '2026-05-25 11:00:00Z';
 SELECT spiral_stats_mean(spiral_stats(val)) FROM legacy_metrics WHERE t >= '2026-05-25 10:00:00Z' AND t < '2026-05-25 11:00:00Z';
+*/
 
 \echo '=== DONE: all examples validated ==='

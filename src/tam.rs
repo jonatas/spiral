@@ -278,7 +278,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
     if !attr_widths.is_null() {
         let tupdesc = (*rel).rd_att;
         for i in 0..(*tupdesc).natts {
-            let attr = pg_sys::TupleDescAttr(tupdesc, i as i32);
+            let attr = pg_sys::TupleDescAttr(tupdesc, i);
             *attr_widths.add(i as usize) =
                 pg_sys::get_typavgwidth((*attr).atttypid, (*attr).atttypmod);
         }
@@ -776,7 +776,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
             let ts_rel = ts - k;
             let te_rel = te - k;
 
-            // Calculate block bounds based on physical layout
+            // Calculate block bounds based on physical layou
             let first = (ts_rel.saturating_mul(tenant_scale) / dpg).max(0) as u32;
             let last = ((te_rel.saturating_mul(tenant_scale) / dpg) + 1)
                 .min(total_blks as i64)
@@ -801,7 +801,12 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     (*state).noffsets = 0;
     (*state).read_stream = std::ptr::null_mut();
 
-    warning!("Spiral: scan_begin total_blks={} bounds=[{}, {})", total_blks, scan_first_blk, scan_last_blk);
+    warning!(
+        "Spiral: scan_begin total_blks={} bounds=[{}, {})",
+        total_blks,
+        scan_first_blk,
+        scan_last_blk
+    );
 
     (*spiral_scan).state = state;
 
@@ -867,7 +872,10 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
         let page = pg_sys::BufferGetPage(buffer);
 
         if !crate::storage::is_valid_spiral_page(page) {
-            warning!("Spiral: scan encountered INVALID page at blkno {}", pg_sys::BufferGetBlockNumber(buffer));
+            warning!(
+                "Spiral: scan encountered INVALID page at blkno {}",
+                pg_sys::BufferGetBlockNumber(buffer)
+            );
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
             pg_sys::ReleaseBuffer(buffer);
             if state.read_stream.is_null() && pscan.is_null() {
@@ -968,7 +976,6 @@ pub unsafe extern "C-unwind" fn spiral_scan_rescan(
             state.noffsets = 0;
 
             if !state.read_stream.is_null() {
-
                 pg_sys::read_stream_reset(state.read_stream);
             }
         }
@@ -1297,7 +1304,7 @@ mod tests {
             let val = Spi::get_one::<f64>("SELECT value FROM tam_update_test").unwrap().unwrap();
             assert_eq!(val, 20.0);
 
-            // Update key (t) - should move it
+            // Update key (t) - should move i
             client.update("UPDATE tam_update_test SET t = 2 WHERE t = 1;", None, &[])?;
             let t_new = Spi::get_one::<i64>("SELECT t FROM tam_update_test").unwrap().unwrap();
             assert_eq!(t_new, 2);
@@ -1434,7 +1441,7 @@ mod tests {
             client.update("CREATE TABLE tam_bitmap_test (t bigint, tenant_id int, value double precision) USING spiral;", None, &[])?;
             client.update("INSERT INTO tam_bitmap_test (t, tenant_id, value) VALUES (1, 1, 10.0), (2, 2, 20.0), (3, 3, 30.0);", None, &[])?;
             client.update("CREATE INDEX idx_t ON tam_bitmap_test(t);", None, &[])?;
-            
+
             // Force a bitmap scan
             client.update("SET enable_indexscan = off;", None, &[])?;
             client.update("SET enable_seqscan = off;", None, &[])?;
@@ -1445,10 +1452,10 @@ mod tests {
 
             let val = Spi::get_one::<f64>("SELECT value FROM tam_bitmap_test WHERE t = 2").unwrap().unwrap();
             assert_eq!(val, 20.0);
-            
+
             let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_bitmap_test WHERE t >= 1").unwrap().unwrap();
             assert_eq!(count, 3);
-            
+
             Ok::<(), spi::Error>(())
         }).unwrap();
     }
