@@ -1,3 +1,15 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::unnecessary_unwrap,
+    clippy::nonminimal_bool,
+    clippy::missing_safety_doc,
+    clippy::needless_range_loop,
+    clippy::field_reassign_with_default,
+    clippy::from_str_radix_10,
+    dead_code,
+    unused_parens
+)]
+
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 use std::cell::Cell;
@@ -22,7 +34,8 @@ pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
 pub static WORKER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10);
 pub static ENABLE_PLANNER_HOOK: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static PLANNER_MAX_SEGMENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
-pub static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> = GucSetting::<Option<std::ffi::CString>>::new(None);
+pub static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
 pub static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(60.0);
 
 thread_local! {
@@ -224,7 +237,7 @@ fn refresh_incremental(
         parent_view.clone()
     };
 
-    let cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = '\"{}\"'::regclass AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\""));
+    let cols_query = format!("SELECT attname::text FROM pg_attribute WHERE attrelid = to_regclass('\"{}\"') AND attnum > 0 AND NOT attisdropped", view_name.replace("\"", "\"\""));
     let all_cols: Vec<String> = Spi::connect(|client| {
         Ok::<Vec<String>, spi::Error>(
             client
@@ -265,7 +278,10 @@ fn refresh_incremental(
             let tsw = scope_json_to_where(sj).unwrap_or_else(|| "1=1".to_string());
             (format!("c.scope_values = '{}'::jsonb", safe_sj), tsw)
         } else if scope_cols_raw.is_empty() {
-            ("c.scope_values = '{}'::jsonb".to_string(), "1=1".to_string())
+            (
+                "c.scope_values = '{}'::jsonb".to_string(),
+                "1=1".to_string(),
+            )
         } else {
             let scope_cols_json = scope_cols_raw
                 .iter()
@@ -273,8 +289,11 @@ fn refresh_incremental(
                 .collect::<Vec<_>>()
                 .join(", ");
             (
-                format!("(c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({}))", scope_cols_json),
-                "1=1".to_string()
+                format!(
+                    "(c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({}))",
+                    scope_cols_json
+                ),
+                "1=1".to_string(),
             )
         };
 
@@ -308,8 +327,13 @@ fn refresh_incremental(
 
         let base_metadata_owned = catalog::get_metadata(&metadata.base_view);
         let source_time_col = if parent_view == "BASE" {
-            base_metadata_owned.as_ref()
-                .and_then(|m| m.columns_metadata.get("time_column").and_then(|v| v.as_str()))
+            base_metadata_owned
+                .as_ref()
+                .and_then(|m| {
+                    m.columns_metadata
+                        .get("time_column")
+                        .and_then(|v| v.as_str())
+                })
                 .unwrap_or("t")
         } else {
             "t"
@@ -326,10 +350,17 @@ fn refresh_incremental(
                 .map(|s| format!("'{}', s.\"{}\"", s, s))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("(c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({}))", scope_cols_json)
+            format!(
+                "(c.scope_values = '{{}}'::jsonb OR c.scope_values = jsonb_build_object({}))",
+                scope_cols_json
+            )
         };
 
-        let all_cols_joined = all_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
+        let all_cols_joined = all_cols
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
         let insert_sql = format!(
             "INSERT INTO \"{view_name}\" ({all_cols_joined})
              SELECT {select_part} FROM \"{source_table}\" AS s
@@ -366,7 +397,9 @@ fn refresh_incremental(
         if let Err(e) = run_result {
             notice!(
                 "Spiral: refresh_incremental failed for '{}': {:?}\nSQL: {}",
-                view_name, e, insert_sql
+                view_name,
+                e,
+                insert_sql
             );
             return false;
         }
@@ -375,11 +408,10 @@ fn refresh_incremental(
     let children = catalog::get_children(view_name);
     let mut all_ok = true;
     for child in children {
-        if child != view_name {
-            if !refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone()) {
+        if child != view_name
+            && !refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone()) {
                 all_ok = false;
             }
-        }
     }
     all_ok
 }
@@ -529,7 +561,10 @@ fn spiral_register_view(
 
     let kickoff = get_kickoff_epoch();
     let mut cols_meta = serde_json::Map::new();
-    cols_meta.insert("kickoff_epoch".to_string(), serde_json::Value::Number(kickoff.into()));
+    cols_meta.insert(
+        "kickoff_epoch".to_string(),
+        serde_json::Value::Number(kickoff.into()),
+    );
 
     // Ensure base table has a frame_seconds=0 metadata row so track_changes_stmt
     // can look up scope_columns via "WHERE view_name = base_view".
@@ -596,16 +631,26 @@ pub fn get_kickoff_epoch() -> i64 {
     let kickoff_str = Spi::get_one::<String>("SELECT current_setting('spiral.kickoff_date', true)")
         .unwrap_or(None)
         .unwrap_or_else(|| "2000-01-01".to_string());
-    
-    let kickoff_val = if kickoff_str.is_empty() { "2000-01-01".to_string() } else { kickoff_str };
+
+    let kickoff_val = if kickoff_str.is_empty() {
+        "2000-01-01".to_string()
+    } else {
+        kickoff_str
+    };
 
     Spi::connect(|client| {
-        let ts = client.select(&format!("SELECT '{}'::timestamptz", kickoff_val.replace("'", "''")), Some(1), &[])?
+        let ts = client
+            .select(
+                &format!("SELECT '{}'::timestamptz", kickoff_val.replace("'", "''")),
+                Some(1),
+                &[],
+            )?
             .first()
             .get::<pgrx::datum::TimestampWithTimeZone>(1)?
             .unwrap();
         Ok::<i64, spi::Error>(spiral_to_epoch(ts))
-    }).unwrap_or(0)
+    })
+    .unwrap_or(0)
 }
 
 pub fn get_minimal_pace() -> f64 {
@@ -1662,7 +1707,10 @@ mod tests {
         )
         .unwrap()
         .unwrap_or(-1);
-        assert_eq!(rows_before, 0, "scope_status must be empty before any inserts");
+        assert_eq!(
+            rows_before, 0,
+            "scope_status must be empty before any inserts"
+        );
 
         // Insert 2 rows for tenant 1 and 1 row for tenant 2 — same time bucket.
         Spi::run(
@@ -1686,7 +1734,11 @@ mod tests {
             "SELECT bool_and(lag > interval '0') FROM spiral.scope_status WHERE base_view = 'scope_obs'",
         )
         .unwrap();
-        assert_eq!(all_positive, Some(true), "all dirty scopes must have positive lag");
+        assert_eq!(
+            all_positive,
+            Some(true),
+            "all dirty scopes must have positive lag"
+        );
 
         // After refresh: scope_status must be empty.
         Spi::run("SELECT spiral_refresh('scope_obs')").unwrap();
@@ -1720,7 +1772,10 @@ mod tests {
             let trimmed = stmt.trim();
             if !trimmed.is_empty() {
                 if let Err(e) = Spi::run(trimmed) {
-                    panic!("QA Matrix failed on statement: [{}]. Error: {:?}", trimmed, e);
+                    panic!(
+                        "QA Matrix failed on statement: [{}]. Error: {:?}",
+                        trimmed, e
+                    );
                 }
             }
         }
@@ -1729,19 +1784,22 @@ mod tests {
     #[pg_test]
     fn test_accelerate_idempotency() {
         Spi::run("CREATE TABLE idempotent_test (t timestamptz, val float)").unwrap();
-        
+
         // First call
         Spi::run("SELECT accelerate('idempotent_test', frames => '1m')").unwrap();
-        
+
         // Second call with more frames - should not fail due to existing triggers
         Spi::run("SELECT accelerate('idempotent_test', frames => '1m,1h')").unwrap();
-        
+
         let rollup_exists: bool = Spi::get_one::<bool>(
             "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'idempotent_test_1h')",
         )
         .unwrap()
         .unwrap_or(false);
-        assert!(rollup_exists, "Second tier should be created on second accelerate call");
+        assert!(
+            rollup_exists,
+            "Second tier should be created on second accelerate call"
+        );
     }
 
     #[pg_test]
@@ -1762,25 +1820,55 @@ mod tests {
         // 1. Subquery acceleration
         // Query for only ONE hour (10:00). If it works, it should show 1 segment of j1_1h.
         let subq_sql = "SELECT * FROM (SELECT sum(val) FROM j1 WHERE t >= ''2026-05-25 10:00:00Z'' AND t < ''2026-05-25 11:00:00Z'') sub";
-        let subq_explain = Spi::get_one::<String>(&format!("SELECT spiral_explain('{}')", subq_sql)).unwrap().unwrap();
-        assert!(subq_explain.contains("1x j1_1h"), "Subquery should use exactly 1 rollup segment");
-        assert!(subq_explain.contains("Range: 2026-05-25 10:00:00"), "Subquery should use the correct start range");
+        let subq_explain =
+            Spi::get_one::<String>(&format!("SELECT spiral_explain('{}')", subq_sql))
+                .unwrap()
+                .unwrap();
+        assert!(
+            subq_explain.contains("1x j1_1h"),
+            "Subquery should use exactly 1 rollup segment"
+        );
+        assert!(
+            subq_explain.contains("Range: 2026-05-25 10:00:00"),
+            "Subquery should use the correct start range"
+        );
 
         // 2. JOIN predicate propagation (tenant_id = 1 should propagate from j1 to j2)
         let join_sql = "SELECT * FROM j1 JOIN j2 USING (t, tenant_id) \
                         WHERE j1.t >= ''2026-05-25 10:00:00Z'' AND j1.t < ''2026-05-25 11:00:00Z'' \
                         AND j1.tenant_id = 1";
-        let join_explain = Spi::get_one::<String>(&format!("SELECT spiral_explain('{}')", join_sql)).unwrap().unwrap();
-        
-        assert!(join_explain.contains("Accelerating 'j1'"), "j1 should be accelerated in JOIN");
-        assert!(join_explain.contains("Accelerating 'j2'"), "j2 should be accelerated in JOIN via predicate propagation");
-        
+        let join_explain =
+            Spi::get_one::<String>(&format!("SELECT spiral_explain('{}')", join_sql))
+                .unwrap()
+                .unwrap();
+
+        assert!(
+            join_explain.contains("Accelerating 'j1'"),
+            "j1 should be accelerated in JOIN"
+        );
+        assert!(
+            join_explain.contains("Accelerating 'j2'"),
+            "j2 should be accelerated in JOIN via predicate propagation"
+        );
+
         // Count segments to ensure propagation worked for both
-        let j1_accel_line = join_explain.lines().find(|l| l.contains("Accelerating 'j1'")).unwrap();
-        let j2_accel_line = join_explain.lines().find(|l| l.contains("Accelerating 'j2'")).unwrap();
-        
-        assert!(j1_accel_line.contains("1x j1_1h"), "j1 should use 1 segment");
-        assert!(j2_accel_line.contains("1x j2_1h"), "j2 should use 1 segment via propagated time and scope");
+        let j1_accel_line = join_explain
+            .lines()
+            .find(|l| l.contains("Accelerating 'j1'"))
+            .unwrap();
+        let j2_accel_line = join_explain
+            .lines()
+            .find(|l| l.contains("Accelerating 'j2'"))
+            .unwrap();
+
+        assert!(
+            j1_accel_line.contains("1x j1_1h"),
+            "j1 should use 1 segment"
+        );
+        assert!(
+            j2_accel_line.contains("1x j2_1h"),
+            "j2 should use 1 segment via propagated time and scope"
+        );
     }
 
     #[pg_test]
@@ -1792,7 +1880,7 @@ mod tests {
         Spi::run("INSERT INTO sparse VALUES ('2026-05-25 10:30:00Z', 10)").unwrap();
         Spi::run("INSERT INTO sparse VALUES ('2026-05-25 11:30:00Z', 20)").unwrap();
         Spi::run("SELECT spiral_refresh('sparse_1h')").unwrap();
-        
+
         // Update statistics so pg_class has row counts
         Spi::run("ANALYZE sparse").unwrap();
         Spi::run("ANALYZE sparse_1h").unwrap();
@@ -1800,10 +1888,16 @@ mod tests {
         // In this case, sparse has 2 rows, sparse_1h has 2 rows.
         // The cost model should skip sparse_1h because 2 >= 2 * 0.9.
         let explain = Spi::get_one::<String>("SELECT spiral_explain('SELECT sum(val) FROM sparse WHERE t >= ''2026-05-25 10:00:00Z'' AND t < ''2026-05-25 12:00:00Z''')").unwrap().unwrap();
-        
+
         // It should NOT contain sparse_1h
-        assert!(!explain.contains("sparse_1h"), "Should not use rollup if it doesn't reduce rows significantly");
-        assert!(explain.contains("no rollups available"), "Should report no rollups available (due to cost model rejection)");
+        assert!(
+            !explain.contains("sparse_1h"),
+            "Should not use rollup if it doesn't reduce rows significantly"
+        );
+        assert!(
+            explain.contains("no rollups available"),
+            "Should report no rollups available (due to cost model rejection)"
+        );
     }
 
     #[pg_test]
@@ -1814,8 +1908,10 @@ mod tests {
         Spi::run("CREATE TABLE fail_ticks (t timestamptz NOT NULL, val numeric)").unwrap();
         Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('fail_ticks', 'BASE', 0, 'fail_ticks', '{}')")
             .unwrap();
-        Spi::run("SELECT spiral_register_view('fail_ticks_1h', 'fail_ticks', 3600, 'fail_ticks', '{}')")
-            .unwrap();
+        Spi::run(
+            "SELECT spiral_register_view('fail_ticks_1h', 'fail_ticks', 3600, 'fail_ticks', '{}')",
+        )
+        .unwrap();
 
         Spi::run(
             "INSERT INTO fail_ticks (t, val)
@@ -1872,25 +1968,33 @@ mod tests {
     #[pg_test]
     fn test_issue_67_repro_delete_leaves_stale_rows() {
         Spi::run("SET spiral.kickoff_date = '2026-04-15';").unwrap();
-        Spi::run("CREATE TABLE metrics_repro (
+        Spi::run(
+            "CREATE TABLE metrics_repro (
             t timestamptz NOT NULL,
             device_id text NOT NULL,
             val double precision -- Spiral: sum
         ) WITH (
             spiral.frames = '1m',
             spiral.tenant = 'device_id'
-        );").unwrap();
+        );",
+        )
+        .unwrap();
 
         // 1. Ingest initial data
-        Spi::run("INSERT INTO metrics_repro (t, device_id, val) VALUES
+        Spi::run(
+            "INSERT INTO metrics_repro (t, device_id, val) VALUES
             ('2026-04-15 10:00:05Z', 'A', 10.0),
-            ('2026-04-15 10:00:55Z', 'A', 20.0);").unwrap();
+            ('2026-04-15 10:00:55Z', 'A', 20.0);",
+        )
+        .unwrap();
 
         // 2. Refresh
         Spi::run("SELECT spiral_refresh('metrics_repro');").unwrap();
 
         // Check metrics_repro_1m (should have 1 row for A at 10:00:00)
-        let count: i64 = Spi::get_one("SELECT count(*) FROM metrics_repro_1m").unwrap().unwrap();
+        let count: i64 = Spi::get_one("SELECT count(*) FROM metrics_repro_1m")
+            .unwrap()
+            .unwrap();
         assert_eq!(count, 1, "Initial refresh should produce 1 row");
 
         // 3. Delete ALL data for that bucket
@@ -1900,8 +2004,13 @@ mod tests {
         Spi::run("SELECT spiral_refresh('metrics_repro');").unwrap();
 
         // 5. Check metrics_repro_1m (it SHOULD BE EMPTY)
-        let count: i64 = Spi::get_one("SELECT count(*) FROM metrics_repro_1m").unwrap().unwrap();
-        assert_eq!(count, 0, "Refresh after delete should result in 0 rows in rollup");
+        let count: i64 = Spi::get_one("SELECT count(*) FROM metrics_repro_1m")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "Refresh after delete should result in 0 rows in rollup"
+        );
     }
 }
 
@@ -1941,7 +2050,7 @@ mod zorder_tests {
         let r1 = spiral_zorder_int_array_core(1 << 16, vec![0]);
         let r2 = spiral_zorder_int_array_core((1 << 16) + 1, vec![0]);
         assert_ne!(r1, r2);
-        
+
         // And bit 32 of t is preserved.
         let r3 = spiral_zorder_int_array_core(1_i64 << 32, vec![0]);
         assert_ne!(r3, spiral_zorder_int_array_core(0, vec![0]));
@@ -2024,7 +2133,8 @@ mod zorder_tests {
     #[test]
     fn test_zorder_monotone_for_fixed_string_dimension() {
         let tenant = Some("42".to_string());
-        let timestamps: Vec<i64> = vec![0, 1, 100, 1000, 86400, 2_000_000, i32::MAX as i64, i64::MAX];
+        let timestamps: Vec<i64> =
+            vec![0, 1, 100, 1000, 86400, 2_000_000, i32::MAX as i64, i64::MAX];
         let zorders: Vec<u128> = timestamps
             .iter()
             .map(|&t| spiral_zorder_core(t, vec![tenant.clone()]))
