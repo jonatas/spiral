@@ -477,6 +477,72 @@
                 min-height: 22px;
             }
 
+            /* ─── TIME AXIS ───────────────────────────── */
+            .time-axis {
+                position: relative;
+                height: 16px;
+                margin-bottom: 2px;
+            }
+            .time-axis-label {
+                position: absolute;
+                transform: translateX(-50%);
+                font-size: 9px;
+                color: var(--muted);
+                white-space: nowrap;
+                user-select: none;
+            }
+            .time-axis-label:first-child { transform: none; }
+            .time-axis-label:last-child { transform: translateX(-100%); }
+
+            /* ─── CHANGELOG PANEL ─────────────────────── */
+            .changelog-panel {
+                border-top: 1px solid var(--border);
+                padding-top: 6px;
+                font-size: 10px;
+            }
+            .changelog-hdr {
+                cursor: pointer;
+                color: var(--muted);
+                font-weight: 700;
+                font-size: 9px;
+                letter-spacing: 0.05em;
+                padding: 2px 0;
+                user-select: none;
+            }
+            .changelog-hdr:hover { color: var(--text); }
+            .changelog-list {
+                max-height: 160px;
+                overflow-y: auto;
+                margin-top: 4px;
+                display: flex;
+                flex-direction: column;
+                gap: 1px;
+            }
+            .changelog-row {
+                display: flex;
+                gap: 6px;
+                align-items: baseline;
+                font-size: 10px;
+                padding: 1px 0;
+            }
+            .cl-id { color: var(--muted); min-width: 32px; }
+            .cl-base { color: var(--blue); font-weight: 600; }
+            .cl-time { color: var(--text); font-size: 9px; }
+            .cl-sep { color: var(--muted); }
+
+            /* ─── AUTO-EXPLAIN TOGGLE ─────────────────── */
+            .auto-explain-toggle {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                font-size: 10px;
+                color: var(--muted);
+                cursor: pointer;
+                user-select: none;
+            }
+            .auto-explain-toggle input { cursor: pointer; }
+            .auto-explain-toggle:hover { color: var(--text); }
+
             /* ─── BLOCK INSPECTOR ─────────────────────── */
             .block-inspector { display: flex; flex-direction: column; gap: 1px; }
 

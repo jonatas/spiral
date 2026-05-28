@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use gloo_net::websocket::Message;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use wasm_bindgen::JsValue;
 
@@ -136,6 +136,19 @@ fn format_epoch_seconds(epoch: i64) -> String {
         .trim_end_matches(".000")
         .to_string()
         + "Z"
+}
+
+fn format_date_short(epoch: i64) -> String {
+    if epoch <= 0 {
+        return "?".to_string();
+    }
+    let date = js_sys::Date::new(&JsValue::from_f64(epoch as f64 * 1000.0));
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.get_utc_full_year(),
+        date.get_utc_month() + 1,
+        date.get_utc_date()
+    )
 }
 
 fn format_bytes(kb: i64) -> String {
@@ -1304,6 +1317,37 @@ fn App() -> impl IntoView {
     let explain_user_edited = RwSignal::new(false);
     let explain_last_block = RwSignal::new(None::<BlockInfo>);
     let dirty_page_nos = RwSignal::new(BTreeSet::<i32>::new());
+    let changelog_buffer = RwSignal::new(VecDeque::<ChangelogEntry>::new());
+    let changelog_expanded = RwSignal::new(false);
+    let pending_page_restore = RwSignal::new(None::<i32>);
+    let auto_explain = RwSignal::new({
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|ls| ls.get_item("auto_explain").ok().flatten())
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    });
+
+    // Parse URL hash for state restore: #table=X&tier=Y&page=N
+    let (url_table, url_tier, url_page) = {
+        let hash = web_sys::window()
+            .and_then(|w| w.location().hash().ok())
+            .unwrap_or_default();
+        let hash = hash.trim_start_matches('#').to_string();
+        let mut table = None::<String>;
+        let mut tier = None::<String>;
+        let mut page = None::<i32>;
+        for part in hash.split('&') {
+            if let Some(v) = part.strip_prefix("table=") {
+                if !v.is_empty() { table = Some(v.to_string()); }
+            } else if let Some(v) = part.strip_prefix("tier=") {
+                if !v.is_empty() { tier = Some(v.to_string()); }
+            } else if let Some(v) = part.strip_prefix("page=") {
+                page = v.parse().ok();
+            }
+        }
+        (table, tier, page)
+    };
 
     let hostname = web_sys::window()
         .map(|w| {
@@ -1320,6 +1364,8 @@ fn App() -> impl IntoView {
     let ws_url_clone = Arc::clone(&ws_url);
     Effect::new(move |_| {
         let ws_url = ws_url_clone.clone();
+        let url_table = url_table.clone();
+        let url_tier = url_tier.clone();
         console_log!("Connecting to {}", ws_url);
         match WebSocket::open(&ws_url) {
             Ok(mut ws) => {
@@ -1351,9 +1397,19 @@ fn App() -> impl IntoView {
                                             .unwrap_or_default();
 
                                         if selected.is_empty() || !c.hierarchies.iter().any(|h| h.base_view == selected) {
-                                            selected_base_view.set(first_base);
+                                            let target_base = url_table.as_deref()
+                                                .filter(|t| c.hierarchies.iter().any(|h| h.base_view == *t))
+                                                .map(|t| t.to_string())
+                                                .unwrap_or(first_base);
+                                            selected_base_view.set(target_base);
+                                            if let Some(ref tier) = url_tier {
+                                                selected_tier_view.set(Some(tier.clone()));
+                                            }
                                             selected_block.set(None);
-                                            selected_page_no.set(None);
+                                            selected_page_no.set(url_page);
+                                            if url_page.is_some() {
+                                                pending_page_restore.set(url_page);
+                                            }
                                         }
                                         config.set(c);
                                         let dt = js_sys::Date::now() - t0;
@@ -1361,6 +1417,10 @@ fn App() -> impl IntoView {
                                     }
                                     VortexEvent::ChangelogUpdate(entry) => {
                                         let t0 = js_sys::Date::now();
+                                        changelog_buffer.update(|buf| {
+                                            buf.push_front(entry.clone());
+                                            buf.truncate(100);
+                                        });
                                         last_event.set(Some(format!(
                                             "#{} {} @ {}",
                                             entry.event_id, entry.base_view, entry.t_start
@@ -1410,6 +1470,18 @@ fn App() -> impl IntoView {
         }
     });
 
+    // Write URL hash on state change (#75)
+    Effect::new(move |_| {
+        let table = selected_base_view.get();
+        if table.is_empty() { return; }
+        let tier = selected_tier_view.get().unwrap_or_default();
+        let page_str = selected_page_no.get().map(|p| p.to_string()).unwrap_or_default();
+        let hash = format!("table={}&tier={}&page={}", table, tier, page_str);
+        if let Some(w) = web_sys::window() {
+            let _ = w.location().set_hash(&hash);
+        }
+    });
+
     Effect::new(move |_| {
         let _ = selected_tier_view.get();
         selected_block.set(None);
@@ -1452,6 +1524,30 @@ fn App() -> impl IntoView {
             }
         });
     };
+
+    // Auto-restore page from URL hash (#75): fires when base is set + pending page exists
+    let api_base_restore = Arc::clone(&api_base);
+    Effect::new(move |_| {
+        let base = selected_base_view.get();
+        if base.is_empty() { return; }
+        let Some(blkno) = pending_page_restore.get() else { return; };
+        pending_page_restore.set(None);
+        let view_name = selected_tier_view.get_untracked().unwrap_or_else(|| {
+            config.get_untracked().hierarchies.iter()
+                .find(|h| h.base_view == base)
+                .map(|h| h.raw_view_name.clone())
+                .unwrap_or_default()
+        });
+        if view_name.is_empty() { return; }
+        let url = format!("{}/api/storage/{}/block/{}", api_base_restore, view_name, blkno);
+        leptos::task::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
+                if let Ok(info) = resp.json::<BlockInfo>().await {
+                    selected_block.set(Some(info));
+                }
+            }
+        });
+    });
 
     // Memo: only propagates to subscribers when the value actually changes (PartialEq check).
     // Without Memo, Signal::derive re-notifies ALL subscribers on every stats_by_view update,
@@ -1625,6 +1721,15 @@ fn App() -> impl IntoView {
         });
     };
 
+    // Auto-run EXPLAIN when page selected (#78)
+    let run_explain_auto = run_explain.clone();
+    Effect::new(move |_| {
+        let block = selected_block.get();
+        if block.is_some() && auto_explain.get() {
+            run_explain_auto();
+        }
+    });
+
     view! {
         <div id="app">
             <header class="topbar">
@@ -1768,6 +1873,41 @@ fn App() -> impl IntoView {
                         <span class="legend-swatch legend-selected-swatch"></span>
                         <span class="legend-label">"selected"</span>
                     </div>
+
+                    // Time-range axis above page map (#73)
+                    {move || {
+                        let s = current_stats.get();
+                        let k = kickoff.get();
+                        let fs = current_frame_seconds.get().max(1) as i64;
+                        let total = s.total_pages;
+                        let scale = s.tenant_scale.max(1);
+                        if total <= 0 { return view! { <div></div> }.into_any(); }
+                        let (t_start, t_end) = if s.min_t > 0 && s.max_t > 0 {
+                            (s.min_t, s.max_t)
+                        } else if k > 0 {
+                            let num_steps = (total + scale - 1) / scale;
+                            (k, k + num_steps * fs)
+                        } else {
+                            return view! { <div></div> }.into_any();
+                        };
+                        let range = t_end - t_start;
+                        if range <= 0 { return view! { <div></div> }.into_any(); }
+                        let labels: Vec<(i32, String)> = (0i64..=4).map(|i| {
+                            let t = t_start + range * i / 4;
+                            (i as i32 * 25, format_date_short(t))
+                        }).collect();
+                        view! {
+                            <div class="time-axis">
+                                {labels.into_iter().map(|(pct, label)| view! {
+                                    <span
+                                        class="time-axis-label"
+                                        style=format!("left:{}%", pct)
+                                    >{label}</span>
+                                }).collect_view()}
+                            </div>
+                        }.into_any()
+                    }}
+
                     <PageMap
                         total_pages=Signal::derive(move || current_stats.get().total_pages)
                         tenant_scale=tenant_scale
@@ -1791,13 +1931,31 @@ fn App() -> impl IntoView {
                             <div class="query-panel">
                                 <div class="qp-hdr">
                                     <span class="panel-hdr" style="border:none;margin:0;padding:0;">"EXPLAIN ANALYZE"</span>
-                                    <button
-                                        class="run-btn"
-                                        on:click=move |_| run()
-                                        disabled=move || explain_running.get()
-                                    >
-                                        {move || if explain_running.get() { "running…" } else { "▶ RUN" }}
-                                    </button>
+                                    <div style="display:flex;align-items:center;gap:8px;">
+                                        <label class="auto-explain-toggle">
+                                            <input
+                                                type="checkbox"
+                                                prop:checked=move || auto_explain.get()
+                                                on:change=move |_| {
+                                                    let new_val = !auto_explain.get_untracked();
+                                                    auto_explain.set(new_val);
+                                                    if let Some(ls) = web_sys::window()
+                                                        .and_then(|w| w.local_storage().ok().flatten())
+                                                    {
+                                                        let _ = ls.set_item("auto_explain", if new_val { "true" } else { "false" });
+                                                    }
+                                                }
+                                            />
+                                            "auto-run"
+                                        </label>
+                                        <button
+                                            class="run-btn"
+                                            on:click=move |_| run()
+                                            disabled=move || explain_running.get()
+                                        >
+                                            {move || if explain_running.get() { "running…" } else { "▶ RUN" }}
+                                        </button>
+                                    </div>
                                 </div>
                                 <textarea
                                     class="query-input"
@@ -1845,6 +2003,36 @@ fn App() -> impl IntoView {
                                 "waiting for data...".into()
                             } else {
                                 "connecting...".into()
+                            }
+                        })}
+                    </div>
+
+                    // Changelog buffer panel (#74)
+                    <div class="changelog-panel">
+                        <div class="changelog-hdr" on:click=move |_| changelog_expanded.update(|v| *v = !*v)>
+                            {move || {
+                                let count = changelog_buffer.get().len();
+                                if changelog_expanded.get() {
+                                    format!("▼ CHANGES ({})", count)
+                                } else {
+                                    format!("▶ CHANGES ({})", count)
+                                }
+                            }}
+                        </div>
+                        {move || changelog_expanded.get().then(|| {
+                            let entries: Vec<_> = changelog_buffer.get().into_iter().collect();
+                            view! {
+                                <div class="changelog-list">
+                                    {entries.into_iter().map(|e| view! {
+                                        <div class="changelog-row">
+                                            <span class="cl-id">"#"{e.event_id}</span>
+                                            <span class="cl-base">{e.base_view}</span>
+                                            <span class="cl-time">{format_epoch_seconds(e.t_start)}</span>
+                                            <span class="cl-sep">"→"</span>
+                                            <span class="cl-time">{format_epoch_seconds(e.t_end)}</span>
+                                        </div>
+                                    }).collect_view()}
+                                </div>
                             }
                         })}
                     </div>

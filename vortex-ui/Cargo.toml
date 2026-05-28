@@ -13,6 +13,6 @@ leptos_router = "0.8.13"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 wasm-bindgen = "0.2.121"
-web-sys = { version = "0.3.98", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "Window", "Document", "Element", "DomRect", "MouseEvent", "Location"] }
+web-sys = { version = "0.3.98", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "Window", "Document", "Element", "DomRect", "MouseEvent", "Location", "Storage"] }
 gloo-utils = { version = "0.3.0", features = ["serde"] }
 js-sys = "0.3.77"
