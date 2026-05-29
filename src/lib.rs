@@ -37,6 +37,9 @@ pub static PLANNER_MAX_SEGMENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
 pub static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 pub static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(60.0);
+/// When true (default), a WARNING is emitted on the first Spiral TAM write
+/// per session to indicate that MVCC / rollback semantics are absent.
+pub static TAM_WARN_WRITES: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 thread_local! {
     pub static SKIP_ACCELERATION: Cell<bool> = const { Cell::new(false) };
@@ -126,6 +129,18 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         &MINIMAL_PACE,
         1.0,
         3600.0 * 24.0,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"spiral.warn_on_tam_writes",
+        c"Warn on first Spiral TAM write per session (non-ACID)",
+        c"Spiral TAM lacks MVCC: writes are not rolled back on ROLLBACK, and \
+          snapshot isolation is absent. When true (default), a WARNING is emitted \
+          on the first write per session. Set to false to suppress after \
+          acknowledging the limitation.",
+        &TAM_WARN_WRITES,
         GucContext::Userset,
         GucFlags::default(),
     );
