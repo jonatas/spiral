@@ -409,9 +409,10 @@ fn refresh_incremental(
     let mut all_ok = true;
     for child in children {
         if child != view_name
-            && !refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone()) {
-                all_ok = false;
-            }
+            && !refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone())
+        {
+            all_ok = false;
+        }
     }
     all_ok
 }
@@ -2026,7 +2027,8 @@ mod tests {
             "CREATE TABLE scoped_u (t timestamptz NOT NULL, tenant int NOT NULL, val double precision)",
         )
         .unwrap();
-        Spi::run("SELECT accelerate('scoped_u', frames => '1h', tenant => ARRAY['tenant'])").unwrap();
+        Spi::run("SELECT accelerate('scoped_u', frames => '1h', tenant => ARRAY['tenant'])")
+            .unwrap();
 
         let has_unique: bool = Spi::get_one::<bool>(
             "SELECT EXISTS (
@@ -2038,25 +2040,21 @@ mod tests {
         )
         .unwrap()
         .unwrap_or(false);
-        assert!(has_unique, "scoped rollup must have UNIQUE index on (t, tenant)");
-
+        assert!(
+            has_unique,
+            "scoped rollup must have UNIQUE index on (t, tenant)"
+        );
     }
 
     // issue #68: dirty range [t, t+bucket) must not mark the next frame dirty
     #[pg_test]
     fn test_dirty_range_no_overexpansion() {
         Spi::run("SET timezone = 'UTC'").unwrap();
-        Spi::run(
-            "CREATE TABLE boundary_ticks (t timestamptz NOT NULL, val float)",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE boundary_ticks (t timestamptz NOT NULL, val float)").unwrap();
         Spi::run("SELECT accelerate('boundary_ticks', frames => '1h')").unwrap();
 
         // Insert into last minute of hour 0 (frame [0h, 1h))
-        Spi::run(
-            "INSERT INTO boundary_ticks VALUES ('2026-01-01 00:59:00+00', 1.0)",
-        )
-        .unwrap();
+        Spi::run("INSERT INTO boundary_ticks VALUES ('2026-01-01 00:59:00+00', 1.0)").unwrap();
 
         // Refresh — only frame [0h, 1h) should be touched
         Spi::run("SELECT spiral_refresh('boundary_ticks')").unwrap();
@@ -2067,13 +2065,13 @@ mod tests {
         )
         .unwrap()
         .unwrap_or(-1);
-        assert_eq!(dirty, 0, "changelog must be empty after refresh — no over-expanded dirty range");
+        assert_eq!(
+            dirty, 0,
+            "changelog must be empty after refresh — no over-expanded dirty range"
+        );
 
         // Insert into first minute of hour 1 (frame [1h, 2h))
-        Spi::run(
-            "INSERT INTO boundary_ticks VALUES ('2026-01-01 01:00:00+00', 2.0)",
-        )
-        .unwrap();
+        Spi::run("INSERT INTO boundary_ticks VALUES ('2026-01-01 01:00:00+00', 2.0)").unwrap();
 
         Spi::run("SELECT spiral_refresh('boundary_ticks')").unwrap();
 

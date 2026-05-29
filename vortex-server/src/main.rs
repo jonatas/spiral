@@ -80,6 +80,14 @@ struct BlockInfo {
     last_changelog_ts: i64,
     #[serde(default)]
     kickoff_epoch: i64,
+    #[serde(default)]
+    fill_pct: f64,
+    #[serde(default)]
+    live_tuples: i64,
+    #[serde(default)]
+    dead_tuples: i32,
+    #[serde(default)]
+    unused_slots: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -501,6 +509,35 @@ async fn get_block_info(
             block_info.pending_changes = count;
             block_info.is_stale = count > 0;
             block_info.last_changelog_ts = last_ts;
+        }
+    }
+
+    // Physical fill stats: live/unused 8-byte slots in this spiral page
+    if let Ok(Some(fill_row)) = sqlx::query(
+        "SELECT spiral_page_fill_stats(oid::int, $2) AS stats FROM pg_class WHERE relname = $1",
+    )
+    .bind(&name)
+    .bind(blkno)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        if let Some(stats_val) = fill_row.get::<Option<serde_json::Value>, _>("stats") {
+            block_info.fill_pct = stats_val
+                .get("fill_pct")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            block_info.live_tuples = stats_val
+                .get("live_tuples")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            block_info.dead_tuples = stats_val
+                .get("dead_tuples")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            block_info.unused_slots = stats_val
+                .get("unused_slots")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
         }
     }
 
