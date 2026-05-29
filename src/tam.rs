@@ -144,15 +144,15 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
             let t_rel = idx / tenant_scale;
             let tenant_id = (idx % tenant_scale) as i32;
 
-            // Convert to Postgres internal timestamp (micros since 2000)
-            let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
+            // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
+            let t_bigint = t_rel + kickoff;
 
             pg_sys::ExecClearTuple(slot);
             let values = (*slot).tts_values;
             let isnull = (*slot).tts_isnull;
 
             if !values.is_null() && !isnull.is_null() {
-                *values.add(0) = t_abs.into_datum().unwrap();
+                *values.add(0) = t_bigint.into_datum().unwrap();
                 *isnull.add(0) = false;
                 *values.add(1) = tenant_id.into_datum().unwrap();
                 *isnull.add(1) = false;
@@ -901,15 +901,15 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                 let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
-                // Convert to Postgres internal timestamp (micros since 2000)
-                let t_abs = (t_rel + state.kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
+                // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
+                let t_bigint = t_rel + state.kickoff;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t_abs.into_datum().unwrap();
+                    *values.add(0) = t_bigint.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;
@@ -1056,16 +1056,16 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
-                // Convert to Postgres internal timestamp (micros since 2000)
+                // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
                 let kickoff = crate::get_kickoff_epoch();
-                let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
+                let t_bigint = t_rel + kickoff;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t_abs.into_datum().unwrap();
+                    *values.add(0) = t_bigint.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;
