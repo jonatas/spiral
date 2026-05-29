@@ -9,7 +9,7 @@ use axum::{
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{FromRow, Pool, Postgres, Row};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -199,16 +199,27 @@ async fn main() {
                             last_processed_event_id
                         );
 
+                        // Dedup against buffer (pg_notify listener may have already sent these)
+                        let already_sent: std::collections::BTreeSet<i64> = polling_state
+                            .recent_changelog
+                            .lock()
+                            .map(|buf| buf.iter().map(|e| e.event_id).collect())
+                            .unwrap_or_default();
+
                         if let Ok(mut buffer) = polling_state.recent_changelog.lock() {
                             for entry in &entries {
-                                buffer.push_front(entry.clone());
+                                if !already_sent.contains(&entry.event_id) {
+                                    buffer.push_front(entry.clone());
+                                }
                             }
                             buffer.truncate(500);
                         }
 
                         for entry in entries {
                             last_processed_event_id = last_processed_event_id.max(entry.event_id);
-                            let _ = polling_state.tx.send(VortexEvent::ChangelogUpdate(entry));
+                            if !already_sent.contains(&entry.event_id) {
+                                let _ = polling_state.tx.send(VortexEvent::ChangelogUpdate(entry));
+                            }
                         }
                     }
                 }
@@ -260,6 +271,83 @@ async fn main() {
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    });
+
+    // Real-time changelog notifications via pg_notify (#63)
+    let notify_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        // Create the trigger function and trigger so INSERTs notify us immediately
+        let setup = sqlx::query(
+            "CREATE OR REPLACE FUNCTION spiral.spiral_changelog_notify()
+             RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               PERFORM pg_notify('spiral_changelog', json_build_object(
+                 'event_id',    NEW.event_id,
+                 'base_view',   NEW.base_view,
+                 'scope_values', NEW.scope_values,
+                 't_start',     EXTRACT(EPOCH FROM NEW.t_start)::bigint,
+                 't_end',       EXTRACT(EPOCH FROM NEW.t_end)::bigint
+               )::text);
+               RETURN NEW;
+             END;
+             $$;
+             DROP TRIGGER IF EXISTS changelog_notify_trigger ON spiral.changelog;
+             CREATE TRIGGER changelog_notify_trigger
+               AFTER INSERT ON spiral.changelog
+               FOR EACH ROW EXECUTE FUNCTION spiral.spiral_changelog_notify();",
+        )
+        .execute(&notify_state.pool)
+        .await;
+
+        if let Err(e) = setup {
+            tracing::warn!(
+                "pg_notify trigger setup failed (falling back to polling): {}",
+                e
+            );
+            return;
+        }
+        tracing::info!("pg_notify trigger installed on spiral.changelog");
+
+        let mut listener = match PgListener::connect_with(&notify_state.pool).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("PgListener connect failed: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = listener.listen("spiral_changelog").await {
+            tracing::warn!("PgListener listen failed: {}", e);
+            return;
+        }
+        tracing::info!("PgListener ready on spiral_changelog channel");
+
+        loop {
+            match listener.recv().await {
+                Ok(notification) => {
+                    match serde_json::from_str::<ChangelogEntry>(notification.payload()) {
+                        Ok(entry) => {
+                            if let Ok(mut buf) = notify_state.recent_changelog.lock() {
+                                if !buf.iter().any(|e| e.event_id == entry.event_id) {
+                                    buf.push_front(entry.clone());
+                                    buf.truncate(500);
+                                }
+                            }
+                            let _ = notify_state.tx.send(VortexEvent::ChangelogUpdate(entry));
+                        }
+                        Err(e) => tracing::warn!("pg_notify parse error: {}", e),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("PgListener recv error: {} — reconnecting", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    if let Err(e) = listener.listen("spiral_changelog").await {
+                        tracing::warn!("PgListener re-listen failed: {}", e);
+                        break;
+                    }
+                }
+            }
         }
     });
 

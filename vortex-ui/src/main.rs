@@ -1725,6 +1725,11 @@ fn App() -> impl IntoView {
                                     }
                                     VortexEvent::ChangelogUpdate(entry) => {
                                         let t0 = js_sys::Date::now();
+                                        // Dedup: pg_notify and polling may both deliver the same entry
+                                        let is_new = changelog_buffer.get_untracked()
+                                            .iter()
+                                            .all(|e| e.event_id != entry.event_id);
+                                        if !is_new { continue; }
                                         changelog_buffer.update(|buf| {
                                             buf.push_front(entry.clone());
                                             buf.truncate(100);
