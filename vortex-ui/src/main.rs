@@ -309,6 +309,14 @@ struct BlockInfo {
     dead_tuples: i32,
     #[serde(default)]
     unused_slots: i64,
+    #[serde(default)]
+    opaque_window_start_t: i64,
+    #[serde(default)]
+    opaque_window_end_t: i64,
+    #[serde(default)]
+    opaque_tenant_scale: i32,
+    #[serde(default)]
+    magic_valid: bool,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -629,6 +637,59 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
                 <span class="ilabel">"end"</span>
                 <div class="ivalue ivalue-ts">{format_epoch_seconds(end_t)}</div>
             </div>
+
+            // Raw SpiralPageOpaque section (#61)
+            {(block.opaque_window_start_t != 0 || block.opaque_window_end_t != 0 || block.magic_valid).then(|| {
+                let computed_start = start_t;
+                let computed_end = end_t;
+                let actual_start = block.opaque_window_start_t;
+                let actual_end = block.opaque_window_end_t;
+                let start_drift = (actual_start - computed_start).abs();
+                let end_drift = (actual_end - computed_end).abs();
+                let has_drift = start_drift > 1 || end_drift > 1;
+                let scale_mismatch = block.opaque_tenant_scale > 0
+                    && block.opaque_tenant_scale != block.tenant_range[1] - block.tenant_range[0] + 1;
+
+                view! {
+                    <div class="raw-header-section">
+                        <div class="raw-hdr-title">
+                            "RAW HEADER"
+                            {(!block.magic_valid).then(|| view! {
+                                <span class="badge-corrupt">"BAD MAGIC"</span>
+                            })}
+                            {has_drift.then(|| view! {
+                                <span class="badge-corrupt">"DRIFT"</span>
+                            })}
+                        </div>
+                        <div class="irow">
+                            <span class="ilabel">"magic"</span>
+                            <span class={if block.magic_valid { "ivalue good" } else { "ivalue bad" }}>
+                                {if block.magic_valid { "✓ valid" } else { "✗ invalid" }}
+                            </span>
+                        </div>
+                        <div class="irow-full">
+                            <span class="ilabel">"stored start"</span>
+                            <div class={if start_drift > 1 { "ivalue ivalue-ts ivalue-drift" } else { "ivalue ivalue-ts" }}>
+                                {format_epoch_seconds(actual_start)}
+                                {(start_drift > 1).then(|| format!(" (Δ{}s)", start_drift))}
+                            </div>
+                        </div>
+                        <div class="irow-full">
+                            <span class="ilabel">"stored end"</span>
+                            <div class={if end_drift > 1 { "ivalue ivalue-ts ivalue-drift" } else { "ivalue ivalue-ts" }}>
+                                {format_epoch_seconds(actual_end)}
+                                {(end_drift > 1).then(|| format!(" (Δ{}s)", end_drift))}
+                            </div>
+                        </div>
+                        {scale_mismatch.then(|| view! {
+                            <div class="irow">
+                                <span class="ilabel">"stored scale"</span>
+                                <span class="ivalue bad">{block.opaque_tenant_scale} " ≠ computed"</span>
+                            </div>
+                        })}
+                    </div>
+                }
+            })}
         </div>
     }
 }
@@ -1688,7 +1749,19 @@ fn App() -> impl IntoView {
         })
         .unwrap_or_else(|| "localhost".to_string());
 
-    let server_port = option_env!("VORTEX_SERVER_PORT").unwrap_or("3001");
+    // Runtime port: ?port=3010 overrides compile-time default (#71)
+    let compile_time_default = option_env!("VORTEX_SERVER_PORT").unwrap_or("3001");
+    let server_port = web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .and_then(|search| {
+            search
+                .trim_start_matches('?')
+                .split('&')
+                .find(|p| p.starts_with("port="))
+                .and_then(|p| p.strip_prefix("port="))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| compile_time_default.to_string());
     let ws_url = Arc::new(format!("ws://{}:{}/ws", hostname, server_port));
     let api_base = Arc::new(format!("http://{}:{}", hostname, server_port));
 
