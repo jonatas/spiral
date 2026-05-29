@@ -1,0 +1,85 @@
+LOAD 'spiral';
+CREATE EXTENSION IF NOT EXISTS spiral CASCADE;
+SET client_min_messages = error;
+-- kickoff at Unix epoch so t values can be plain integers (seconds since 1970-01-01)
+SET spiral.kickoff_date = '1970-01-01 00:00:00Z';
+-- ----------------------------------------------------------------
+-- MVCC correctness tests for Spiral TAM
+-- ----------------------------------------------------------------
+DROP TABLE IF EXISTS mvcc_test;
+CREATE TABLE mvcc_test (
+    t bigint,
+    tenant_id int,
+    value double precision
+) USING spiral;
+-- 1. Basic insert then scan
+INSERT INTO mvcc_test (t, tenant_id, value) VALUES (100, 0, 999.0);
+SELECT value FROM mvcc_test WHERE t = 100 AND tenant_id = 0;
+ value 
+-------
+   999
+(1 row)
+
+-- 2. Rollback: inserted value must not be visible after ROLLBACK
+BEGIN;
+INSERT INTO mvcc_test (t, tenant_id, value) VALUES (200, 0, 42.0);
+-- Within transaction the value should be visible
+SELECT value FROM mvcc_test WHERE t = 200 AND tenant_id = 0;
+ value 
+-------
+    42
+(1 row)
+
+ROLLBACK;
+-- After rollback the value must be gone (0 rows)
+SELECT COUNT(*) AS after_rollback_count FROM mvcc_test WHERE t = 200 AND tenant_id = 0;
+ after_rollback_count 
+----------------------
+                    0
+(1 row)
+
+-- Pre-existing slot (t=100) must be unaffected
+SELECT value FROM mvcc_test WHERE t = 100 AND tenant_id = 0;
+ value 
+-------
+   999
+(1 row)
+
+-- 3. Committed insert must remain visible
+BEGIN;
+INSERT INTO mvcc_test (t, tenant_id, value) VALUES (300, 0, 77.0);
+COMMIT;
+SELECT value FROM mvcc_test WHERE t = 300 AND tenant_id = 0;
+ value 
+-------
+    77
+(1 row)
+
+-- 4. Delete rollback: deleted slot must reappear after ROLLBACK
+BEGIN;
+DELETE FROM mvcc_test WHERE t = 100 AND tenant_id = 0;
+SELECT COUNT(*) AS during_delete FROM mvcc_test WHERE t = 100 AND tenant_id = 0;
+ during_delete 
+---------------
+             0
+(1 row)
+
+ROLLBACK;
+SELECT value AS after_delete_rollback FROM mvcc_test WHERE t = 100 AND tenant_id = 0;
+ after_delete_rollback 
+-----------------------
+                   999
+(1 row)
+
+-- 5. Committed delete must stay deleted
+BEGIN;
+DELETE FROM mvcc_test WHERE t = 300 AND tenant_id = 0;
+COMMIT;
+SELECT COUNT(*) AS after_committed_delete FROM mvcc_test WHERE t = 300 AND tenant_id = 0;
+ after_committed_delete 
+------------------------
+                      0
+(1 row)
+
+-- Cleanup
+DROP TABLE mvcc_test;

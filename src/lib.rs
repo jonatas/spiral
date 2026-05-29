@@ -17,6 +17,7 @@ use std::cell::Cell;
 pub mod bgworker;
 pub mod catalog;
 pub mod hooks;
+pub mod mvcc;
 pub mod rollup;
 pub mod stats;
 pub mod storage;

@@ -70,13 +70,13 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 | `tuple_fetch_row_version` | **Implemented** | Reconstructs tuple from TID and physical block. |
 | `tuple_tid_valid` | **Implemented** | Returns `true` if position is within Spiral page limits. |
 | `tuple_get_latest_tid` | **Placeholder** | No-op. |
-| `tuple_satisfies_snapshot` | **Implemented** | Always returns `true` (no MVCC yet). |
+| `tuple_satisfies_snapshot` | **Implemented** | Snapshot-aware: returns `false` for slots whose writing xid is still in-progress per the MVCC snapshot. Backed by a per-backend pending-writes map registered via `RegisterXactCallback`; aborts restore old values, commits clear the map. |
 | `scan_analyze_next_block` | **Implemented** | Returns `true` if blocks remain. |
 | `scan_analyze_next_tuple` | **Implemented** | Full block/tuple sampling for statistical analysis. |
 
 ## Summary of Missing Semantics
 
-1.  **MVCC**: Snapshot isolation is completely absent. The TAM currently reads the "current" state of blocks regardless of the transaction snapshot. Updates are implemented as logical deletes and inserts, but visibility is strictly latest-wins.
+1.  **MVCC (partial)**: Snapshot isolation is implemented via an in-memory pending-writes map (`src/mvcc.rs`). Uncommitted inserts/deletes are hidden from concurrent snapshots and rolled back on abort. Limitation: the undo log is in-memory only — a crash during a write transaction leaves stale data (WAL-based undo is a future work item). Tuple-level locking remains a no-op (`TM_Ok` always).
 2.  **TABLESAMPLE**: `TABLESAMPLE` clauses are currently unsupported.
 
 ## Roadmap
@@ -88,3 +88,5 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 - [x] Implement `index_build_range_scan` and fetch callbacks for standard indices.
 - [x] Add `GenericXLog` support to point-in-time operations for durability.
 - [x] Implement `scan_bitmap_next_tuple` for Bitmap Scan support.
+- [x] Implement snapshot-aware `tuple_satisfies_snapshot` with in-memory undo for rollback (closes #65, partial MVCC).
+- [ ] WAL-log individual slot writes so crash recovery can undo in-flight transactions.
