@@ -358,3 +358,19 @@ pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
     OFFSET_COLS_CACHE.with(|c| c.borrow_mut().insert(view_name.to_string(), cols.clone()));
     cols
 }
+
+/// Remove all Spiral catalog entries for a dropped table.
+/// Cleans spiral.metadata, spiral.sources, and spiral.changelog rows whose
+/// base_view or view_name match `table_name` (handles both base tables and rollup tiers).
+pub fn remove_table_from_spiral(table_name: &str) {
+    if !spiral_metadata_table_exists() {
+        return;
+    }
+    let name = table_name.replace("'", "''");
+    let _ = Spi::run(&format!(
+        "DELETE FROM spiral.sources WHERE view_name = '{name}' OR base_view = '{name}'; \
+         DELETE FROM spiral.metadata WHERE view_name = '{name}' OR base_view = '{name}'; \
+         DELETE FROM spiral.changelog WHERE base_view = '{name}';"
+    ));
+    invalidate_catalog_cache();
+}
