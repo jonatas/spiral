@@ -49,6 +49,16 @@ struct ChangelogEntry {
     t_end: Option<i64>,
 }
 
+#[derive(Serialize, Deserialize, Debug, FromRow, Clone)]
+struct ChangelogEntryFull {
+    event_id: i64,
+    base_view: String,
+    scope_values: serde_json::Value,
+    t_start: Option<i64>,
+    t_end: Option<i64>,
+    age_seconds: i64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct BlockInfo {
     blkno: i32,
@@ -188,7 +198,7 @@ async fn main() {
                             entries.len(),
                             last_processed_event_id
                         );
-                        
+
                         if let Ok(mut buffer) = polling_state.recent_changelog.lock() {
                             for entry in &entries {
                                 buffer.push_front(entry.clone());
@@ -258,6 +268,7 @@ async fn main() {
         .route("/api/metadata/{name}", get(get_metadata))
         .route("/api/changelog", get(get_changelog))
         .route("/api/storage/{name}/block/{blkno}", get(get_block_info))
+        .route("/api/storage/{name}/changelog", get(get_storage_changelog))
         .route("/api/slice/{view_name}", get(get_slice_data))
         .route("/api/explain", post(run_explain))
         .route("/ws", get(ws_handler))
@@ -273,9 +284,11 @@ async fn main() {
 
 fn valid_identifier(s: &str) -> bool {
     !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && s.chars().next().map(|c| !c.is_ascii_digit()).unwrap_or(false)
+            .next()
+            .map(|c| !c.is_ascii_digit())
+            .unwrap_or(false)
 }
 
 async fn get_block_info(
@@ -283,7 +296,10 @@ async fn get_block_info(
     Path((name, blkno)): Path<(String, i32)>,
 ) -> Result<Json<BlockInfo>, (axum::http::StatusCode, String)> {
     if !valid_identifier(&name) {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid view name".into()));
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid view name".into(),
+        ));
     }
 
     let row = sqlx::query(
@@ -298,20 +314,22 @@ async fn get_block_info(
 
     let info_val: Option<serde_json::Value> = row.get("info");
     let Some(info) = info_val else {
-        return Err((axum::http::StatusCode::NOT_FOUND, "Block info not available".into()));
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Block info not available".into(),
+        ));
     };
 
     let mut block_info = serde_json::from_value::<BlockInfo>(info)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Look up the time column from spiral metadata
-    let meta_row = sqlx::query(
-        "SELECT base_view, columns_metadata FROM spiral.metadata WHERE view_name = $1",
-    )
-    .bind(&name)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let meta_row =
+        sqlx::query("SELECT base_view, columns_metadata FROM spiral.metadata WHERE view_name = $1")
+            .bind(&name)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut time_col = meta_row.as_ref().and_then(|row| {
         let cm: serde_json::Value = row.get("columns_metadata");
@@ -324,12 +342,11 @@ async fn get_block_info(
         && let Some(ref row) = meta_row
     {
         let base_view: String = row.get("base_view");
-        if let Ok(Some(base_meta)) = sqlx::query(
-            "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1",
-        )
-        .bind(&base_view)
-        .fetch_optional(&state.pool)
-        .await
+        if let Ok(Some(base_meta)) =
+            sqlx::query("SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1")
+                .bind(&base_view)
+                .fetch_optional(&state.pool)
+                .await
         {
             let cm: serde_json::Value = base_meta.get("columns_metadata");
             time_col = cm
@@ -353,10 +370,7 @@ async fn get_block_info(
             next_blkno = blkno + 1
         );
 
-        match sqlx::query(&time_sql)
-            .fetch_one(&state.pool)
-            .await
-        {
+        match sqlx::query(&time_sql).fetch_one(&state.pool).await {
             Ok(time_row) => {
                 let t_min: Option<i64> = time_row.get(0);
                 let t_max: Option<i64> = time_row.get(1);
@@ -448,6 +462,40 @@ async fn get_changelog(
     Ok(Json(rows))
 }
 
+#[derive(Deserialize)]
+struct ChangelogQueryParams {
+    limit: Option<i64>,
+}
+
+async fn get_storage_changelog(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<ChangelogQueryParams>,
+) -> Result<Json<Vec<ChangelogEntryFull>>, (axum::http::StatusCode, String)> {
+    if !valid_identifier(&name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid view name".into(),
+        ));
+    }
+    let limit = params.limit.unwrap_or(100).min(500);
+    let rows = sqlx::query_as::<_, ChangelogEntryFull>(
+        "SELECT event_id, base_view, scope_values, t_start, t_end,
+                GREATEST(0, EXTRACT(EPOCH FROM NOW())::bigint - COALESCE(t_end, 0)) AS age_seconds
+         FROM spiral.changelog
+         WHERE base_view = $1
+         ORDER BY event_id DESC
+         LIMIT $2",
+    )
+    .bind(&name)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(rows))
+}
+
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     tracing::info!("New WebSocket connection request");
     ws.on_upgrade(|socket| handle_socket(socket, state))
@@ -477,7 +525,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             for level in &hierarchy.aggregation_levels {
                 if let Ok(Some(storage_stats)) =
                     load_storage_stats(&state.pool, &hierarchy.base_view, &level.view_name).await
-                    && let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
+                    && let Ok(msg) =
+                        serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
                 {
                     let _ = sender.send(Message::Text(msg.into())).await;
                 }
@@ -496,11 +545,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-
 fn log_db_error(context: &str, e: &sqlx::Error) {
     let msg = e.to_string();
     if msg.contains("lock timeout") || msg.contains("55P03") {
-        tracing::warn!("Lock timeout in {context} — another session holds a lock. Will retry next poll cycle.");
+        tracing::warn!(
+            "Lock timeout in {context} — another session holds a lock. Will retry next poll cycle."
+        );
     } else if msg.contains("statement timeout") || msg.contains("57014") {
         tracing::warn!("Statement timeout in {context} — query exceeded 30s limit.");
     } else {
@@ -683,7 +733,10 @@ async fn get_slice_data(
 
     // view_name must be a registered spiral view — prevents SQL injection
     let meta_row = meta_row.ok_or_else(|| {
-        (axum::http::StatusCode::NOT_FOUND, format!("View '{}' not in spiral.metadata", view_name))
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("View '{}' not in spiral.metadata", view_name),
+        )
     })?;
 
     let columns_metadata: serde_json::Value = meta_row.get("columns_metadata");
@@ -696,12 +749,11 @@ async fn get_slice_data(
 
     if time_col.is_none() {
         let base_view: String = meta_row.get("base_view");
-        if let Ok(Some(base_meta)) = sqlx::query(
-            "SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1",
-        )
-        .bind(&base_view)
-        .fetch_optional(&state.pool)
-        .await
+        if let Ok(Some(base_meta)) =
+            sqlx::query("SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1")
+                .bind(&base_view)
+                .fetch_optional(&state.pool)
+                .await
         {
             let cm: serde_json::Value = base_meta.get("columns_metadata");
             time_col = cm
@@ -764,10 +816,7 @@ async fn run_explain(
     let trimmed = payload.query.trim().to_string();
     let upper = trimmed.to_uppercase();
 
-    if !upper.starts_with("SELECT")
-        && !upper.starts_with("WITH")
-        && !upper.starts_with("EXPLAIN")
-    {
+    if !upper.starts_with("SELECT") && !upper.starts_with("WITH") && !upper.starts_with("EXPLAIN") {
         return Json(serde_json::json!({
             "ok": false,
             "error": "Only SELECT/WITH/EXPLAIN allowed",
@@ -788,10 +837,7 @@ async fn run_explain(
 
     match result {
         Ok(rows) => {
-            let lines: Vec<String> = rows
-                .iter()
-                .map(|row| row.get::<String, _>(0))
-                .collect();
+            let lines: Vec<String> = rows.iter().map(|row| row.get::<String, _>(0)).collect();
             Json(serde_json::json!({
                 "ok": true,
                 "lines": lines,
