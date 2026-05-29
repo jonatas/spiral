@@ -1,5 +1,28 @@
 use pgrx::pg_sys;
 use pgrx::prelude::*;
+use std::cell::Cell;
+
+thread_local! {
+    /// Tracks whether the non-ACID warning has been emitted this session.
+    static TAM_WRITE_WARNED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Emit a one-per-session WARNING when TAM_WARN_WRITES GUC is enabled.
+/// Spiral TAM writes bypass WAL and MVCC — callers should know this.
+fn warn_tam_non_acid() {
+    if crate::TAM_WARN_WRITES.get() {
+        TAM_WRITE_WARNED.with(|w| {
+            if !w.get() {
+                w.set(true);
+                warning!(
+                    "Spiral TAM: write on a non-ACID relation. \
+                     MVCC, rollback, and snapshot isolation are absent (see issue #65). \
+                     Set spiral.warn_on_tam_writes = false to suppress."
+                );
+            }
+        });
+    }
+}
 
 // Table Access Method (TAM) Handler for Spiral
 #[pg_extern(sql = "
@@ -296,6 +319,7 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
     if rel.is_null() || slot.is_null() {
         return;
     }
+    warn_tam_non_acid();
 
     let tupdesc = (*slot).tts_tupleDescriptor;
     let mut t_val: Option<i64> = None;
@@ -438,6 +462,7 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
     _tmfd: *mut pg_sys::TM_FailureData,
     _changing_part: bool,
 ) -> pg_sys::TM_Result::Type {
+    warn_tam_non_acid();
     if tid.is_null() {
         return pg_sys::TM_Result::TM_Ok;
     }
@@ -1432,6 +1457,94 @@ mod tests {
 
             Ok::<(), spi::Error>(())
         }).unwrap();
+    }
+
+    /// P0 correctness test: proves TAM writes are NOT rolled back on ROLLBACK TO SAVEPOINT.
+    /// This asserts the CURRENT BROKEN behavior. When #65 is fixed, this test must be
+    /// updated to assert count == 0 after rollback.
+    #[pg_test]
+    fn test_tam_rollback_does_not_undo_write() {
+        Spi::connect_mut(|client| {
+            client.update(
+                "SET spiral.kickoff_date = '1970-01-01 00:00:00Z';",
+                None,
+                &[],
+            )?;
+            client.update("SET spiral.warn_on_tam_writes = false;", None, &[])?;
+            client.update(
+                "CREATE TABLE tam_rollback_p0 \
+                 (t bigint, tenant_id int, value double precision) USING spiral;",
+                None,
+                &[],
+            )?;
+
+            // Create savepoint, insert, then roll back to savepoint.
+            client.update("SAVEPOINT before_insert;", None, &[])?;
+            client.update(
+                "INSERT INTO tam_rollback_p0 VALUES (1, 0, 42.0);",
+                None,
+                &[],
+            )?;
+            client.update("ROLLBACK TO SAVEPOINT before_insert;", None, &[])?;
+
+            // CORRECT: count should be 0 — rollback undid the insert.
+            // ACTUAL (P0 bug): count is 1 — TAM write bypassed WAL, rollback had no effect.
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_rollback_p0")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "P0 known failure (#65): TAM INSERT not reversed by ROLLBACK TO SAVEPOINT"
+            );
+
+            Ok::<(), spi::Error>(())
+        })
+        .unwrap();
+    }
+
+    /// P0 correctness test: proves tuple_satisfies_snapshot ignores the snapshot and
+    /// returns true for every non-zero slot. All writes are immediately visible to all
+    /// concurrent and historical snapshots. When #65 is fixed, snapshot-isolated reads
+    /// should respect transaction boundaries.
+    #[pg_test]
+    fn test_tam_tuple_satisfies_snapshot_ignores_xid() {
+        Spi::connect_mut(|client| {
+            client.update(
+                "SET spiral.kickoff_date = '1970-01-01 00:00:00Z';",
+                None,
+                &[],
+            )?;
+            client.update("SET spiral.warn_on_tam_writes = false;", None, &[])?;
+            client.update(
+                "CREATE TABLE tam_snapshot_p0 \
+                 (t bigint, tenant_id int, value double precision) USING spiral;",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO tam_snapshot_p0 VALUES (1, 0, 1.0), (2, 0, 2.0);",
+                None,
+                &[],
+            )?;
+
+            // Both non-zero tuples are visible — tuple_satisfies_snapshot returns true
+            // unconditionally regardless of snapshot or transaction state.
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_snapshot_p0")
+                .unwrap()
+                .unwrap();
+            assert_eq!(count, 2, "both non-zero tuples visible (no MVCC filtering)");
+
+            // Even after a delete (which zeros the slot), the zeroed slot disappears —
+            // confirming visibility is purely value-based (val != 0.0), not XID-based.
+            client.update("DELETE FROM tam_snapshot_p0 WHERE t = 1;", None, &[])?;
+            let count_after = Spi::get_one::<i64>("SELECT count(*) FROM tam_snapshot_p0")
+                .unwrap()
+                .unwrap();
+            assert_eq!(count_after, 1, "deleted (zeroed) slot no longer visible");
+
+            Ok::<(), spi::Error>(())
+        })
+        .unwrap();
     }
 
     #[pg_test]
