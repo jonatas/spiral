@@ -578,6 +578,56 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
     }
 }
 
+/// Read the raw SpiralPageOpaque special area from disk.
+/// Returns actual stored header values so callers can detect drift vs computed values.
+#[pg_extern]
+pub fn spiral_read_page_opaque(rel_oid: i32, blkno: i32) -> pgrx::JsonB {
+    let not_found = || {
+        pgrx::JsonB(serde_json::json!({
+            "found": false,
+            "window_start_t": 0_i64,
+            "window_end_t": 0_i64,
+            "tenant_scale": 0_i32,
+            "magic": 0_u32,
+            "magic_valid": false
+        }))
+    };
+
+    unsafe {
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(rel_oid as u32),
+            pg_sys::AccessShareLock as i32,
+        );
+        let rel = pg_rel.as_ptr();
+
+        if (blkno as u32) >= get_block_count(rel) {
+            return not_found();
+        }
+
+        let buffer = pg_sys::ReadBuffer(rel, blkno as u32);
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buffer);
+        let opaque = page_special_ptr(page);
+
+        let window_start_t = (*opaque).window_start_t;
+        let window_end_t = (*opaque).window_end_t;
+        let tenant_scale = (*opaque).tenant_scale;
+        let magic = (*opaque).magic;
+
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+        pg_sys::ReleaseBuffer(buffer);
+
+        pgrx::JsonB(serde_json::json!({
+            "found": true,
+            "window_start_t": window_start_t,
+            "window_end_t": window_end_t,
+            "tenant_scale": tenant_scale,
+            "magic": magic,
+            "magic_valid": magic == SPIRAL_PAGE_MAGIC
+        }))
+    }
+}
+
 /// Count live (non-zero) vs unused (zero) 8-byte slots in a spiral page.
 /// Spiral pages are raw byte arrays — no heap line pointers, no MVCC.
 /// A slot is "unused" when its 8 bytes are all zero (never written or written 0.0).

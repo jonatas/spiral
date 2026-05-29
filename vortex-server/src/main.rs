@@ -88,6 +88,14 @@ struct BlockInfo {
     dead_tuples: i32,
     #[serde(default)]
     unused_slots: i64,
+    #[serde(default)]
+    opaque_window_start_t: i64,
+    #[serde(default)]
+    opaque_window_end_t: i64,
+    #[serde(default)]
+    opaque_tenant_scale: i32,
+    #[serde(default)]
+    magic_valid: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -509,6 +517,33 @@ async fn get_block_info(
             block_info.pending_changes = count;
             block_info.is_stale = count > 0;
             block_info.last_changelog_ts = last_ts;
+        }
+    }
+
+    // Raw SpiralPageOpaque from disk for corruption detection (#61)
+    if let Ok(Some(opaque_row)) = sqlx::query(
+        "SELECT spiral_read_page_opaque(oid::int, $2) AS opaque FROM pg_class WHERE relname = $1",
+    )
+    .bind(&name)
+    .bind(blkno)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        if let Some(v) = opaque_row.get::<Option<serde_json::Value>, _>("opaque") {
+            if v.get("found").and_then(|x| x.as_bool()).unwrap_or(false) {
+                block_info.opaque_window_start_t = v
+                    .get("window_start_t")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0);
+                block_info.opaque_window_end_t =
+                    v.get("window_end_t").and_then(|x| x.as_i64()).unwrap_or(0);
+                block_info.opaque_tenant_scale =
+                    v.get("tenant_scale").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+                block_info.magic_valid = v
+                    .get("magic_valid")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+            }
         }
     }
 
