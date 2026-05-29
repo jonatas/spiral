@@ -2091,6 +2091,56 @@ mod tests {
         assert_eq!(hour0, 1, "hour 0 rollup row must exist");
         assert_eq!(hour1, 1, "hour 1 rollup row must exist");
     }
+
+    #[pg_test]
+    fn test_count_star_without_where_clause() {
+        // Regression: count(*) on a Spiral-accelerated table with rolled-up data
+        // must return the correct total row count without "unboxing other_ argument
+        // failed" — caused by a stale aggtranstype (INT8) on the rewritten Aggref
+        // making PostgreSQL store JSONB transition states as byval pointers, which
+        // became dangling when the COMBINEFUNC merged partial results from UNION ALL
+        // arms whose memory contexts had been freed.
+        Spi::run(
+            "CREATE TABLE count_test (
+                t   timestamptz NOT NULL,
+                val double precision  -- Spiral: sum
+            ) WITH (spiral.frames = '1h')",
+        )
+        .unwrap();
+
+        Spi::run(
+            "INSERT INTO count_test (t, val)
+             SELECT '2026-01-01 00:00:00+00'::timestamptz + (i * interval '10 minutes'), i::float8
+             FROM generate_series(0, 11) i",
+        )
+        .unwrap();
+
+        Spi::run("SELECT spiral_refresh('count_test')").unwrap();
+
+        // count(*) with WHERE clause — must not error
+        let n_with_where: i64 = Spi::get_one(
+            "SELECT count(*) FROM count_test
+             WHERE t >= '2026-01-01 00:00:00+00' AND t < '2026-01-01 02:00:00+00'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(n_with_where, 12, "count(*) with WHERE must return 12");
+
+        // count(*) without WHERE clause — was broken before the aggtranstype fix
+        let n_no_where: i64 = Spi::get_one("SELECT count(*) FROM count_test")
+            .unwrap()
+            .unwrap_or(-1);
+        assert_eq!(n_no_where, 12, "count(*) without WHERE must return 12");
+
+        // DROP TABLE must clean up spiral catalog entries
+        Spi::run("DROP TABLE count_test CASCADE").unwrap();
+        let meta_gone: i64 = Spi::get_one(
+            "SELECT COUNT(*)::bigint FROM spiral.metadata WHERE view_name = 'count_test'",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(meta_gone, 0, "spiral.metadata must be cleaned up after DROP TABLE");
+    }
 }
 
 #[cfg(test)]

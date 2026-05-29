@@ -444,6 +444,37 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
         }
     }
 
+    // Collect table names to clean up BEFORE drop executes (relations still exist here).
+    let drop_table_names: Vec<String> = if !utility_stmt.is_null()
+        && (*utility_stmt).type_ == pg_sys::NodeTag::T_DropStmt
+    {
+        let drop = utility_stmt as *mut pg_sys::DropStmt;
+        if (*drop).removeType == pg_sys::ObjectType::OBJECT_TABLE {
+            let mut names = Vec::new();
+            if !(*drop).objects.is_null() {
+                for i in 0..(*(*drop).objects).length {
+                    let obj = pg_sys::list_nth((*drop).objects, i);
+                    // Each object in a DROP TABLE is a List of String nodes (schema.table).
+                    let name_list = obj as *mut pg_sys::List;
+                    if !name_list.is_null() && (*name_list).length > 0 {
+                        let tail = pg_sys::list_nth(name_list, (*name_list).length - 1)
+                            as *mut pg_sys::String;
+                        if !tail.is_null() && !(*tail).sval.is_null() {
+                            names.push(
+                                CStr::from_ptr((*tail).sval).to_string_lossy().into_owned(),
+                            );
+                        }
+                    }
+                }
+            }
+            names
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
     if let Some(prev) = PREV_PROCESS_UTILITY_HOOK {
         prev(
             pstmt,
@@ -466,6 +497,11 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
             dest,
             qc,
         );
+    }
+
+    // After the drop succeeds, clean up Spiral catalog entries.
+    for table_name in &drop_table_names {
+        catalog::remove_table_from_spiral(table_name);
     }
     })) // end PgTryBuilder closure
     .catch_others(|e| {
@@ -1223,9 +1259,11 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                     query_cols.iter().find(|(name, _)| name == c)
                                 {
                                     cols.push((c.clone(), agg.clone()));
-                                } else {
-                                    cols.push((c.clone(), None));
                                 }
+                                // Omit columns not referenced by the outer query: including them
+                                // causes type-mismatch errors in UNION ALL branches because
+                                // rollup columns (e.g. OHLCV stored as JSONB) differ in type
+                                // from the base-table originals (e.g. double precision).
                             }
 
                             let scope_vals: Vec<(String, String)> = qc_opt
@@ -2317,6 +2355,13 @@ pub(crate) unsafe fn rewrite_query_aggregates(
 
                 if let Some(oid) = new_oid {
                     (*agg).aggfnoid = oid;
+                    // All Spiral merge aggregates use JSONB as transition type.
+                    // The stale aggtranstype from the original aggregate (e.g. INT8OID for
+                    // count(*)) would make PostgreSQL treat the state as a byval 8-byte type.
+                    // That causes the JSONB varlena pointer to be stored without copying, so
+                    // when the COMBINEFUNC merges partial states from UNION ALL arms the second
+                    // arm's state pointer is dangling → "unboxing other_ argument failed".
+                    (*agg).aggtranstype = pg_sys::JSONBOID;
                     if (*agg).aggstar {
                         use std::os::raw::c_void;
                         (*agg).aggstar = false;
