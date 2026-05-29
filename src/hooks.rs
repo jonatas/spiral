@@ -3099,6 +3099,7 @@ pub fn reactive_refresh_by_scope(base_name: &str, scope_json: String) {
         let _ = crate::refresh_incremental(base_name, None, 0, Some(scope_json));
         return;
     }
+    catalog::unify_changelog_scope(&real_base, &scope_json);
     let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
     let _ = Spi::run(&format!("CREATE TEMP TABLE refreshing_changelog AS SELECT ctid as old_ctid FROM spiral.changelog WHERE base_view = '{}' AND scope_values = '{}'::jsonb", real_base.replace('\'', "''"), scope_json.replace('\'', "''")));
     if crate::refresh_incremental(base_name, None, 0, Some(scope_json)) {

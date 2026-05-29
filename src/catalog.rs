@@ -215,6 +215,39 @@ pub fn insert_source(
     let _ = Spi::run(&sql);
 }
 
+pub fn unify_changelog_scope(base_view: &str, scope_json: &str) {
+    let safe_bv = base_view.replace("'", "''");
+    let safe_sv = scope_json.replace("'", "''");
+    let _ = Spi::run(&format!(
+        "CREATE TEMP TABLE scope_cl_snapshot AS \
+         SELECT ctid AS old_ctid, * FROM spiral.changelog \
+         WHERE base_view = '{}' AND scope_values = '{}'::jsonb",
+        safe_bv, safe_sv
+    ));
+    let _ = Spi::run("CREATE TEMP TABLE scope_cl_unified AS
+         SELECT base_view, scope_values,
+                NULLIF(MIN(ts_safe), -9223372036854775808) as ts,
+                NULLIF(MAX(te_safe), 9223372036854775807) as te
+         FROM (
+            SELECT *,
+                COUNT(*) FILTER (WHERE prev_end < ts_safe OR prev_end IS NULL) OVER (PARTITION BY base_view, scope_values ORDER BY ts_safe) as grp
+            FROM (
+                SELECT *,
+                    COALESCE(t_start, -9223372036854775808) as ts_safe,
+                    COALESCE(t_end, 9223372036854775807) as te_safe,
+                    MAX(COALESCE(t_end, 9223372036854775807)) OVER (PARTITION BY base_view, scope_values ORDER BY COALESCE(t_start, -9223372036854775808) ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
+                FROM scope_cl_snapshot
+            ) s1
+         ) s2
+         GROUP BY base_view, scope_values, grp");
+    let _ = Spi::run(
+        "DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM scope_cl_snapshot)",
+    );
+    let _ = Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM scope_cl_unified");
+    let _ = Spi::run("DROP TABLE scope_cl_snapshot");
+    let _ = Spi::run("DROP TABLE scope_cl_unified");
+}
+
 pub fn unify_changelog(base_view: &str) {
     // Snapshot existing rows with their ctids first.
     let _ = Spi::run(&format!(
