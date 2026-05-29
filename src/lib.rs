@@ -987,8 +987,8 @@ mod tests {
         use crate::zorder::spiral_hilbert_2d;
         assert_eq!(spiral_hilbert_2d(0, 0).to_string(), "0");
         assert_eq!(spiral_hilbert_2d(1, 0).to_string(), "1");
-        assert_eq!(spiral_hilbert_2d(0, 1).to_string(), "2");
-        assert_eq!(spiral_hilbert_2d(1, 1).to_string(), "3");
+        assert_eq!(spiral_hilbert_2d(1, 1).to_string(), "2");
+        assert_eq!(spiral_hilbert_2d(0, 1).to_string(), "3");
     }
 
     #[pg_test]
@@ -1535,7 +1535,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE sparse_refresh (
                 t   timestamptz NOT NULL,
-                val double precision
+                val double precision -- Spiral: sum
             ) WITH (spiral.frames = '1h')",
         )
         .unwrap();
@@ -1683,7 +1683,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE tiered_obs (
                 t   timestamptz NOT NULL,
-                val double precision
+                val double precision -- Spiral: sum
             ) WITH (spiral.frames = '1h,1d')",
         )
         .unwrap();
