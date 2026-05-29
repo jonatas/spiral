@@ -11,7 +11,7 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, Pool, Postgres, Row};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -161,13 +161,18 @@ async fn main() {
         recent_changelog: Mutex::new(VecDeque::with_capacity(500)),
     });
 
+    let poll_secs = std::env::var("VORTEX_POLL_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+
     // Start background polling task
     let polling_state = Arc::clone(&state);
     tokio::spawn(async move {
         let mut last_processed_event_id = 0i64;
         let mut last_config_signature: Option<String> = None;
 
-        tracing::info!("Starting background polling loop");
+        tracing::info!("Starting background polling loop (interval={}s)", poll_secs);
         loop {
             // 1. Poll for new changelog entries
             let result = sqlx::query_as::<_, ChangelogEntry>(
@@ -188,14 +193,12 @@ async fn main() {
                             entries.len(),
                             last_processed_event_id
                         );
-                        
                         if let Ok(mut buffer) = polling_state.recent_changelog.lock() {
                             for entry in &entries {
                                 buffer.push_front(entry.clone());
                             }
                             buffer.truncate(500);
                         }
-
                         for entry in entries {
                             last_processed_event_id = last_processed_event_id.max(entry.event_id);
                             let _ = polling_state.tx.send(VortexEvent::ChangelogUpdate(entry));
@@ -205,43 +208,30 @@ async fn main() {
                 Err(e) => log_db_error("changelog poll", &e),
             }
 
-            // 2. Poll for storage stats and metadata
+            // 2. Poll metadata; on change broadcast SystemConfig.
+            // 3. Batch all storage stats in one query — O(1) round-trips regardless of view count.
             match load_system_config(&polling_state.pool).await {
                 Ok(config) => {
                     let signature = serde_json::to_string(&config).unwrap_or_default();
                     if last_config_signature.as_deref() != Some(signature.as_str()) {
                         last_config_signature = Some(signature);
-                        let _ = polling_state
-                            .tx
-                            .send(VortexEvent::SystemConfig(config.clone()));
+                        let _ = polling_state.tx.send(VortexEvent::SystemConfig(config.clone()));
                     }
 
-                    for hierarchy in &config.hierarchies {
-                        // Polling for raw view
-                        if let Ok(Some(storage_stats)) = load_storage_stats(
-                            &polling_state.pool,
-                            &hierarchy.base_view,
-                            &hierarchy.raw_view_name,
-                        )
-                        .await
-                        {
-                            let _ = polling_state
-                                .tx
-                                .send(VortexEvent::StorageStats(storage_stats));
-                        }
+                    let all_view_names: Vec<String> = config.hierarchies.iter().flat_map(|h| {
+                        std::iter::once(h.raw_view_name.clone())
+                            .chain(h.aggregation_levels.iter().map(|l| l.view_name.clone()))
+                    }).collect();
 
-                        // Polling for aggregation levels
-                        for level in &hierarchy.aggregation_levels {
-                            if let Ok(Some(storage_stats)) = load_storage_stats(
-                                &polling_state.pool,
-                                &hierarchy.base_view,
-                                &level.view_name,
-                            )
-                            .await
-                            {
-                                let _ = polling_state
-                                    .tx
-                                    .send(VortexEvent::StorageStats(storage_stats));
+                    let mut all_stats = load_all_storage_stats(&polling_state.pool, &all_view_names).await;
+
+                    for hierarchy in &config.hierarchies {
+                        for view_name in std::iter::once(&hierarchy.raw_view_name)
+                            .chain(hierarchy.aggregation_levels.iter().map(|l| &l.view_name))
+                        {
+                            if let Some(mut stats) = all_stats.remove(view_name) {
+                                stats.base_view = hierarchy.base_view.clone();
+                                let _ = polling_state.tx.send(VortexEvent::StorageStats(stats));
                             }
                         }
                     }
@@ -249,7 +239,7 @@ async fn main() {
                 Err(e) => log_db_error("metadata poll", &e),
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
         }
     });
 
@@ -459,27 +449,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut _receiver) = socket.split();
 
     if let Ok(config) = load_system_config(&state.pool).await {
+        // Send SystemConfig first — fast (metadata only, no per-view stats queries).
         if let Ok(msg) = serde_json::to_string(&VortexEvent::SystemConfig(config.clone())) {
             let _ = sender.send(Message::Text(msg.into())).await;
         }
 
-        for hierarchy in &config.hierarchies {
-            // Stats for raw view
-            if let Ok(Some(storage_stats)) =
-                load_storage_stats(&state.pool, &hierarchy.base_view, &hierarchy.raw_view_name)
-                    .await
-                && let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
-            {
-                let _ = sender.send(Message::Text(msg.into())).await;
-            }
+        // Batch all storage stats in one round-trip.
+        let all_view_names: Vec<String> = config.hierarchies.iter().flat_map(|h| {
+            std::iter::once(h.raw_view_name.clone())
+                .chain(h.aggregation_levels.iter().map(|l| l.view_name.clone()))
+        }).collect();
 
-            // Stats for all aggregation levels
-            for level in &hierarchy.aggregation_levels {
-                if let Ok(Some(storage_stats)) =
-                    load_storage_stats(&state.pool, &hierarchy.base_view, &level.view_name).await
-                    && let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(storage_stats))
-                {
-                    let _ = sender.send(Message::Text(msg.into())).await;
+        let mut all_stats = load_all_storage_stats(&state.pool, &all_view_names).await;
+
+        for hierarchy in &config.hierarchies {
+            for view_name in std::iter::once(&hierarchy.raw_view_name)
+                .chain(hierarchy.aggregation_levels.iter().map(|l| &l.view_name))
+            {
+                if let Some(mut stats) = all_stats.remove(view_name) {
+                    stats.base_view = hierarchy.base_view.clone();
+                    if let Ok(msg) = serde_json::to_string(&VortexEvent::StorageStats(stats)) {
+                        let _ = sender.send(Message::Text(msg.into())).await;
+                    }
                 }
             }
         }
@@ -529,50 +520,39 @@ async fn load_sources(pool: &Pool<Postgres>) -> Result<Vec<SourceInfo>, sqlx::Er
     .await
 }
 
-async fn load_storage_stats(
+/// Fetch storage stats for all named views in a single DB round-trip.
+/// Returns only what succeeds — one failing view does not affect others.
+async fn load_all_storage_stats(
     pool: &Pool<Postgres>,
-    base_view: &str,
-    raw_view_name: &str,
-) -> Result<Option<StorageStats>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT spiral_get_storage_stats(oid::int) as stats
+    view_names: &[String],
+) -> HashMap<String, StorageStats> {
+    if view_names.is_empty() {
+        return HashMap::new();
+    }
+    let rows = sqlx::query(
+        "SELECT relname::text, spiral_get_storage_stats(oid::int) AS stats, reltuples::float8
          FROM pg_class
-         WHERE relname = $1",
+         WHERE relname = ANY($1)",
     )
-    .bind(raw_view_name)
-    .fetch_optional(pool)
-    .await?;
+    .bind(view_names)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let stats_val: Option<serde_json::Value> = row.get("stats");
-    let Some(stats) = stats_val else {
-        return Ok(None);
-    };
-
-    let reltuples: f32 = sqlx::query("SELECT reltuples FROM pg_class WHERE relname = $1")
-        .bind(raw_view_name)
-        .fetch_one(pool)
-        .await?
-        .get(0);
-
-    let mut storage_stats = match serde_json::from_value::<StorageStats>(stats) {
-        Ok(mut storage_stats) => {
-            storage_stats.row_count = if reltuples < 0.0 {
-                storage_stats.total_rows_capacity
-            } else {
-                reltuples as i64
-            };
-            storage_stats
+    let mut result = HashMap::new();
+    for row in rows {
+        let relname: String = row.get("relname");
+        let stats_val: Option<serde_json::Value> = row.get("stats");
+        let reltuples: f64 = row.try_get("reltuples").unwrap_or(-1.0);
+        if let Some(stats) = stats_val {
+            if let Ok(mut s) = serde_json::from_value::<StorageStats>(stats) {
+                s.row_count = if reltuples < 0.0 { s.total_rows_capacity } else { reltuples as i64 };
+                s.view_name = relname.clone();
+                result.insert(relname, s);
+            }
         }
-        Err(_) => return Ok(None),
-    };
-
-    storage_stats.base_view = base_view.to_string();
-    storage_stats.view_name = raw_view_name.to_string();
-    Ok(Some(storage_stats))
+    }
+    result
 }
 
 async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx::Error> {
@@ -581,65 +561,51 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
 
     let mut metadata_by_base: BTreeMap<String, Vec<Metadata>> = BTreeMap::new();
     for view in metadata {
-        metadata_by_base
-            .entry(view.base_view.clone())
-            .or_default()
-            .push(view);
+        metadata_by_base.entry(view.base_view.clone()).or_default().push(view);
     }
+    for views in metadata_by_base.values_mut() {
+        views.sort_by(|a, b| a.frame_seconds.cmp(&b.frame_seconds).then_with(|| a.view_name.cmp(&b.view_name)));
+    }
+
+    // Collect raw view names, then fetch all storage stats in one round-trip.
+    let raw_view_names: Vec<String> = metadata_by_base
+        .iter()
+        .map(|(base_view, views)| {
+            views.iter()
+                .find(|v| v.view_name == *base_view || v.frame_seconds == 0)
+                .or_else(|| views.first())
+                .map(|v| v.view_name.clone())
+                .unwrap_or_else(|| base_view.clone())
+        })
+        .collect();
+    let all_stats = load_all_storage_stats(pool, &raw_view_names).await;
 
     let mut sources_by_base: BTreeMap<String, Vec<SourceInfo>> = BTreeMap::new();
     for source in sources {
-        sources_by_base
-            .entry(source.base_view.clone())
-            .or_default()
-            .push(source);
+        sources_by_base.entry(source.base_view.clone()).or_default().push(source);
     }
 
     let mut hierarchies = Vec::new();
-    for (base_view, mut views) in metadata_by_base {
-        views.sort_by(|a, b| {
-            a.frame_seconds
-                .cmp(&b.frame_seconds)
-                .then_with(|| a.view_name.cmp(&b.view_name))
-        });
-
+    for (base_view, views) in metadata_by_base {
         let raw_view = views
             .iter()
             .find(|view| view.view_name == base_view || view.frame_seconds == 0)
             .cloned()
             .or_else(|| views.first().cloned());
 
-        let raw_view_name = raw_view
-            .as_ref()
-            .map(|v| v.view_name.clone())
-            .unwrap_or_else(|| base_view.clone());
-
-        let time_column = raw_view
-            .as_ref()
-            .and_then(|v| {
-                v.columns_metadata
-                    .get("time_column")
-                    .and_then(|tc| tc.as_str())
-            })
+        let raw_view_name = raw_view.as_ref().map(|v| v.view_name.clone()).unwrap_or_else(|| base_view.clone());
+        let time_column = raw_view.as_ref()
+            .and_then(|v| v.columns_metadata.get("time_column").and_then(|tc| tc.as_str()))
             .unwrap_or("t")
             .to_string();
 
-        let storage_stats = load_storage_stats(pool, &base_view, &raw_view_name).await?;
-        let tenant_scale = storage_stats
-            .as_ref()
-            .map(|stats| stats.tenant_scale)
-            .unwrap_or(1024);
-        let kickoff_epoch = storage_stats
-            .as_ref()
-            .map(|stats| stats.kickoff_epoch)
-            .unwrap_or(0);
+        let (tenant_scale, kickoff_epoch) = all_stats
+            .get(&raw_view_name)
+            .map(|s| (s.tenant_scale, s.kickoff_epoch))
+            .unwrap_or((1024, 0));
 
-        let aggregation_levels = views
-            .iter()
-            .map(|view| AggregationLevel {
-                frame_seconds: view.frame_seconds,
-                view_name: view.view_name.clone(),
-            })
+        let aggregation_levels = views.iter()
+            .map(|view| AggregationLevel { frame_seconds: view.frame_seconds, view_name: view.view_name.clone() })
             .collect();
 
         hierarchies.push(HierarchyConfig {
