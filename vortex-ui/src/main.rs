@@ -301,6 +301,14 @@ struct BlockInfo {
     is_stale: bool,
     #[serde(default)]
     last_changelog_ts: i64,
+    #[serde(default)]
+    fill_pct: f64,
+    #[serde(default)]
+    live_tuples: i64,
+    #[serde(default)]
+    dead_tuples: i32,
+    #[serde(default)]
+    unused_slots: i64,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -527,6 +535,18 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
         "ivalue bad"
     };
 
+    let fill_class = if block.fill_pct > 80.0 {
+        "ivalue good"
+    } else if block.fill_pct > 40.0 {
+        "ivalue warn"
+    } else if block.fill_pct > 0.0 {
+        "ivalue bad"
+    } else {
+        "ivalue"
+    };
+
+    let has_fill = block.fill_pct > 0.0 || block.live_tuples > 0;
+
     view! {
         <div class="block-inspector">
             <div class="bi-title">
@@ -537,11 +557,32 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
                 {block.is_stale.then(|| view! {
                     <span class="badge-dirty">"DIRTY"</span>
                 })}
+                {(has_fill && block.fill_pct < 20.0).then(|| view! {
+                    <span class="badge-sparse">"SPARSE"</span>
+                })}
             </div>
             <div class="irow">
                 <span class="ilabel">"capacity"</span>
                 <span class="ivalue">{block.tuple_count} " slots"</span>
             </div>
+            {has_fill.then(|| view! {
+                <div>
+                    <div class="irow">
+                        <span class="ilabel">"fill"</span>
+                        <span class={fill_class}>{format!("{:.1}%", block.fill_pct)}</span>
+                    </div>
+                    <div class="irow">
+                        <span class="ilabel">"live slots"</span>
+                        <span class="ivalue">{block.live_tuples}</span>
+                    </div>
+                    <div class="irow">
+                        <span class="ilabel">"unused"</span>
+                        <span class={if block.unused_slots > 500 { "ivalue warn" } else { "ivalue" }}>
+                            {block.unused_slots}
+                        </span>
+                    </div>
+                </div>
+            })}
             <div class="irow">
                 <span class="ilabel">"alignment"</span>
                 <span class={align_class}>{format!("{:.1}%", block.alignment_pct)}</span>

@@ -1101,7 +1101,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
         build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
 
     for i in 0..(*rtable).length {
-        let varno = i + 1 ;
+        let varno = i + 1;
         let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
         if rte.is_null() {
             continue;
@@ -2006,7 +2006,10 @@ pub fn generate_hierarchy_internal(
         match Spi::run(&create_table_sql) {
             Ok(_) => {
                 if let Err(e) = Spi::run(&unique_index_sql) {
-                    error!("Spiral: failed to create unique index for '{}': {:?}", child_name, e);
+                    error!(
+                        "Spiral: failed to create unique index for '{}': {:?}",
+                        child_name, e
+                    );
                 }
                 if !scope_columns.is_empty() {
                     let zorder_sql = format!("CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[]))");
@@ -2519,21 +2522,23 @@ pub(crate) unsafe fn extract_supported_query_columns(
                 }
                 let l = pg_sys::list_nth(args, 0) as *mut pg_sys::Node;
                 let r = pg_sys::list_nth(args, 1) as *mut pg_sys::Node;
-                if (((*l).type_ == pg_sys::NodeTag::T_Var && (*r).type_ == pg_sys::NodeTag::T_Const)
+                if (((*l).type_ == pg_sys::NodeTag::T_Var
+                    && (*r).type_ == pg_sys::NodeTag::T_Const)
                     || ((*l).type_ == pg_sys::NodeTag::T_Const
                         && (*r).type_ == pg_sys::NodeTag::T_Var))
-                    && matches!(opname.as_ref(), "+" | "-" | "*") {
-                        return walk_expr(
-                            if (*l).type_ == pg_sys::NodeTag::T_Var {
-                                l
-                            } else {
-                                r
-                            },
-                            base_table,
-                            rtable,
-                            cols,
-                        );
-                    }
+                    && matches!(opname.as_ref(), "+" | "-" | "*")
+                {
+                    return walk_expr(
+                        if (*l).type_ == pg_sys::NodeTag::T_Var {
+                            l
+                        } else {
+                            r
+                        },
+                        base_table,
+                        rtable,
+                        cols,
+                    );
+                }
                 for i in 0..(*args).length {
                     if !walk_expr(
                         pg_sys::list_nth(args, i) as *mut pg_sys::Node,
@@ -3152,7 +3157,7 @@ unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String
     ));
 
     for i in 0..(*rtable).length {
-        let varno = i + 1 ;
+        let varno = i + 1;
         let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
 
         if (*rte).rtekind == pg_sys::RTEKind::RTE_SUBQUERY {

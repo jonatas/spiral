@@ -578,6 +578,65 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
     }
 }
 
+/// Count live (non-zero) vs unused (zero) 8-byte slots in a spiral page.
+/// Spiral pages are raw byte arrays — no heap line pointers, no MVCC.
+/// A slot is "unused" when its 8 bytes are all zero (never written or written 0.0).
+#[pg_extern]
+pub fn spiral_page_fill_stats(rel_oid: i32, blkno: i32) -> pgrx::JsonB {
+    let empty = |unused: usize| {
+        pgrx::JsonB(serde_json::json!({
+            "max_offset": DATA_PER_PAGE,
+            "live_tuples": 0_i64,
+            "dead_tuples": 0_i64,
+            "unused_slots": unused as i64,
+            "fill_pct": 0.0_f64
+        }))
+    };
+
+    unsafe {
+        let pg_rel = PgRelation::with_lock(
+            pg_sys::Oid::from(rel_oid as u32),
+            pg_sys::AccessShareLock as i32,
+        );
+        let rel = pg_rel.as_ptr();
+
+        if (blkno as u32) >= get_block_count(rel) {
+            return empty(DATA_PER_PAGE);
+        }
+
+        let buffer = pg_sys::ReadBuffer(rel, blkno as u32);
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buffer);
+
+        if !is_valid_spiral_page(page) {
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+            pg_sys::ReleaseBuffer(buffer);
+            return empty(DATA_PER_PAGE);
+        }
+
+        let base = (page as *const u8).add(HEADER_SIZE);
+        let mut live: i64 = 0;
+
+        for i in 0..DATA_PER_PAGE {
+            if *(base.add(i * 8) as *const u64) != 0 {
+                live += 1;
+            }
+        }
+
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+        pg_sys::ReleaseBuffer(buffer);
+
+        let unused = DATA_PER_PAGE as i64 - live;
+        pgrx::JsonB(serde_json::json!({
+            "max_offset": DATA_PER_PAGE,
+            "live_tuples": live,
+            "dead_tuples": 0_i64,
+            "unused_slots": unused,
+            "fill_pct": live as f64 / DATA_PER_PAGE as f64 * 100.0
+        }))
+    }
+}
+
 #[pg_extern]
 pub fn spiral_blkno_to_tenant_range(main_rel_oid: i32, blkno: i32) -> pgrx::JsonB {
     let mut tenant_scale = 1024;
