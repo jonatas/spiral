@@ -9,7 +9,7 @@ DROP TABLE IF EXISTS ivm_ticks_1h CASCADE;
 CREATE TABLE ivm_ticks (
     t timestamptz NOT NULL,
     symbol_id int NOT NULL,
-    price numeric -- Spiral: ohlc, sum
+    price numeric -- Spiral: ohlcv, sum as price_total
 ) WITH (spiral.frames = '1h', spiral.tenant = 'symbol_id');
 
 -- 1. Initial Ingestion
@@ -37,4 +37,4 @@ SELECT spiral_refresh('ivm_ticks', 'symbol_id = 1');
 -- Display raw counts first
 SELECT count(*) FROM ivm_ticks_1h;
 
-SELECT symbol_id, round(price_ohlcv_h::numeric, 2) as high FROM ivm_ticks_1h ORDER BY symbol_id;
+SELECT symbol_id, round(spiral_ohlcv_high(price)::numeric, 2) as high FROM ivm_ticks_1h ORDER BY symbol_id;

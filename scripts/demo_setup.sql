@@ -43,15 +43,15 @@ SELECT spiral_refresh('sensor_data');
 
 \echo '--- 1m rollup after refresh:'
 SELECT t, sensor_id,
-       (temperature->>'o')::double precision as temperature_ohlcv_o, (temperature->>'h')::double precision as temperature_ohlcv_h,
-       (temperature->>'l')::double precision as temperature_ohlcv_l, (temperature->>'c')::double precision as temperature_ohlcv_c,
+       spiral_ohlcv_open(temperature) as temperature_ohlcv_o, spiral_ohlcv_high(temperature) as temperature_ohlcv_h,
+       spiral_ohlcv_low(temperature) as temperature_ohlcv_l, spiral_ohlcv_close(temperature) as temperature_ohlcv_c,
        humidity, power_usage as power_usage_stats
 FROM sensor_data_1m ORDER BY t, sensor_id;
 
 \echo '--- 1h rollup after refresh:'
 SELECT t, sensor_id,
-       (temperature->>'o')::double precision as temperature_ohlcv_o, (temperature->>'h')::double precision as temperature_ohlcv_h,
-       (temperature->>'l')::double precision as temperature_ohlcv_l, (temperature->>'c')::double precision as temperature_ohlcv_c,
+       spiral_ohlcv_open(temperature) as temperature_ohlcv_o, spiral_ohlcv_high(temperature) as temperature_ohlcv_h,
+       spiral_ohlcv_low(temperature) as temperature_ohlcv_l, spiral_ohlcv_close(temperature) as temperature_ohlcv_c,
        humidity, power_usage as power_usage_stats
 FROM sensor_data_1h ORDER BY t, sensor_id;
 

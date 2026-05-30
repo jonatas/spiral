@@ -972,9 +972,11 @@ The column names are dynamically derived from the magic comments:
 
 ```sql
 SELECT t, sensor_id, 
-       temperature_ohlcv_o, temperature_ohlcv_h, 
-       temperature_ohlcv_l, temperature_ohlcv_c,
-       humidity, power_usage_stats
+       spiral_ohlcv_open(temperature) AS temperature_ohlcv_o,
+       spiral_ohlcv_high(temperature) AS temperature_ohlcv_h,
+       spiral_ohlcv_low(temperature) AS temperature_ohlcv_l,
+       spiral_ohlcv_close(temperature) AS temperature_ohlcv_c,
+       humidity, power_usage AS power_usage_stats
 FROM sensor_data_1m ORDER BY t, sensor_id;
 ```
 

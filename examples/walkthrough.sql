@@ -64,9 +64,12 @@ SELECT '--- 1 Minute Rollup Data ---' AS step;
 SELECT 
     t, 
     sensor_id, 
-    temperature_ohlcv_o, temperature_ohlcv_h, temperature_ohlcv_l, temperature_ohlcv_c,
+    spiral_ohlcv_open(temperature) as temperature_ohlcv_o,
+    spiral_ohlcv_high(temperature) as temperature_ohlcv_h,
+    spiral_ohlcv_low(temperature) as temperature_ohlcv_l,
+    spiral_ohlcv_close(temperature) as temperature_ohlcv_c,
     humidity,
-    power_usage_stats
+    power_usage as power_usage_stats
 FROM sensor_data_1m
 ORDER BY t, sensor_id;
 
