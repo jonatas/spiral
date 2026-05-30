@@ -123,7 +123,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
 pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
     rel: pg_sys::Relation,
     tid: pg_sys::ItemPointer,
-    _snapshot: pg_sys::Snapshot,
+    snapshot: pg_sys::Snapshot,
     slot: *mut pg_sys::TupleTableSlot,
 ) -> bool {
     if tid.is_null() || slot.is_null() {
@@ -133,9 +133,12 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
     let blkno = pg_sys::ItemPointerGetBlockNumber(tid);
     let posid = pg_sys::ItemPointerGetOffsetNumber(tid);
 
-    if posid < 1 || posid > crate::storage::DATA_PER_PAGE as u16 {
+    if posid < 1 || posid > crate::storage::TAM_DATA_PER_PAGE as u16 {
         return false;
     }
+
+    let page_offset = crate::storage::HEADER_SIZE as u32
+        + (posid as u32 - 1) * crate::storage::TAM_SLOT_SIZE as u32;
 
     let buffer = pg_sys::ReadBuffer(rel, blkno);
     if buffer == 0 {
@@ -147,11 +150,9 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
 
     let mut found = false;
     if crate::storage::is_valid_spiral_page(page) {
-        let offset = (crate::storage::HEADER_SIZE as u32) + (posid as u32 - 1) * 8;
-        let ptr = (page as *const u8).add(offset as usize);
-        let val = *(ptr as *const f64);
+        let tam = crate::storage::tam_read_slot(page, page_offset);
 
-        if val != 0.0 {
+        if crate::storage::tam_slot_visible(&tam, snapshot) {
             let rel_name_ptr = pg_sys::get_rel_name((*rel).rd_id);
             let mut kickoff = crate::get_kickoff_epoch();
             let mut tenant_scale = 1024;
@@ -163,23 +164,22 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
                 }
             }
 
-            let idx = (blkno as i64 * crate::storage::DATA_PER_PAGE as i64) + (posid as i64 - 1);
+            let idx =
+                (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
             let t_rel = idx / tenant_scale;
             let tenant_id = (idx % tenant_scale) as i32;
-
-            // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
-            let t_bigint = t_rel + kickoff;
+            let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
 
             pg_sys::ExecClearTuple(slot);
             let values = (*slot).tts_values;
             let isnull = (*slot).tts_isnull;
 
             if !values.is_null() && !isnull.is_null() {
-                *values.add(0) = t_bigint.into_datum().unwrap();
+                *values.add(0) = t_abs.into_datum().unwrap();
                 *isnull.add(0) = false;
                 *values.add(1) = tenant_id.into_datum().unwrap();
                 *isnull.add(1) = false;
-                *values.add(2) = val.into_datum().unwrap();
+                *values.add(2) = tam.value.into_datum().unwrap();
                 *isnull.add(2) = false;
 
                 pg_sys::ItemPointerCopy(tid, &mut (*slot).tts_tid);
@@ -202,17 +202,30 @@ pub unsafe extern "C-unwind" fn spiral_tuple_satisfies_snapshot(
     snapshot: pg_sys::Snapshot,
 ) -> bool {
     if rel.is_null() || slot.is_null() {
-        return true;
+        return false;
     }
-    let tid = std::ptr::addr_of_mut!((*slot).tts_tid);
+    let tid = &(*slot).tts_tid;
     let blkno = pg_sys::ItemPointerGetBlockNumber(tid);
     let posid = pg_sys::ItemPointerGetOffsetNumber(tid);
-    let rel_oid = u32::from((*rel).rd_id);
 
-    match crate::mvcc::check_visibility(rel_oid, blkno, posid, snapshot) {
-        Some(visible) => visible,
-        None => true, // no pending write — committed data is visible
+    if posid < 1 || posid > crate::storage::TAM_DATA_PER_PAGE as u16 {
+        return false;
     }
+
+    let page_offset = crate::storage::HEADER_SIZE as u32
+        + (posid as u32 - 1) * crate::storage::TAM_SLOT_SIZE as u32;
+
+    let buffer = pg_sys::ReadBuffer(rel, blkno);
+    if buffer == 0 {
+        return false;
+    }
+    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+    let page = pg_sys::BufferGetPage(buffer);
+    let tam = crate::storage::tam_read_slot(page, page_offset);
+    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+    pg_sys::ReleaseBuffer(buffer);
+
+    crate::storage::tam_slot_visible(&tam, snapshot)
 }
 
 #[pg_guard]
@@ -227,10 +240,9 @@ pub unsafe extern "C-unwind" fn spiral_tuple_tid_valid(
     let blkno = pg_sys::ItemPointerGetBlockNumber(tid);
     let posid = pg_sys::ItemPointerGetOffsetNumber(tid);
 
-    let nblocks =
-        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
 
-    blkno < nblocks && posid >= 1 && posid <= crate::storage::DATA_PER_PAGE as u16
+    blkno < nblocks && posid >= 1 && posid <= crate::storage::TAM_DATA_PER_PAGE as u16
 }
 
 #[pg_guard]
@@ -301,8 +313,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_estimate_size(
     let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
     *pages = nblocks;
 
-    // Each block is full (mathematically mapped)
-    *tuples = (nblocks as f64) * (crate::storage::DATA_PER_PAGE as f64);
+    *tuples = (nblocks as f64) * (crate::storage::TAM_DATA_PER_PAGE as f64);
 
     if !allvisfrac.is_null() {
         *allvisfrac = 1.0; // Everything is always visible in Spiral
@@ -383,49 +394,49 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
         let t_rel = t - kickoff;
 
         if t_rel >= 0 && (0..tenant_scale).contains(&(tid as i64)) {
-            let logical_offset = (t_rel * tenant_scale * 8) + (tid as i64 * 8);
-            let (blkno, page_offset) = crate::storage::logical_to_physical_offset(logical_offset);
+            let slot_index = t_rel * tenant_scale + tid as i64;
+            let (blkno, page_offset) = crate::storage::tam_logical_to_physical_offset(slot_index);
 
             let smgr = pg_sys::RelationGetSmgr(rel);
             let mut nblocks = pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
 
-            // 1. Initialize missing pages
+            // 1. Initialize missing pages (WAL-logged)
             while nblocks <= blkno {
+                let xlog_state = pg_sys::GenericXLogStart(rel);
                 let buffer = pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
-
-                let page = pg_sys::BufferGetPage(buffer);
+                let page = pg_sys::GenericXLogRegisterBuffer(
+                    xlog_state,
+                    buffer,
+                    pg_sys::GENERIC_XLOG_FULL_IMAGE as i32,
+                );
                 crate::storage::initialize_spiral_page(page, tenant_scale as i32);
-
                 pg_sys::MarkBufferDirty(buffer);
+                pg_sys::GenericXLogFinish(xlog_state);
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                 pg_sys::ReleaseBuffer(buffer);
                 nblocks += 1;
             }
 
-            // 2. Perform point insertion
+            // 2. Write TamSlot with current XID (WAL-logged)
+            let xmin = pg_sys::GetCurrentTransactionId().into_inner();
+            let tam = crate::storage::TamSlot {
+                value: v,
+                xmin,
+                xmax: 0,
+            };
+
+            let xlog_state = pg_sys::GenericXLogStart(rel);
             let buffer = pg_sys::ReadBuffer(rel, blkno);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+            let page = pg_sys::GenericXLogRegisterBuffer(xlog_state, buffer, 0);
+            crate::storage::tam_write_slot(page, page_offset, tam);
 
-            let page = pg_sys::BufferGetPage(buffer);
-            let ptr = (page as *mut u8).add(page_offset as usize);
-
-            // MVCC: record old value before overwriting so we can undo on abort.
-            let xid = pg_sys::GetCurrentTransactionId();
-            let old_val = *(ptr as *const f64);
-            let posid = ((page_offset - crate::storage::HEADER_SIZE as u32) / 8 + 1) as u16;
-            crate::mvcc::ensure_callback_registered();
-            crate::mvcc::record_write(u32::from((*rel).rd_id), blkno, posid, xid.into_inner(), old_val);
-
-            *(ptr as *mut f64) = v;
-
-            pg_sys::ItemPointerSet(
-                &mut (*slot).tts_tid,
-                blkno,
-                posid,
-            );
+            let posid = (slot_index % crate::storage::TAM_DATA_PER_PAGE as i64 + 1) as u16;
+            pg_sys::ItemPointerSet(&mut (*slot).tts_tid, blkno, posid);
 
             pg_sys::MarkBufferDirty(buffer);
+            pg_sys::GenericXLogFinish(xlog_state);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
             pg_sys::ReleaseBuffer(buffer);
         }
@@ -488,7 +499,7 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
     let blkno = pg_sys::ItemPointerGetBlockNumber(tid);
     let posid = pg_sys::ItemPointerGetOffsetNumber(tid); // 1-based
 
-    if posid < 1 || posid > crate::storage::DATA_PER_PAGE as u16 {
+    if posid < 1 || posid > crate::storage::TAM_DATA_PER_PAGE as u16 {
         return pg_sys::TM_Result::TM_Ok;
     }
 
@@ -497,21 +508,22 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
         return pg_sys::TM_Result::TM_Ok;
     }
 
+    let page_offset = crate::storage::HEADER_SIZE as u32
+        + (posid as u32 - 1) * crate::storage::TAM_SLOT_SIZE as u32;
+
+    let xlog_state = pg_sys::GenericXLogStart(rel);
     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
-    let page = pg_sys::BufferGetPage(buffer);
+    let page = pg_sys::GenericXLogRegisterBuffer(xlog_state, buffer, 0);
 
     if crate::storage::is_valid_spiral_page(page) {
-        let offset = (crate::storage::HEADER_SIZE as u32) + (posid as u32 - 1) * 8;
-        let ptr = (page as *mut u8).add(offset as usize);
-
-        // MVCC: record old value before zeroing so we can undo on abort.
-        let xid = pg_sys::GetCurrentTransactionId();
-        let old_val = *(ptr as *const f64);
-        crate::mvcc::ensure_callback_registered();
-        crate::mvcc::record_write(u32::from((*rel).rd_id), blkno, posid, xid.into_inner(), old_val);
-
-        *(ptr as *mut f64) = 0.0;
+        let mut tam = crate::storage::tam_read_slot(page, page_offset);
+        // Mark as deleted by current transaction; CLOG-based rollback will undo this.
+        tam.xmax = pg_sys::GetCurrentTransactionId().into_inner();
+        crate::storage::tam_write_slot(page, page_offset, tam);
         pg_sys::MarkBufferDirty(buffer);
+        pg_sys::GenericXLogFinish(xlog_state);
+    } else {
+        pg_sys::GenericXLogAbort(xlog_state);
     }
 
     pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
@@ -680,13 +692,12 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
             if crate::storage::is_valid_spiral_page(page) {
                 let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
                 let mut offset = crate::storage::HEADER_SIZE as u32;
-                while offset + 8 <= upper_bound {
-                    let ptr = (page as *const u8).add(offset as usize);
-                    let val = *(ptr as *const f64);
-                    if val != 0.0 {
+                while offset + crate::storage::TAM_SLOT_SIZE as u32 <= upper_bound {
+                    let tam = crate::storage::tam_read_slot(page, offset);
+                    if crate::storage::tam_slot_visible(&tam, std::ptr::null_mut()) {
                         n_tuples += 1.0;
                     }
-                    offset += 8;
+                    offset += crate::storage::TAM_SLOT_SIZE as u32;
                 }
             }
 
@@ -822,7 +833,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
         // Consume the time range set by the planner hook (None → full scan).
         let time_range = crate::SCAN_TIME_RANGE.with(|r| r.take());
         if let Some((ts, te)) = time_range {
-            let dpg = crate::storage::DATA_PER_PAGE as i64;
+            let dpg = crate::storage::TAM_DATA_PER_PAGE as i64;
             let ts_rel = ts - k;
             let te_rel = te - k;
 
@@ -936,34 +947,33 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
         }
 
         let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
-        while state.current_offset_in_page + 8 <= upper_bound {
-            let ptr = (page as *const u8).add(state.current_offset_in_page as usize);
-            let val = *(ptr as *const f64);
+        while state.current_offset_in_page + crate::storage::TAM_SLOT_SIZE as u32 <= upper_bound {
             let offset_in_page = state.current_offset_in_page;
-            state.current_offset_in_page += 8;
+            state.current_offset_in_page += crate::storage::TAM_SLOT_SIZE as u32;
 
-            if val != 0.0 {
-                let items_before = (offset_in_page - crate::storage::HEADER_SIZE as u32) / 8;
+            let tam = crate::storage::tam_read_slot(page, offset_in_page);
+
+            if crate::storage::tam_slot_visible(&tam, (*scan).rs_snapshot) {
+                let items_before = (offset_in_page - crate::storage::HEADER_SIZE as u32)
+                    / crate::storage::TAM_SLOT_SIZE as u32;
                 let idx = (pg_sys::BufferGetBlockNumber(buffer) as i64
-                    * crate::storage::DATA_PER_PAGE as i64)
+                    * crate::storage::TAM_DATA_PER_PAGE as i64)
                     + items_before as i64;
 
                 let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
-
-                // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
-                let t_bigint = t_rel + state.kickoff;
+                let t_abs = (t_rel + state.kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t_bigint.into_datum().unwrap();
+                    *values.add(0) = t_abs.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;
-                    *values.add(2) = val.into_datum().unwrap();
+                    *values.add(2) = tam.value.into_datum().unwrap();
                     *isnull.add(2) = false;
 
                     pg_sys::ItemPointerSet(
@@ -1092,34 +1102,33 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
         }
 
         let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
-        while state.current_offset_in_page + 8 <= upper_bound {
-            let ptr = (page as *const u8).add(state.current_offset_in_page as usize);
-            let val = *(ptr as *const f64);
-            state.current_offset_in_page += 8;
+        while state.current_offset_in_page + crate::storage::TAM_SLOT_SIZE as u32 <= upper_bound {
+            let offset_in_page = state.current_offset_in_page;
+            state.current_offset_in_page += crate::storage::TAM_SLOT_SIZE as u32;
 
-            if val != 0.0 {
-                let items_before =
-                    (state.current_offset_in_page - 8 - crate::storage::HEADER_SIZE as u32) / 8;
-                let idx = (state.current_blkno as i64 * crate::storage::DATA_PER_PAGE as i64)
+            let tam = crate::storage::tam_read_slot(page, offset_in_page);
+
+            if crate::storage::tam_slot_visible(&tam, std::ptr::null_mut()) {
+                let items_before = (offset_in_page - crate::storage::HEADER_SIZE as u32)
+                    / crate::storage::TAM_SLOT_SIZE as u32;
+                let idx = (state.current_blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64)
                     + items_before as i64;
 
                 let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
-
-                // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
                 let kickoff = crate::get_kickoff_epoch();
-                let t_bigint = t_rel + kickoff;
+                let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t_bigint.into_datum().unwrap();
+                    *values.add(0) = t_abs.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;
-                    *values.add(2) = val.into_datum().unwrap();
+                    *values.add(2) = tam.value.into_datum().unwrap();
                     *isnull.add(2) = false;
                     pg_sys::ExecStoreVirtualTuple(slot);
                 }
@@ -1281,7 +1290,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_bitmap_next_tuple(
 
         state.curr_offset_idx = 0;
         if state.tbm_res.lossy {
-            state.noffsets = crate::storage::DATA_PER_PAGE as i32;
+            state.noffsets = crate::storage::TAM_DATA_PER_PAGE as i32;
             if !lossy_pages.is_null() {
                 *lossy_pages += 1;
             }
@@ -1484,11 +1493,11 @@ mod tests {
         }).unwrap();
     }
 
-    /// P0 correctness test: proves TAM writes are NOT rolled back on ROLLBACK TO SAVEPOINT.
-    /// This asserts the CURRENT BROKEN behavior. When #65 is fixed, this test must be
-    /// updated to assert count == 0 after rollback.
+    /// MVCC correctness: ROLLBACK TO SAVEPOINT undoes a TAM INSERT via CLOG.
+    /// The INSERT gets the sub-XID as xmin; aborting the savepoint marks it aborted
+    /// in CLOG → tuple_satisfies_snapshot returns false → count == 0.
     #[pg_test]
-    fn test_tam_rollback_does_not_undo_write() {
+    fn test_tam_rollback_undoes_insert() {
         Spi::connect_mut(|client| {
             client.update(
                 "SET spiral.kickoff_date = '1970-01-01 00:00:00Z';",
@@ -1497,42 +1506,34 @@ mod tests {
             )?;
             client.update("SET spiral.warn_on_tam_writes = false;", None, &[])?;
             client.update(
-                "CREATE TABLE tam_rollback_p0 \
+                "CREATE TABLE tam_rollback_mvcc \
                  (t bigint, tenant_id int, value double precision) USING spiral;",
                 None,
                 &[],
             )?;
 
-            // Create savepoint, insert, then roll back to savepoint.
             client.update("SAVEPOINT before_insert;", None, &[])?;
             client.update(
-                "INSERT INTO tam_rollback_p0 VALUES (1, 0, 42.0);",
+                "INSERT INTO tam_rollback_mvcc VALUES (1, 0, 42.0);",
                 None,
                 &[],
             )?;
             client.update("ROLLBACK TO SAVEPOINT before_insert;", None, &[])?;
 
-            // CORRECT: count should be 0 — rollback undid the insert.
-            // ACTUAL (P0 bug): count is 1 — TAM write bypassed WAL, rollback had no effect.
-            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_rollback_p0")
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_rollback_mvcc")
                 .unwrap()
                 .unwrap();
-            assert_eq!(
-                count, 1,
-                "P0 known failure (#65): TAM INSERT not reversed by ROLLBACK TO SAVEPOINT"
-            );
+            assert_eq!(count, 0, "ROLLBACK TO SAVEPOINT must undo the TAM INSERT");
 
             Ok::<(), spi::Error>(())
         })
         .unwrap();
     }
 
-    /// P0 correctness test: proves tuple_satisfies_snapshot ignores the snapshot and
-    /// returns true for every non-zero slot. All writes are immediately visible to all
-    /// concurrent and historical snapshots. When #65 is fixed, snapshot-isolated reads
-    /// should respect transaction boundaries.
+    /// MVCC correctness: tuple_satisfies_snapshot uses CLOG XID visibility,
+    /// not val != 0.0. Committed inserts visible; aborted deletes restore tuple.
     #[pg_test]
-    fn test_tam_tuple_satisfies_snapshot_ignores_xid() {
+    fn test_tam_snapshot_uses_xid_visibility() {
         Spi::connect_mut(|client| {
             client.update(
                 "SET spiral.kickoff_date = '1970-01-01 00:00:00Z';",
@@ -1541,31 +1542,39 @@ mod tests {
             )?;
             client.update("SET spiral.warn_on_tam_writes = false;", None, &[])?;
             client.update(
-                "CREATE TABLE tam_snapshot_p0 \
+                "CREATE TABLE tam_snapshot_mvcc \
                  (t bigint, tenant_id int, value double precision) USING spiral;",
                 None,
                 &[],
             )?;
             client.update(
-                "INSERT INTO tam_snapshot_p0 VALUES (1, 0, 1.0), (2, 0, 2.0);",
+                "INSERT INTO tam_snapshot_mvcc VALUES (1, 0, 1.0), (2, 0, 2.0);",
                 None,
                 &[],
             )?;
 
-            // Both non-zero tuples are visible — tuple_satisfies_snapshot returns true
-            // unconditionally regardless of snapshot or transaction state.
-            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_snapshot_p0")
+            let count = Spi::get_one::<i64>("SELECT count(*) FROM tam_snapshot_mvcc")
                 .unwrap()
                 .unwrap();
-            assert_eq!(count, 2, "both non-zero tuples visible (no MVCC filtering)");
+            assert_eq!(count, 2, "two committed tuples must be visible");
 
-            // Even after a delete (which zeros the slot), the zeroed slot disappears —
-            // confirming visibility is purely value-based (val != 0.0), not XID-based.
-            client.update("DELETE FROM tam_snapshot_p0 WHERE t = 1;", None, &[])?;
-            let count_after = Spi::get_one::<i64>("SELECT count(*) FROM tam_snapshot_p0")
+            client.update("DELETE FROM tam_snapshot_mvcc WHERE t = 1;", None, &[])?;
+            let count_after = Spi::get_one::<i64>("SELECT count(*) FROM tam_snapshot_mvcc")
                 .unwrap()
                 .unwrap();
-            assert_eq!(count_after, 1, "deleted (zeroed) slot no longer visible");
+            assert_eq!(count_after, 1, "deleted tuple must be invisible");
+
+            // Rolled-back delete: xmax aborted → tuple reappears.
+            client.update("SAVEPOINT before_delete;", None, &[])?;
+            client.update("DELETE FROM tam_snapshot_mvcc WHERE t = 2;", None, &[])?;
+            client.update("ROLLBACK TO SAVEPOINT before_delete;", None, &[])?;
+            let count_restored = Spi::get_one::<i64>("SELECT count(*) FROM tam_snapshot_mvcc")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                count_restored, 1,
+                "rolled-back DELETE must leave tuple visible"
+            );
 
             Ok::<(), spi::Error>(())
         })
