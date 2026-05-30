@@ -167,15 +167,15 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
             let t_rel = idx / tenant_scale;
             let tenant_id = (idx % tenant_scale) as i32;
 
-            // Convert to Postgres internal timestamp (micros since 2000)
-            let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
+            // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
+            let t_bigint = t_rel + kickoff;
 
             pg_sys::ExecClearTuple(slot);
             let values = (*slot).tts_values;
             let isnull = (*slot).tts_isnull;
 
             if !values.is_null() && !isnull.is_null() {
-                *values.add(0) = t_abs.into_datum().unwrap();
+                *values.add(0) = t_bigint.into_datum().unwrap();
                 *isnull.add(0) = false;
                 *values.add(1) = tenant_id.into_datum().unwrap();
                 *isnull.add(1) = false;
@@ -197,12 +197,22 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn spiral_tuple_satisfies_snapshot(
-    _rel: pg_sys::Relation,
-    _slot: *mut pg_sys::TupleTableSlot,
-    _snapshot: pg_sys::Snapshot,
+    rel: pg_sys::Relation,
+    slot: *mut pg_sys::TupleTableSlot,
+    snapshot: pg_sys::Snapshot,
 ) -> bool {
-    // We don't implement MVCC yet, so all non-zero tuples satisfy all snapshots.
-    true
+    if rel.is_null() || slot.is_null() {
+        return true;
+    }
+    let tid = std::ptr::addr_of_mut!((*slot).tts_tid);
+    let blkno = pg_sys::ItemPointerGetBlockNumber(tid);
+    let posid = pg_sys::ItemPointerGetOffsetNumber(tid);
+    let rel_oid = u32::from((*rel).rd_id);
+
+    match crate::mvcc::check_visibility(rel_oid, blkno, posid, snapshot) {
+        Some(visible) => visible,
+        None => true, // no pending write — committed data is visible
+    }
 }
 
 #[pg_guard]
@@ -399,12 +409,20 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
 
             let page = pg_sys::BufferGetPage(buffer);
             let ptr = (page as *mut u8).add(page_offset as usize);
+
+            // MVCC: record old value before overwriting so we can undo on abort.
+            let xid = pg_sys::GetCurrentTransactionId();
+            let old_val = *(ptr as *const f64);
+            let posid = ((page_offset - crate::storage::HEADER_SIZE as u32) / 8 + 1) as u16;
+            crate::mvcc::ensure_callback_registered();
+            crate::mvcc::record_write(u32::from((*rel).rd_id), blkno, posid, xid.into_inner(), old_val);
+
             *(ptr as *mut f64) = v;
 
             pg_sys::ItemPointerSet(
                 &mut (*slot).tts_tid,
                 blkno,
-                ((page_offset - crate::storage::HEADER_SIZE as u32) / 8 + 1) as u16,
+                posid,
             );
 
             pg_sys::MarkBufferDirty(buffer);
@@ -485,6 +503,13 @@ pub unsafe extern "C-unwind" fn spiral_tuple_delete(
     if crate::storage::is_valid_spiral_page(page) {
         let offset = (crate::storage::HEADER_SIZE as u32) + (posid as u32 - 1) * 8;
         let ptr = (page as *mut u8).add(offset as usize);
+
+        // MVCC: record old value before zeroing so we can undo on abort.
+        let xid = pg_sys::GetCurrentTransactionId();
+        let old_val = *(ptr as *const f64);
+        crate::mvcc::ensure_callback_registered();
+        crate::mvcc::record_write(u32::from((*rel).rd_id), blkno, posid, xid.into_inner(), old_val);
+
         *(ptr as *mut f64) = 0.0;
         pg_sys::MarkBufferDirty(buffer);
     }
@@ -926,15 +951,15 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                 let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
-                // Convert to Postgres internal timestamp (micros since 2000)
-                let t_abs = (t_rel + state.kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
+                // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
+                let t_bigint = t_rel + state.kickoff;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t_abs.into_datum().unwrap();
+                    *values.add(0) = t_bigint.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;
@@ -1081,16 +1106,16 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 let t_rel = idx / state.tenant_scale;
                 let tenant_id = (idx % state.tenant_scale) as i32;
 
-                // Convert to Postgres internal timestamp (micros since 2000)
+                // Reconstruct t as the original Unix-seconds bigint (t_rel + kickoff)
                 let kickoff = crate::get_kickoff_epoch();
-                let t_abs = (t_rel + kickoff - crate::POSTGRES_EPOCH_JDATE) * 1_000_000;
+                let t_bigint = t_rel + kickoff;
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
                 let isnull = (*slot).tts_isnull;
 
                 if !values.is_null() && !isnull.is_null() {
-                    *values.add(0) = t_abs.into_datum().unwrap();
+                    *values.add(0) = t_bigint.into_datum().unwrap();
                     *isnull.add(0) = false;
                     *values.add(1) = tenant_id.into_datum().unwrap();
                     *isnull.add(1) = false;

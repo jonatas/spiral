@@ -110,13 +110,13 @@ BEGIN
                 v_union_sql := v_union_sql || 'SELECT t, ' || v_cols_csv || ' FROM old_table';
             END IF;
 
-            -- Collapse to one range per scope per statement.
+            -- One entry per (scope, bucket) — avoids dirty-range amplification.
             v_sql := 'INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) ' ||
-                     'SELECT $1, ' || v_json_build || ', MIN(bucket), MAX(bucket) + ' || v_bucket_secs || ' ' ||
-                     'FROM (SELECT ' || v_cols_csv || ', ' ||
+                     'SELECT $1, ' || v_json_build || ', bucket, bucket + ' || v_bucket_secs || ' ' ||
+                     'FROM (SELECT DISTINCT ' || v_cols_csv || ', ' ||
                      '      (spiral(t::timestamptz) / ' || v_bucket_secs || ') * ' || v_bucket_secs || ' AS bucket ' ||
                      '      FROM (' || v_union_sql || ') sub) sub ' ||
-                     'GROUP BY ' || v_cols_csv;
+                     'GROUP BY ' || v_cols_csv || ', bucket';
 
             EXECUTE v_sql USING v_base_view;
         END;
@@ -134,9 +134,9 @@ BEGIN
                 v_union_sql := v_union_sql || 'SELECT t FROM old_table';
             END IF;
 
-            -- Collapse to one range per statement.
+            -- One entry per bucket — avoids dirty-range amplification.
             v_sql := 'INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) ' ||
-                     'SELECT $1, ''{}''::jsonb, MIN(bucket), MAX(bucket) + ' || v_bucket_secs || ' ' ||
+                     'SELECT DISTINCT $1, ''{}''::jsonb, bucket, bucket + ' || v_bucket_secs || ' ' ||
                      'FROM (SELECT (spiral(t::timestamptz) / ' || v_bucket_secs || ') * ' || v_bucket_secs || ' AS bucket ' ||
                      '      FROM (' || v_union_sql || ') sub) sub';
 

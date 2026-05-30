@@ -414,18 +414,16 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
                 install_changelog_triggers(&name, &frames_str);
 
-                // 5. Generate the entire hierarchy automatically
-                if !validated_cols.is_empty() {
-                    notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
-                    generate_hierarchy_internal(
-                        &name,
-                        &frames_str,
-                        scope_columns,
-                        validated_cols,
-                        anchor_col,
-                        offset_cols,
-                    );
-                }
+                // 5. Generate the entire hierarchy automatically (even with no column formulas)
+                notice!("Spiral: Calling generate_hierarchy_internal for '{}'", name);
+                generate_hierarchy_internal(
+                    &name,
+                    &frames_str,
+                    scope_columns,
+                    validated_cols,
+                    anchor_col,
+                    offset_cols,
+                );
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
 
