@@ -1,15 +1,14 @@
 # Table Access Method (TAM) Audit
 
-> **⚠️ EXPERIMENTAL — NOT ACID-SAFE**
+> **⚠️ EXPERIMENTAL**
 >
-> The Spiral TAM does **not** implement MVCC, WAL-backed rollback, or snapshot
-> isolation. Writes bypass WAL and are immediately visible to all readers regardless
-> of transaction state. `ROLLBACK` and `ROLLBACK TO SAVEPOINT` do **not** undo TAM
-> writes. Do not use TAM-backed tables in production paths that require transactional
-> correctness. See [issue #65](https://github.com/jonatas/spiral/issues/65).
+> Spiral TAM implements per-slot MVCC (xmin/xmax + CLOG) and WAL-backed writes.
+> `ROLLBACK TO SAVEPOINT` correctly undoes inserts and deletes via CLOG without physical undo.
+> Snapshot isolation (`XidInMVCCSnapshot`) is implemented for read-committed semantics.
+> Concurrent update conflict detection and repeatable-read isolation are not yet fully tested.
+> See [issue #65](https://github.com/jonatas/spiral/issues/65) for the full roadmap.
 >
-> A `WARNING` is emitted on the first TAM write per session by default.
-> Set `spiral.warn_on_tam_writes = false` to suppress after acknowledging the limitation.
+> Set `spiral.warn_on_tam_writes = false` to suppress the per-session write warning.
 
 This document tracks the implementation status of all Table Access Method (TAM) callbacks registered in `src/tam.rs`.
 
@@ -81,13 +80,13 @@ This document tracks the implementation status of all Table Access Method (TAM) 
 | `tuple_fetch_row_version` | **Implemented** | Reconstructs tuple from TID and physical block. |
 | `tuple_tid_valid` | **Implemented** | Returns `true` if position is within Spiral page limits. |
 | `tuple_get_latest_tid` | **Placeholder** | No-op. |
-| `tuple_satisfies_snapshot` | **Stub (P0 bug)** | Always returns `true` — ignores snapshot entirely. All non-zero slots visible to all transactions. See issue #65. |
+| `tuple_satisfies_snapshot` | **Implemented** | CLOG-based: checks xmin committed+visible and xmax not committed/visible. Rollback via CLOG without physical undo. |
 | `scan_analyze_next_block` | **Implemented** | Returns `true` if blocks remain. |
 | `scan_analyze_next_tuple` | **Implemented** | Full block/tuple sampling for statistical analysis. |
 
 ## Summary of Missing Semantics
 
-1.  **MVCC (P0 — issue #65)**: Snapshot isolation is completely absent. `tuple_satisfies_snapshot` always returns `true`. Writes bypass WAL so `ROLLBACK` and `ROLLBACK TO SAVEPOINT` have no effect on TAM data. Updates are latest-wins. Two `pg_test` tests document these failures explicitly: `test_tam_rollback_does_not_undo_write` and `test_tam_tuple_satisfies_snapshot_ignores_xid`.
+1.  **MVCC (implemented — issue #65)**: Each slot is 16 bytes: `f64 value + u32 xmin + u32 xmax`. `tuple_satisfies_snapshot` checks CLOG visibility for xmin/xmax. Rollback works without physical undo: the INSERT sub-XID is marked aborted in CLOG and future reads skip it. WAL-logged via `GenericXLog` for crash safety.
 2.  **Non-ACID gate**: `spiral.warn_on_tam_writes = true` (default) emits a WARNING on the first TAM write per session. Set to `false` to suppress after acknowledging.
 3.  **TABLESAMPLE**: `TABLESAMPLE` clauses are currently unsupported.
 

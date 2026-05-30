@@ -18,6 +18,87 @@ pub const SPECIAL_SIZE: usize = maxalign!(std::mem::size_of::<SpiralPageOpaque>(
 pub const DATA_PER_PAGE: usize = (BLCKSZ - HEADER_SIZE - SPECIAL_SIZE) / 8;
 pub const SPIRAL_PAGE_MAGIC: u32 = 0x5049_5241;
 
+/// Slot size for TAM-backed relations: f64 value + xmin + xmax for MVCC.
+pub const TAM_SLOT_SIZE: usize = 16;
+/// Slots per page for TAM relations (uses 16-byte MVCC slots).
+pub const TAM_DATA_PER_PAGE: usize = (BLCKSZ - HEADER_SIZE - SPECIAL_SIZE) / TAM_SLOT_SIZE;
+
+/// A single tuple slot in a TAM-backed Spiral page.
+/// f64 value + inserting XID + deleting XID (0 = alive).
+/// xmin == 0 means the slot was never written.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct TamSlot {
+    pub value: f64,
+    pub xmin: u32,
+    pub xmax: u32,
+}
+
+pub fn tam_logical_to_physical_offset(slot_index: i64) -> (u32, u32) {
+    let blkno = (slot_index / TAM_DATA_PER_PAGE as i64) as u32;
+    let offset =
+        HEADER_SIZE as u32 + (slot_index % TAM_DATA_PER_PAGE as i64) as u32 * TAM_SLOT_SIZE as u32;
+    (blkno, offset)
+}
+
+pub unsafe fn tam_read_slot(page: pg_sys::Page, page_offset: u32) -> TamSlot {
+    let ptr = (page as *const u8).add(page_offset as usize) as *const TamSlot;
+    *ptr
+}
+
+pub unsafe fn tam_write_slot(page: pg_sys::Page, page_offset: u32, slot: TamSlot) {
+    let ptr = (page as *mut u8).add(page_offset as usize) as *mut TamSlot;
+    *ptr = slot;
+}
+
+/// MVCC visibility check for a TAM slot.
+/// Mirrors the essential logic of HeapTupleSatisfiesMVCC.
+pub unsafe fn tam_slot_visible(slot: &TamSlot, snapshot: pg_sys::Snapshot) -> bool {
+    if slot.xmin == 0 {
+        return false; // unwritten slot
+    }
+
+    let xmin = pg_sys::TransactionId::from(slot.xmin);
+
+    // Is the inserting transaction visible?
+    let xmin_ok = if pg_sys::TransactionIdIsCurrentTransactionId(xmin) {
+        true
+    } else if pg_sys::TransactionIdDidAbort(xmin) {
+        false
+    } else if !pg_sys::TransactionIdDidCommit(xmin) {
+        false // in-progress by another backend
+    } else if snapshot.is_null() {
+        true // committed; SnapshotNow semantics
+    } else {
+        !pg_sys::XidInMVCCSnapshot(xmin, snapshot)
+    };
+
+    if !xmin_ok {
+        return false;
+    }
+
+    if slot.xmax == 0 {
+        return true; // not deleted
+    }
+
+    let xmax = pg_sys::TransactionId::from(slot.xmax);
+
+    // Is the deleting transaction visible? (if so, tuple is dead)
+    let xmax_visible = if pg_sys::TransactionIdIsCurrentTransactionId(xmax) {
+        true
+    } else if pg_sys::TransactionIdDidAbort(xmax) {
+        false // delete was rolled back → tuple alive
+    } else if !pg_sys::TransactionIdDidCommit(xmax) {
+        false // delete in-progress by another backend → still visible to us
+    } else if snapshot.is_null() {
+        true
+    } else {
+        !pg_sys::XidInMVCCSnapshot(xmax, snapshot)
+    };
+
+    !xmax_visible
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CompressedBlock {
