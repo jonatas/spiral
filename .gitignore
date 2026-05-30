@@ -11,3 +11,5 @@ tests/pg_regress/regression.out
 /feedbacks
 .env
 vortex-ui/dist/
+node_modules/
+test-results/
