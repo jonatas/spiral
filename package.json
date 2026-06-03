@@ -9,7 +9,9 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "playwright test",
+    "test:e2e": "playwright test tests/e2e/vortex.spec.js",
+    "test:api": "playwright test tests/e2e/vortex.spec.js --grep 'Vortex API'"
   },
   "repository": {
     "type": "git",
