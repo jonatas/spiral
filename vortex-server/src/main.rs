@@ -10,11 +10,11 @@ use axum::{
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgListener, PgPoolOptions};
-use sqlx::{FromRow, Pool, Postgres, Row};
+use sqlx::{Connection, FromRow, Pool, Postgres, Row};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -167,13 +167,27 @@ struct ChangelogSummaryRow {
     oldest_age_seconds: i64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct HeartbeatConfig {
+    enabled: bool,
+    interval_s: i32,
+    samples_per_tick: i32,
+    tick_count: i64,
+    #[serde(default)]
+    shell_cmd: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "data")]
 enum VortexEvent {
     ChangelogUpdate(ChangelogEntry),
     StorageStats(StorageStats),
     SystemConfig(SystemConfig),
-    WorkerUpdate { workers: Vec<WorkerInfo>, summary: Vec<ChangelogSummaryRow> },
+    WorkerUpdate {
+        workers: Vec<WorkerInfo>,
+        summary: Vec<ChangelogSummaryRow>,
+    },
+    HeartbeatUpdate(HeartbeatConfig),
 }
 
 struct AppState {
@@ -183,6 +197,7 @@ struct AppState {
     last_worker_update: Mutex<(Vec<WorkerInfo>, Vec<ChangelogSummaryRow>)>,
     worker_target: AtomicUsize,
     worker_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    database_url: String,
 }
 
 #[tokio::main]
@@ -218,12 +233,24 @@ async fn main() {
         last_worker_update: Mutex::new((Vec::new(), Vec::new())),
         worker_target: AtomicUsize::new(0),
         worker_handles: Mutex::new(Vec::new()),
+        database_url: database_url.clone(),
     });
 
     let poll_secs = std::env::var("VORTEX_POLL_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(5);
+
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    let addr = format!("0.0.0.0:{}", port).parse::<SocketAddr>().unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("failed to bind Vortex Server on {}: {}", addr, e);
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("Vortex Server starting on {}", addr);
 
     // Start background polling task
     let polling_state = Arc::clone(&state);
@@ -260,7 +287,6 @@ async fn main() {
                             .map(|buf| buf.iter().map(|e| e.event_id).collect())
                             .unwrap_or_default();
 
-
                         if let Ok(mut buffer) = polling_state.recent_changelog.lock() {
                             for entry in &entries {
                                 if !already_sent.contains(&entry.event_id) {
@@ -287,15 +313,22 @@ async fn main() {
                     let signature = serde_json::to_string(&config).unwrap_or_default();
                     if last_config_signature.as_deref() != Some(signature.as_str()) {
                         last_config_signature = Some(signature);
-                        let _ = polling_state.tx.send(VortexEvent::SystemConfig(config.clone()));
+                        let _ = polling_state
+                            .tx
+                            .send(VortexEvent::SystemConfig(config.clone()));
                     }
 
-                    let all_view_names: Vec<String> = config.hierarchies.iter().flat_map(|h| {
-                        std::iter::once(h.raw_view_name.clone())
-                            .chain(h.aggregation_levels.iter().map(|l| l.view_name.clone()))
-                    }).collect();
+                    let all_view_names: Vec<String> = config
+                        .hierarchies
+                        .iter()
+                        .flat_map(|h| {
+                            std::iter::once(h.raw_view_name.clone())
+                                .chain(h.aggregation_levels.iter().map(|l| l.view_name.clone()))
+                        })
+                        .collect();
 
-                    let mut all_stats = load_all_storage_stats(&polling_state.pool, &all_view_names).await;
+                    let mut all_stats =
+                        load_all_storage_stats(&polling_state.pool, &all_view_names).await;
 
                     for hierarchy in &config.hierarchies {
                         for view_name in std::iter::once(&hierarchy.raw_view_name)
@@ -312,13 +345,16 @@ async fn main() {
             }
 
             // 3. Poll active workers + per-table changelog summary
+            // Include native BGW (backend_type LIKE 'Spiral Worker%') and any
+            // session-based workers (application_name LIKE 'spiral%').
             let workers: Vec<WorkerInfo> = sqlx::query(
                 "SELECT pid::int as pid,
-                        COALESCE(state, 'idle') as state,
+                        COALESCE(state, 'active') as state,
                         COALESCE(EXTRACT(EPOCH FROM (now() - query_start))::bigint * 1000, 0) AS duration_ms,
-                        COALESCE(left(query, 300), '') AS query_snippet
+                        COALESCE(left(query, 300), backend_type, '') AS query_snippet
                  FROM pg_stat_activity
-                 WHERE application_name LIKE 'spiral%'
+                 WHERE backend_type LIKE 'Spiral Worker%'
+                    OR application_name LIKE 'spiral%'
                     OR (query ILIKE '%spiral_refresh_scope%' AND state IS DISTINCT FROM 'idle')"
             )
             .fetch_all(&polling_state.pool)
@@ -350,7 +386,28 @@ async fn main() {
             if let Ok(mut wu) = polling_state.last_worker_update.lock() {
                 *wu = (workers.clone(), summary.clone());
             }
-            let _ = polling_state.tx.send(VortexEvent::WorkerUpdate { workers, summary });
+            let _ = polling_state
+                .tx
+                .send(VortexEvent::WorkerUpdate { workers, summary });
+
+            // Poll heartbeat config (table may not exist — default to disabled).
+            let hb = sqlx::query(
+                "SELECT enabled, interval_s, samples_per_tick, tick_count
+                 FROM spiral.heartbeat_config WHERE id = 1",
+            )
+            .fetch_optional(&polling_state.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| HeartbeatConfig {
+                enabled: r.get("enabled"),
+                interval_s: r.get("interval_s"),
+                samples_per_tick: r.get("samples_per_tick"),
+                tick_count: r.get("tick_count"),
+                shell_cmd: String::new(),
+            })
+            .unwrap_or_default();
+            let _ = polling_state.tx.send(VortexEvent::HeartbeatUpdate(hb));
 
             tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
         }
@@ -360,7 +417,7 @@ async fn main() {
     let notify_state = Arc::clone(&state);
     tokio::spawn(async move {
         // Create the trigger function and trigger so INSERTs notify us immediately
-        let setup = sqlx::query(
+        let create_function = sqlx::query(
             "CREATE OR REPLACE FUNCTION spiral.spiral_changelog_notify()
              RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN
@@ -368,27 +425,51 @@ async fn main() {
                  'event_id',    NEW.event_id,
                  'base_view',   NEW.base_view,
                  'scope_values', NEW.scope_values,
-                 't_start',     EXTRACT(EPOCH FROM NEW.t_start)::bigint,
-                 't_end',       EXTRACT(EPOCH FROM NEW.t_end)::bigint
+                 't_start',     NEW.t_start,
+                 't_end',       NEW.t_end
                )::text);
                RETURN NEW;
              END;
-             $$;
-             DROP TRIGGER IF EXISTS changelog_notify_trigger ON spiral.changelog;
-             CREATE TRIGGER changelog_notify_trigger
-               AFTER INSERT ON spiral.changelog
-               FOR EACH ROW EXECUTE FUNCTION spiral.spiral_changelog_notify();",
+             $$;",
         )
         .execute(&notify_state.pool)
         .await;
 
-        if let Err(e) = setup {
+        if let Err(e) = create_function {
+            tracing::warn!(
+                "pg_notify trigger function setup failed (falling back to polling): {}",
+                e
+            );
+            return;
+        }
+
+        if let Err(e) =
+            sqlx::query("DROP TRIGGER IF EXISTS changelog_notify_trigger ON spiral.changelog")
+                .execute(&notify_state.pool)
+                .await
+        {
+            tracing::warn!(
+                "pg_notify trigger cleanup failed (falling back to polling): {}",
+                e
+            );
+            return;
+        }
+
+        if let Err(e) = sqlx::query(
+            "CREATE TRIGGER changelog_notify_trigger
+             AFTER INSERT ON spiral.changelog
+             FOR EACH ROW EXECUTE FUNCTION spiral.spiral_changelog_notify()",
+        )
+        .execute(&notify_state.pool)
+        .await
+        {
             tracing::warn!(
                 "pg_notify trigger setup failed (falling back to polling): {}",
                 e
             );
             return;
         }
+
         tracing::info!("pg_notify trigger installed on spiral.changelog");
 
         let mut listener = match PgListener::connect_with(&notify_state.pool).await {
@@ -443,14 +524,11 @@ async fn main() {
         .route("/api/slice/{view_name}", get(get_slice_data))
         .route("/api/explain", post(run_explain))
         .route("/api/workers", get(get_workers).post(set_workers))
+        .route("/api/heartbeat", get(get_heartbeat).post(set_heartbeat))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
-    let addr = format!("0.0.0.0:{}", port).parse::<SocketAddr>().unwrap();
-    tracing::info!("Vortex Server starting on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -663,7 +741,10 @@ async fn get_pagemap(
     Path(name): Path<String>,
 ) -> Result<Json<Vec<PageTimeRange>>, (axum::http::StatusCode, String)> {
     if !valid_identifier(&name) {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid view name".into()));
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid view name".into(),
+        ));
     }
 
     let meta_row =
@@ -700,7 +781,10 @@ async fn get_pagemap(
 
     let time_col = time_col.unwrap_or_else(|| "t".to_string());
     if !valid_identifier(&time_col) {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid time column".into()));
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid time column".into(),
+        ));
     }
 
     let sql = format!(
@@ -823,10 +907,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
 
         // Batch all storage stats in one round-trip.
-        let all_view_names: Vec<String> = config.hierarchies.iter().flat_map(|h| {
-            std::iter::once(h.raw_view_name.clone())
-                .chain(h.aggregation_levels.iter().map(|l| l.view_name.clone()))
-        }).collect();
+        let all_view_names: Vec<String> = config
+            .hierarchies
+            .iter()
+            .flat_map(|h| {
+                std::iter::once(h.raw_view_name.clone())
+                    .chain(h.aggregation_levels.iter().map(|l| l.view_name.clone()))
+            })
+            .collect();
 
         let mut all_stats = load_all_storage_stats(&state.pool, &all_view_names).await;
 
@@ -850,6 +938,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         serde_json::to_string(&VortexEvent::WorkerUpdate { workers, summary }).ok()
     });
     if let Some(msg) = worker_update_msg {
+        let _ = sender.send(Message::Text(msg.into())).await;
+    }
+
+    // Send initial heartbeat config
+    let hb = sqlx::query(
+        "SELECT enabled, interval_s, samples_per_tick, tick_count
+         FROM spiral.heartbeat_config WHERE id = 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|r| HeartbeatConfig {
+        enabled: r.get("enabled"),
+        interval_s: r.get("interval_s"),
+        samples_per_tick: r.get("samples_per_tick"),
+        tick_count: r.get("tick_count"),
+        shell_cmd: String::new(),
+    })
+    .unwrap_or_default();
+    if let Ok(msg) = serde_json::to_string(&VortexEvent::HeartbeatUpdate(hb)) {
         let _ = sender.send(Message::Text(msg.into())).await;
     }
 
@@ -924,7 +1033,11 @@ async fn load_all_storage_stats(
         let reltuples: f64 = row.try_get("reltuples").unwrap_or(-1.0);
         if let Some(stats) = stats_val {
             if let Ok(mut s) = serde_json::from_value::<StorageStats>(stats) {
-                s.row_count = if reltuples < 0.0 { s.total_rows_capacity } else { reltuples as i64 };
+                s.row_count = if reltuples < 0.0 {
+                    s.total_rows_capacity
+                } else {
+                    reltuples as i64
+                };
                 s.view_name = relname.clone();
                 result.insert(relname, s);
             }
@@ -939,17 +1052,25 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
 
     let mut metadata_by_base: BTreeMap<String, Vec<Metadata>> = BTreeMap::new();
     for view in metadata {
-        metadata_by_base.entry(view.base_view.clone()).or_default().push(view);
+        metadata_by_base
+            .entry(view.base_view.clone())
+            .or_default()
+            .push(view);
     }
     for views in metadata_by_base.values_mut() {
-        views.sort_by(|a, b| a.frame_seconds.cmp(&b.frame_seconds).then_with(|| a.view_name.cmp(&b.view_name)));
+        views.sort_by(|a, b| {
+            a.frame_seconds
+                .cmp(&b.frame_seconds)
+                .then_with(|| a.view_name.cmp(&b.view_name))
+        });
     }
 
     // Collect raw view names, then fetch all storage stats in one round-trip.
     let raw_view_names: Vec<String> = metadata_by_base
         .iter()
         .map(|(base_view, views)| {
-            views.iter()
+            views
+                .iter()
                 .find(|v| v.view_name == *base_view || v.frame_seconds == 0)
                 .or_else(|| views.first())
                 .map(|v| v.view_name.clone())
@@ -960,7 +1081,10 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
 
     let mut sources_by_base: BTreeMap<String, Vec<SourceInfo>> = BTreeMap::new();
     for source in sources {
-        sources_by_base.entry(source.base_view.clone()).or_default().push(source);
+        sources_by_base
+            .entry(source.base_view.clone())
+            .or_default()
+            .push(source);
     }
 
     let mut hierarchies = Vec::new();
@@ -971,9 +1095,17 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
             .cloned()
             .or_else(|| views.first().cloned());
 
-        let raw_view_name = raw_view.as_ref().map(|v| v.view_name.clone()).unwrap_or_else(|| base_view.clone());
-        let time_column = raw_view.as_ref()
-            .and_then(|v| v.columns_metadata.get("time_column").and_then(|tc| tc.as_str()))
+        let raw_view_name = raw_view
+            .as_ref()
+            .map(|v| v.view_name.clone())
+            .unwrap_or_else(|| base_view.clone());
+        let time_column = raw_view
+            .as_ref()
+            .and_then(|v| {
+                v.columns_metadata
+                    .get("time_column")
+                    .and_then(|tc| tc.as_str())
+            })
             .unwrap_or("t")
             .to_string();
 
@@ -982,8 +1114,12 @@ async fn load_system_config(pool: &Pool<Postgres>) -> Result<SystemConfig, sqlx:
             .map(|s| (s.tenant_scale, s.kickoff_epoch))
             .unwrap_or((1024, 0));
 
-        let aggregation_levels = views.iter()
-            .map(|view| AggregationLevel { frame_seconds: view.frame_seconds, view_name: view.view_name.clone() })
+        let aggregation_levels = views
+            .iter()
+            .map(|view| AggregationLevel {
+                frame_seconds: view.frame_seconds,
+                view_name: view.view_name.clone(),
+            })
             .collect();
 
         hierarchies.push(HierarchyConfig {
@@ -1099,57 +1235,157 @@ async fn get_slice_data(
 }
 
 async fn get_workers(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let count = state.worker_handles.lock().unwrap()
-        .iter().filter(|h| !h.is_finished()).count();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'Spiral Worker%'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
     Json(serde_json::json!({ "count": count }))
 }
 
 #[derive(Deserialize)]
-struct SetWorkersRequest { count: usize }
+struct SetWorkersRequest {
+    count: usize,
+}
 
 async fn set_workers(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SetWorkersRequest>,
 ) -> Json<serde_json::Value> {
-    let target = payload.count.min(8);
+    let target = payload.count.min(16);
     state.worker_target.store(target, Ordering::Relaxed);
 
-    let mut handles = state.worker_handles.lock().unwrap();
-
-    // Abort excess workers
-    while handles.len() > target {
-        handles.pop().unwrap().abort();
+    // Abort any old Rust worker handles (legacy)
+    {
+        let mut handles = state.worker_handles.lock().unwrap();
+        handles.iter().for_each(|h| h.abort());
+        handles.clear();
     }
 
-    // Spawn new workers
-    let needed = target.saturating_sub(handles.len());
-    let new_handles: Vec<_> = (0..needed).map(|_| {
-        let pool = state.pool.clone();
-        tokio::spawn(async move {
-            loop {
-                let tables_res = sqlx::query_scalar::<_, String>(
-                    "SELECT DISTINCT base_view FROM spiral.changelog LIMIT 9"
-                )
-                .fetch_all(&pool)
-                .await;
+    let current: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'Spiral Worker%'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
 
-                if let Ok(tables) = tables_res {
-                    for table in tables {
-                        let _ = sqlx::query(&format!(
-                            "SELECT spiral_refresh('{}')", table
-                        ))
-                        .execute(&pool)
+    // Update GUC and reload so BGW picks up new max_workers
+    let _ = sqlx::query(&format!("ALTER SYSTEM SET spiral.max_workers = {}", target))
+        .execute(&state.pool)
+        .await;
+    let _ = sqlx::query("SELECT pg_reload_conf()")
+        .execute(&state.pool)
+        .await;
+
+    // Scale up: spawn ephemeral connections to trigger maybe_start_worker() per new slot
+    if (target as i64) > current {
+        let needed = (target as i64 - current) as usize;
+        let db_url = state.database_url.clone();
+        for _ in 0..needed {
+            let db_url = db_url.clone();
+            tokio::spawn(async move {
+                if let Ok(mut conn) = sqlx::postgres::PgConnection::connect(&db_url).await {
+                    // Any query on a spiral table triggers maybe_start_worker()
+                    let _ = sqlx::query("SELECT 1 FROM spiral.metadata LIMIT 1")
+                        .execute(&mut conn)
                         .await;
-                    }
+                    // conn drops here — session closes, BGW keeps running independently
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        })
-    }).collect();
+            });
+        }
+    }
 
-    handles.extend(new_handles);
-    let active = handles.iter().filter(|h| !h.is_finished()).count();
+    // Scale down: terminate excess BGW processes
+    if (target as i64) < current {
+        let excess = current - target as i64;
+        let _ = sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE backend_type LIKE 'Spiral Worker: spiral_demo%'
+             ORDER BY pid DESC
+             LIMIT $1",
+        )
+        .bind(excess)
+        .execute(&state.pool)
+        .await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'Spiral Worker%'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
     Json(serde_json::json!({ "count": active }))
+}
+
+async fn get_heartbeat(State(state): State<Arc<AppState>>) -> Json<HeartbeatConfig> {
+    let hb = sqlx::query(
+        "SELECT enabled, interval_s, samples_per_tick, tick_count
+         FROM spiral.heartbeat_config WHERE id = 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|r| HeartbeatConfig {
+        enabled: r.get("enabled"),
+        interval_s: r.get("interval_s"),
+        samples_per_tick: r.get("samples_per_tick"),
+        tick_count: r.get("tick_count"),
+        shell_cmd: String::new(),
+    })
+    .unwrap_or_default();
+    Json(hb)
+}
+
+#[derive(Deserialize)]
+struct SetHeartbeatRequest {
+    enabled: bool,
+    interval_s: i32,
+    samples_per_tick: i32,
+}
+
+async fn set_heartbeat(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SetHeartbeatRequest>,
+) -> Json<HeartbeatConfig> {
+    let shell_cmd = if payload.enabled {
+        sqlx::query_scalar::<_, String>("SELECT spiral.enable_heartbeat($1, $2)")
+            .bind(payload.interval_s)
+            .bind(payload.samples_per_tick)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        let _ = sqlx::query("SELECT spiral.disable_heartbeat()")
+            .execute(&state.pool)
+            .await;
+        String::new()
+    };
+
+    // Read back actual tick_count after the update
+    let tick_count =
+        sqlx::query_scalar::<_, i64>("SELECT tick_count FROM spiral.heartbeat_config WHERE id = 1")
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+    let hb = HeartbeatConfig {
+        enabled: payload.enabled,
+        interval_s: payload.interval_s,
+        samples_per_tick: payload.samples_per_tick,
+        tick_count,
+        shell_cmd,
+    };
+    let _ = state.tx.send(VortexEvent::HeartbeatUpdate(hb.clone()));
+    Json(hb)
 }
 
 #[derive(Deserialize)]

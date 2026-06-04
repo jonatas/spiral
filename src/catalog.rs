@@ -418,7 +418,7 @@ pub fn remove_table_from_spiral(table_name: &str) {
     // can DROP the actual PG tables. The hierarchy tables have no PG dependency
     // on the base table, so DROP TABLE base CASCADE won't reach them.
     let hierarchy_tables: Vec<String> = Spi::connect(|client| {
-        Ok(client
+        Ok::<Vec<String>, spi::Error>(client
             .select(
                 &format!(
                     "SELECT view_name FROM spiral.metadata \

@@ -7,7 +7,7 @@ edition = "2024"
 console_error_panic_hook = "0.1.7"
 futures-util = "0.3.32"
 gloo-net = "0.7.0"
-gloo-timers = "0.4.0"
+gloo-timers = { version = "0.4.0", features = ["futures"] }
 leptos = { version = "0.8.19", features = ["csr", "nightly"] }
 leptos_router = "0.8.13"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -202,8 +202,128 @@
                 border-color: color-mix(in srgb, var(--blue) 40%, transparent);
                 background: color-mix(in srgb, var(--blue) 12%, transparent);
             }
+            .ltab-hb-on {
+                color: #22c55e;
+                border-color: color-mix(in srgb, #22c55e 35%, transparent);
+            }
             .left-tab-content { flex: 1; overflow-y: auto; min-height: 0; }
             .calc-panel { display: flex; flex-direction: column; gap: 4px; }
+
+            /* ─── HEARTBEAT PANEL ─────────────────────── */
+            .hb-panel { display: flex; flex-direction: column; gap: 8px; }
+            .hb-status-row {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 11px;
+            }
+            .hb-dot { font-size: 12px; }
+            .hb-active  { color: #22c55e; }
+            .hb-inactive { color: var(--muted); }
+            .hb-status-text { font-weight: 600; letter-spacing: 0.5px; color: var(--text); }
+            .hb-tick-count  { color: var(--muted); font-size: 10px; }
+
+            .hb-slider-row {
+                display: grid;
+                grid-template-columns: 56px 1fr 30px;
+                align-items: center;
+                gap: 6px;
+                font-size: 11px;
+            }
+            .hb-label { color: var(--muted); }
+            .hb-range { width: 100%; accent-color: var(--blue); cursor: pointer; }
+            .hb-slider-val { color: var(--text); font-size: 11px; text-align: right; }
+
+            .hb-throughput {
+                font-size: 10px;
+                color: #22c55e;
+                background: color-mix(in srgb, #22c55e 8%, transparent);
+                border: 1px solid color-mix(in srgb, #22c55e 25%, transparent);
+                border-radius: 4px;
+                padding: 4px 7px;
+            }
+
+            .hb-btn {
+                width: 100%;
+                padding: 6px 0;
+                font-size: 11px;
+                font-weight: 600;
+                border-radius: 4px;
+                cursor: pointer;
+                letter-spacing: 0.3px;
+                transition: opacity 0.15s;
+            }
+            .hb-btn:hover { opacity: 0.85; }
+            .hb-btn-enable {
+                background: color-mix(in srgb, #22c55e 18%, transparent);
+                border: 1px solid color-mix(in srgb, #22c55e 45%, transparent);
+                color: #22c55e;
+            }
+            .hb-btn-disable {
+                background: color-mix(in srgb, var(--red) 15%, transparent);
+                border: 1px solid color-mix(in srgb, var(--red) 40%, transparent);
+                color: var(--red);
+            }
+
+            .hb-cmd-section {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            .hb-cmd-label { font-size: 10px; color: var(--muted); }
+            .hb-cmd {
+                font-size: 10px;
+                background: #0d1117;
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                padding: 6px 8px;
+                white-space: pre-wrap;
+                word-break: break-all;
+                color: var(--green);
+                margin: 0;
+            }
+            .hb-copy-btn {
+                align-self: flex-end;
+                font-size: 10px;
+                padding: 3px 8px;
+                background: transparent;
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                color: var(--muted);
+                cursor: pointer;
+            }
+            .hb-copy-btn:hover { color: var(--text); border-color: var(--text); }
+
+            .hb-setup {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                padding: 6px 0;
+                border-top: 1px solid var(--border);
+            }
+            .hb-setup-title { font-size: 10px; color: var(--muted); margin: 0; font-weight: 600; }
+            .hb-setup-cmd {
+                font-size: 9.5px;
+                background: #0d1117;
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                padding: 5px 7px;
+                white-space: pre;
+                color: var(--muted);
+                margin: 0;
+            }
+            .hb-docs-hint {
+                font-size: 9.5px;
+                color: var(--muted);
+                margin: 0;
+                line-height: 1.4;
+            }
+            .hb-docs-hint code {
+                background: color-mix(in srgb, var(--border) 50%, transparent);
+                padding: 1px 3px;
+                border-radius: 3px;
+                font-size: 9px;
+            }
 
             /* ─── HIERARCHY TREE ──────────────────────── */
             .tree { display: flex; flex-direction: column; gap: 1px; }

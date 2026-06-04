@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
 use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
+use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -80,13 +81,27 @@ struct ChangelogSummaryRow {
     oldest_age_seconds: i64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+struct HeartbeatConfig {
+    enabled: bool,
+    interval_s: i32,
+    samples_per_tick: i32,
+    tick_count: i64,
+    #[serde(default)]
+    shell_cmd: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", content = "data")]
 enum VortexEvent {
     ChangelogUpdate(ChangelogEntry),
     StorageStats(StorageStats),
     SystemConfig(SystemConfig),
-    WorkerUpdate { workers: Vec<WorkerInfo>, summary: Vec<ChangelogSummaryRow> },
+    WorkerUpdate {
+        workers: Vec<WorkerInfo>,
+        summary: Vec<ChangelogSummaryRow>,
+    },
+    HeartbeatUpdate(HeartbeatConfig),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -238,9 +253,8 @@ fn format_age(seconds: i64) -> String {
 
 // High-contrast palette for dark background (#0d1117), all ≥ 4.5:1 contrast ratio
 const TABLE_PALETTE: &[&str] = &[
-    "#3fb950", "#58a6ff", "#ff7b72", "#d2a8ff", "#ffa657",
-    "#79c0ff", "#56d364", "#e3b341", "#f778ba", "#40c4ff",
-    "#ff9800", "#b39ddb", "#00e5ff", "#69ff47", "#ff4081",
+    "#3fb950", "#58a6ff", "#ff7b72", "#d2a8ff", "#ffa657", "#79c0ff", "#56d364", "#e3b341",
+    "#f778ba", "#40c4ff", "#ff9800", "#b39ddb", "#00e5ff", "#69ff47", "#ff4081",
 ];
 
 fn palette_index(base_view: &str) -> usize {
@@ -257,17 +271,28 @@ fn default_table_color(base_view: &str) -> String {
 }
 
 fn resolve_table_color(base_view: &str, overrides: &BTreeMap<String, String>) -> String {
-    overrides.get(base_view).cloned().unwrap_or_else(|| default_table_color(base_view))
+    overrides
+        .get(base_view)
+        .cloned()
+        .unwrap_or_else(|| default_table_color(base_view))
 }
 
 fn hex_luminance(hex: &str) -> f64 {
     let h = hex.trim_start_matches('#');
-    if h.len() < 6 { return 0.0; }
+    if h.len() < 6 {
+        return 0.0;
+    }
     let parse = |s: &str| u8::from_str_radix(s, 16).unwrap_or(0) as f64 / 255.0;
     let r = parse(&h[0..2]);
     let g = parse(&h[2..4]);
     let b = parse(&h[4..6]);
-    let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let lin = |c: f64| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
     0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 }
 
@@ -807,31 +832,51 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
     // Falls back to 48 (the MAXALIGN-correct value for a 3-col IoT schema)
     let heap_bpr = move || {
         let s = stats.get();
-        if s.heap_bytes_per_row > 0.0 { s.heap_bytes_per_row } else { 48.0 }
+        if s.heap_bytes_per_row > 0.0 {
+            s.heap_bytes_per_row
+        } else {
+            48.0
+        }
     };
 
     // XOR-Block bytes/row: BLOCK_SIZE / VALUES_PER_XOR_BLOCK = 128 / 61
     // Derived from CompressedBlock struct on the server, not hardcoded here
     let xor_bpr = move || {
         let s = stats.get();
-        if s.xor_bytes_per_row > 0.0 { s.xor_bytes_per_row } else { 128.0 / 61.0 }
+        if s.xor_bytes_per_row > 0.0 {
+            s.xor_bytes_per_row
+        } else {
+            128.0 / 61.0
+        }
     };
 
     let spiral_rows_per_page = move || {
         let s = stats.get();
-        if s.data_per_page > 0 { s.data_per_page as f64 } else { 1018.0 }
+        if s.data_per_page > 0 {
+            s.data_per_page as f64
+        } else {
+            1018.0
+        }
     };
 
     // Heap rows/page: (BLCKSZ - PageHeaderData) / (tuple_size + ItemId)
     let heap_rows_per_page = move || {
         let s = stats.get();
-        if s.heap_rows_per_page > 0.0 { s.heap_rows_per_page } else { 8168.0 / (heap_bpr() + 4.0) }
+        if s.heap_rows_per_page > 0.0 {
+            s.heap_rows_per_page
+        } else {
+            8168.0 / (heap_bpr() + 4.0)
+        }
     };
 
     // XOR rows/page: (DATA_PER_PAGE / 16 slots/block) × 61 values/block = 3843
     let xor_rows_per_page = move || {
         let s = stats.get();
-        if s.xor_rows_per_page > 0.0 { s.xor_rows_per_page } else { (1018.0_f64 / 16.0).floor() * 61.0 }
+        if s.xor_rows_per_page > 0.0 {
+            s.xor_rows_per_page
+        } else {
+            (1018.0_f64 / 16.0).floor() * 61.0
+        }
     };
 
     view! {
@@ -913,15 +958,25 @@ fn SavingsCalculatorPanel(stats: Signal<StorageStats>) -> impl IntoView {
         let s = stats.get();
         if s.total_rows_capacity > 0 && s.spiral_size_kb > 0 {
             (s.spiral_size_kb * 1024) as f64 / s.total_rows_capacity as f64
-        } else { 8.0 }
+        } else {
+            8.0
+        }
     };
     let heap_bpr = move || {
         let s = stats.get();
-        if s.heap_bytes_per_row > 0.0 { s.heap_bytes_per_row } else { 48.0 }
+        if s.heap_bytes_per_row > 0.0 {
+            s.heap_bytes_per_row
+        } else {
+            48.0
+        }
     };
     let xor_bpr = move || {
         let s = stats.get();
-        if s.xor_bytes_per_row > 0.0 { s.xor_bytes_per_row } else { 2.1 }
+        if s.xor_bytes_per_row > 0.0 {
+            s.xor_bytes_per_row
+        } else {
+            2.1
+        }
     };
 
     view! {
@@ -1630,29 +1685,40 @@ fn DataTable(slice: SliceResponse) -> impl IntoView {
     };
     let time_col = slice.time_col.clone();
     let scope_col = slice.scope_col.clone();
-    let mut keys: Vec<String> = obj.keys()
+    let mut keys: Vec<String> = obj
+        .keys()
         .filter(|k| k.as_str() != "t_epoch")
         .cloned()
         .collect();
     keys.sort_by_key(|k| {
-        if k == &time_col { (0, k.clone()) }
-        else if k == &scope_col { (1, k.clone()) }
-        else { (2, k.clone()) }
+        if k == &time_col {
+            (0, k.clone())
+        } else if k == &scope_col {
+            (1, k.clone())
+        } else {
+            (2, k.clone())
+        }
     });
 
     // Detect column types by scanning all rows
     let mut col_is_bool: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut col_is_int: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for k in &keys {
-        if k == &time_col { continue; }
+        if k == &time_col {
+            continue;
+        }
         let mut all_bool = true;
         let mut all_int = true;
         let mut any_num = false;
         for row in &rows {
             if let Some(f) = row.get(k).and_then(|v| v.as_f64()) {
                 any_num = true;
-                if f != 0.0 && f != 1.0 { all_bool = false; }
-                if f.fract() != 0.0 { all_int = false; }
+                if f != 0.0 && f != 1.0 {
+                    all_bool = false;
+                }
+                if f.fract() != 0.0 {
+                    all_int = false;
+                }
             }
         }
         col_is_bool.insert(k.clone(), any_num && all_bool);
@@ -2081,12 +2147,12 @@ fn MultiTierPageMap(
 
     let cell_px = |fs: i32| -> usize {
         match fs {
-            0             => 4,
-            1..=599       => 5,
-            600..=7199    => 7,
+            0 => 4,
+            1..=599 => 5,
+            600..=7199 => 7,
             7200..=172799 => 10,
             172800..=2591999 => 14,
-            _             => 20,
+            _ => 20,
         }
     };
 
@@ -2201,6 +2267,209 @@ fn MultiTierPageMap(
 }
 
 #[component]
+fn HeartbeatPanel(
+    heartbeat: RwSignal<HeartbeatConfig>,
+    config: RwSignal<SystemConfig>,
+    api_base: Arc<String>,
+) -> impl IntoView {
+    let local_interval = RwSignal::new(1i32);
+    let local_samples = RwSignal::new(1i32);
+    let show_setup = RwSignal::new(false);
+
+    // Sync sliders to server state when it arrives
+    Effect::new(move |_| {
+        let hb = heartbeat.get();
+        local_interval.set(hb.interval_s.max(1));
+        local_samples.set(hb.samples_per_tick.max(1));
+    });
+
+    let throughput = Memo::new(move |_| {
+        let total: i64 = config
+            .get()
+            .hierarchies
+            .iter()
+            .map(|h| h.tenant_scale)
+            .sum();
+        (total as f64 * local_samples.get() as f64) / local_interval.get() as f64
+    });
+
+    // Shell command: prefer what the server returned, else compute locally
+    let shell_cmd = Memo::new(move |_| {
+        let hb = heartbeat.get();
+        let n = local_samples.get();
+        let s = local_interval.get();
+        if !hb.shell_cmd.is_empty() {
+            hb.shell_cmd.clone()
+        } else {
+            format!("while true; do psql -c \"SELECT spiral.tick({n});\"; sleep {s}; done")
+        }
+    });
+
+    let api_enable = Arc::clone(&api_base);
+    let api_disable = Arc::clone(&api_base);
+
+    let do_enable = Arc::new(move || {
+        let url = format!("{}/api/heartbeat", api_enable);
+        let iv = local_interval.get_untracked();
+        let sp = local_samples.get_untracked();
+        let hb_sig = heartbeat;
+        show_setup.set(true);
+        leptos::task::spawn_local(async move {
+            let body = format!(r#"{{"enabled":true,"interval_s":{iv},"samples_per_tick":{sp}}}"#);
+            if let Ok(req) = gloo_net::http::Request::post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                && let Ok(resp) = req.send().await
+                && let Ok(cfg) = resp.json::<HeartbeatConfig>().await
+            {
+                hb_sig.set(cfg);
+            }
+        });
+    });
+
+    let do_disable = Arc::new(move || {
+        let url = format!("{}/api/heartbeat", api_disable);
+        let hb_sig = heartbeat;
+        show_setup.set(false);
+        leptos::task::spawn_local(async move {
+            let body = r#"{"enabled":false,"interval_s":1,"samples_per_tick":1}"#;
+            if let Ok(req) = gloo_net::http::Request::post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                && let Ok(resp) = req.send().await
+                && let Ok(cfg) = resp.json::<HeartbeatConfig>().await
+            {
+                hb_sig.set(cfg);
+            }
+        });
+    });
+
+    view! {
+        <div class="hb-panel">
+            <div class="panel-hdr">"HEARTBEAT"</div>
+
+            // ── Status ──────────────────────────────────────────────────
+            <div class="hb-status-row">
+                {move || {
+                    let hb = heartbeat.get();
+                    if hb.enabled {
+                        view! {
+                            <span class="hb-dot hb-active">"●"</span>
+                            <span class="hb-status-text">"ACTIVE"</span>
+                            <span class="hb-tick-count">{move || format!("{} ticks", heartbeat.get().tick_count)}</span>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <span class="hb-dot hb-inactive">"●"</span>
+                            <span class="hb-status-text">"DISABLED"</span>
+                        }.into_any()
+                    }
+                }}
+            </div>
+
+            // ── Sliders ─────────────────────────────────────────────────
+            <div class="hb-slider-row">
+                <label class="hb-label">"Interval"</label>
+                <input type="range" min="1" max="10" class="hb-range"
+                    prop:value=move || local_interval.get()
+                    on:input=move |ev| {
+                        if let Ok(v) = event_target_value(&ev).parse::<i32>() { local_interval.set(v); }
+                    }
+                />
+                <span class="hb-slider-val">{move || format!("{}s", local_interval.get())}</span>
+            </div>
+            <div class="hb-slider-row">
+                <label class="hb-label">"Samples"</label>
+                <input type="range" min="1" max="20" class="hb-range"
+                    prop:value=move || local_samples.get()
+                    on:input=move |ev| {
+                        if let Ok(v) = event_target_value(&ev).parse::<i32>() { local_samples.set(v); }
+                    }
+                />
+                <span class="hb-slider-val">{move || local_samples.get().to_string()}</span>
+            </div>
+
+            // ── Throughput ──────────────────────────────────────────────
+            <div class="hb-throughput">
+                {move || {
+                    let tp = throughput.get();
+                    let tables = config.get().hierarchies.len();
+                    if tables == 0 {
+                        "no tables — load demo first".to_string()
+                    } else {
+                        format!("~{:.0} rows/s across {} tables", tp, tables)
+                    }
+                }}
+            </div>
+
+            // ── Action button ───────────────────────────────────────────
+            {move || {
+                if heartbeat.get().enabled {
+                    let do_disable = Arc::clone(&do_disable);
+                    view! {
+                        <button class="hb-btn hb-btn-disable" on:click=move |_| do_disable()>
+                            "Disable heartbeat"
+                        </button>
+                    }.into_any()
+                } else {
+                    let do_enable = Arc::clone(&do_enable);
+                    view! {
+                        <button class="hb-btn hb-btn-enable" on:click=move |_| do_enable()>
+                            "Enable heartbeat"
+                        </button>
+                    }.into_any()
+                }
+            }}
+
+            // ── Shell command (visible once enabled or after clicking Enable) ──
+            {move || {
+                let hb = heartbeat.get();
+                if hb.enabled || show_setup.get() {
+                    let cmd = shell_cmd.get();
+                    let cmd_copy = shell_cmd;
+                    view! {
+                        <div class="hb-cmd-section">
+                            <div class="hb-cmd-label">"Run in your shell:"</div>
+                            <pre class="hb-cmd">{cmd}</pre>
+                            <button class="hb-copy-btn" on:click=move |_| {
+                                let text = cmd_copy.get_untracked();
+                                // Use js_sys::eval to call clipboard API without extra web_sys features
+                                let escaped = text.replace('`', "\\`");
+                                let _ = js_sys::eval(&format!(
+                                    "navigator.clipboard.writeText(`{escaped}`).catch(()=>{{}})"
+                                ));
+                            }>"📋 Copy"</button>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! { <span/> }.into_any()
+                }
+            }}
+
+            // ── Setup instructions (disabled + not yet clicked Enable) ──
+            {move || {
+                let hb = heartbeat.get();
+                if !hb.enabled && !show_setup.get() {
+                    view! {
+                        <div class="hb-setup">
+                            <p class="hb-setup-title">"Setup:"</p>
+                            <pre class="hb-setup-cmd">"\\i examples/multi_domain_demo_light.sql\n\\i examples/multi_domain_demo_light_emulator.sql\nSELECT spiral.bootstrap(60);"</pre>
+                            <p class="hb-docs-hint">
+                                "See "
+                                <code>"examples/multi_domain_demo_light_emulator.sql"</code>
+                                " for full docs."
+                            </p>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! { <span/> }.into_any()
+                }
+            }}
+        </div>
+    }
+}
+
+#[component]
 fn App() -> impl IntoView {
     let stats_by_view = RwSignal::new(BTreeMap::<String, StorageStats>::new());
     let config = RwSignal::new(SystemConfig::default());
@@ -2230,7 +2499,12 @@ fn App() -> impl IntoView {
     let table_colors = RwSignal::new(BTreeMap::<String, String>::new());
     let selected_tenant = RwSignal::new(Option::<i32>::None);
     let suppress_tier_clear = RwSignal::new(false);
-    let left_tab = RwSignal::new(0u8); // 0=hierarchy 1=storage 2=calc
+    let left_tab = RwSignal::new(0u8); // 0=hierarchy 1=storage 2=calc 3=heartbeat
+    let heartbeat_config = RwSignal::new(HeartbeatConfig {
+        interval_s: 1,
+        samples_per_tick: 1,
+        ..Default::default()
+    });
     let auto_explain = RwSignal::new({
         web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
@@ -2293,151 +2567,170 @@ fn App() -> impl IntoView {
         let ws_url = ws_url_clone.clone();
         let url_table = url_table.clone();
         let url_tier = url_tier.clone();
-        console_log!("Connecting to {}", ws_url);
-        match WebSocket::open(&ws_url) {
-            Ok(mut ws) => {
-                is_connected.set(true);
-                leptos::task::spawn_local(async move {
-                    while let Some(msg) = ws.next().await {
-                        if let Ok(Message::Text(text)) = msg {
-                            match serde_json::from_str::<VortexEvent>(&text) {
-                                Ok(event) => match event {
-                                    VortexEvent::StorageStats(s) => {
-                                        let t0 = js_sys::Date::now();
-                                        stats_by_view.update(|stats| {
-                                            stats.insert(s.view_name.clone(), s.clone());
-                                        });
-                                        let dt = js_sys::Date::now() - t0;
-                                        if dt > 5.0 {
-                                            console_log!(
-                                                "PERF StorageStats {} took {:.0}ms",
-                                                s.view_name,
-                                                dt
-                                            );
+        leptos::task::spawn_local(async move {
+            loop {
+                console_log!("Connecting to {}", ws_url);
+                match WebSocket::open(&ws_url) {
+                    Ok(mut ws) => {
+                        is_connected.set(true);
+                        while let Some(msg) = ws.next().await {
+                            if let Ok(Message::Text(text)) = msg {
+                                match serde_json::from_str::<VortexEvent>(&text) {
+                                    Ok(event) => match event {
+                                        VortexEvent::StorageStats(s) => {
+                                            let t0 = js_sys::Date::now();
+                                            stats_by_view.update(|stats| {
+                                                stats.insert(s.view_name.clone(), s.clone());
+                                            });
+                                            let dt = js_sys::Date::now() - t0;
+                                            if dt > 5.0 {
+                                                console_log!(
+                                                    "PERF StorageStats {} took {:.0}ms",
+                                                    s.view_name,
+                                                    dt
+                                                );
+                                            }
+                                            last_event.set(Some(format!(
+                                                "stats: {}/{} updated",
+                                                s.base_view, s.view_name
+                                            )));
                                         }
-                                        last_event.set(Some(format!(
-                                            "stats: {}/{} updated",
-                                            s.base_view, s.view_name
-                                        )));
-                                    }
-                                    VortexEvent::SystemConfig(c) => {
-                                        let t0 = js_sys::Date::now();
-                                        last_event.set(Some(format!(
-                                            "system config: {} hierarchies",
-                                            c.hierarchies.len()
-                                        )));
-                                        let selected = selected_base_view.get_untracked();
-                                        let first_base = c
-                                            .hierarchies
-                                            .first()
-                                            .map(|h| h.base_view.clone())
-                                            .unwrap_or_default();
+                                        VortexEvent::SystemConfig(c) => {
+                                            let t0 = js_sys::Date::now();
+                                            last_event.set(Some(format!(
+                                                "system config: {} hierarchies",
+                                                c.hierarchies.len()
+                                            )));
+                                            let selected = selected_base_view.get_untracked();
+                                            let first_base = c
+                                                .hierarchies
+                                                .first()
+                                                .map(|h| h.base_view.clone())
+                                                .unwrap_or_default();
 
-                                        if selected.is_empty()
-                                            || !c
-                                                .hierarchies
-                                                .iter()
-                                                .any(|h| h.base_view == selected)
-                                        {
-                                            let target_base = url_table
-                                                .as_deref()
-                                                .filter(|t| {
-                                                    c.hierarchies.iter().any(|h| h.base_view == *t)
-                                                })
-                                                .map(|t| t.to_string())
-                                                .unwrap_or(first_base);
-                                            selected_base_view.set(target_base);
-                                            if let Some(ref tier) = url_tier {
-                                                selected_tier_view.set(Some(tier.clone()));
+                                            if selected.is_empty()
+                                                || !c
+                                                    .hierarchies
+                                                    .iter()
+                                                    .any(|h| h.base_view == selected)
+                                            {
+                                                let target_base = url_table
+                                                    .as_deref()
+                                                    .filter(|t| {
+                                                        c.hierarchies
+                                                            .iter()
+                                                            .any(|h| h.base_view == *t)
+                                                    })
+                                                    .map(|t| t.to_string())
+                                                    .unwrap_or(first_base);
+                                                selected_base_view.set(target_base);
+                                                if let Some(ref tier) = url_tier {
+                                                    selected_tier_view.set(Some(tier.clone()));
+                                                }
+                                                selected_block.set(None);
+                                                selected_page_no.set(url_page);
+                                                if url_page.is_some() {
+                                                    pending_page_restore.set(url_page);
+                                                }
                                             }
-                                            selected_block.set(None);
-                                            selected_page_no.set(url_page);
-                                            if url_page.is_some() {
-                                                pending_page_restore.set(url_page);
-                                            }
+                                            config.set(c);
+                                            let dt = js_sys::Date::now() - t0;
+                                            console_log!("PERF SystemConfig took {:.0}ms", dt);
                                         }
-                                        config.set(c);
-                                        let dt = js_sys::Date::now() - t0;
-                                        console_log!("PERF SystemConfig took {:.0}ms", dt);
-                                    }
-                                    VortexEvent::ChangelogUpdate(entry) => {
-                                        let t0 = js_sys::Date::now();
-                                        // Dedup: pg_notify and polling may both deliver the same entry
-                                        let is_new = changelog_buffer.get_untracked()
-                                            .iter()
-                                            .all(|e| e.event_id != entry.event_id);
-                                        if !is_new { continue; }
-                                        changelog_buffer.update(|buf| {
-                                            buf.push_front(entry.clone());
-                                            buf.truncate(100);
-                                        });
-                                        last_event.set(Some(format!(
-                                            "#{} {} @ {}",
-                                            entry.event_id, entry.base_view, entry.t_start
-                                        )));
-                                        if entry.base_view == selected_base_view.get_untracked() {
-                                            let h = config
+                                        VortexEvent::ChangelogUpdate(entry) => {
+                                            let t0 = js_sys::Date::now();
+                                            // Dedup: pg_notify and polling may both deliver the same entry
+                                            let is_new = changelog_buffer
                                                 .get_untracked()
-                                                .hierarchies
-                                                .into_iter()
-                                                .find(|h| h.base_view == entry.base_view);
-                                            if let Some(h) = h {
-                                                let kickoff = h.kickoff_epoch;
-                                                let tenant_scale = h.tenant_scale.max(1);
-                                                let data_per_page = stats_by_view
+                                                .iter()
+                                                .all(|e| e.event_id != entry.event_id);
+                                            if !is_new {
+                                                continue;
+                                            }
+                                            changelog_buffer.update(|buf| {
+                                                buf.push_front(entry.clone());
+                                                buf.truncate(100);
+                                            });
+                                            last_event.set(Some(format!(
+                                                "#{} {} @ {}",
+                                                entry.event_id, entry.base_view, entry.t_start
+                                            )));
+                                            if entry.base_view == selected_base_view.get_untracked()
+                                            {
+                                                let h = config
                                                     .get_untracked()
-                                                    .get(&h.raw_view_name)
-                                                    .map(|s| s.data_per_page)
-                                                    .filter(|&d| d > 0)
-                                                    .unwrap_or(1018);
-                                                let t_rel_start = (entry.t_start - kickoff).max(0);
-                                                let t_rel_end = (entry.t_end - kickoff).max(0);
-                                                let blkno_start = ((t_rel_start * tenant_scale)
-                                                    / data_per_page)
-                                                    .max(0)
-                                                    as i32;
-                                                let blkno_end = ((t_rel_end * tenant_scale)
-                                                    / data_per_page
-                                                    + 1)
-                                                    as i32;
-                                                let dirty_before =
-                                                    dirty_page_nos.get_untracked().len();
-                                                dirty_page_nos.update(|set| {
-                                                    const MAX_DIRTY: usize = 200;
-                                                    for b in blkno_start..=blkno_end {
-                                                        if set.len() >= MAX_DIRTY {
-                                                            break;
+                                                    .hierarchies
+                                                    .into_iter()
+                                                    .find(|h| h.base_view == entry.base_view);
+                                                if let Some(h) = h {
+                                                    let kickoff = h.kickoff_epoch;
+                                                    let tenant_scale = h.tenant_scale.max(1);
+                                                    let data_per_page = stats_by_view
+                                                        .get_untracked()
+                                                        .get(&h.raw_view_name)
+                                                        .map(|s| s.data_per_page)
+                                                        .filter(|&d| d > 0)
+                                                        .unwrap_or(1018);
+                                                    let t_rel_start =
+                                                        (entry.t_start - kickoff).max(0);
+                                                    let t_rel_end = (entry.t_end - kickoff).max(0);
+                                                    let blkno_start = ((t_rel_start * tenant_scale)
+                                                        / data_per_page)
+                                                        .max(0)
+                                                        as i32;
+                                                    let blkno_end = ((t_rel_end * tenant_scale)
+                                                        / data_per_page
+                                                        + 1)
+                                                        as i32;
+                                                    let dirty_before =
+                                                        dirty_page_nos.get_untracked().len();
+                                                    dirty_page_nos.update(|set| {
+                                                        const MAX_DIRTY: usize = 200;
+                                                        for b in blkno_start..=blkno_end {
+                                                            if set.len() >= MAX_DIRTY {
+                                                                break;
+                                                            }
+                                                            set.insert(b);
                                                         }
-                                                        set.insert(b);
+                                                    });
+                                                    let dt = js_sys::Date::now() - t0;
+                                                    if dt > 2.0 {
+                                                        console_log!(
+                                                            "PERF ChangelogUpdate blks {}-{} dirty_before={} took {:.0}ms",
+                                                            blkno_start,
+                                                            blkno_end,
+                                                            dirty_before,
+                                                            dt
+                                                        );
                                                     }
-                                                });
-                                                let dt = js_sys::Date::now() - t0;
-                                                if dt > 2.0 {
-                                                    console_log!(
-                                                        "PERF ChangelogUpdate blks {}-{} dirty_before={} took {:.0}ms",
-                                                        blkno_start,
-                                                        blkno_end,
-                                                        dirty_before,
-                                                        dt
-                                                    );
                                                 }
                                             }
                                         }
+                                        VortexEvent::WorkerUpdate { workers, summary } => {
+                                            worker_infos.set(workers);
+                                            changelog_summary.set(summary);
+                                        }
+                                        VortexEvent::HeartbeatUpdate(hb) => {
+                                            heartbeat_config.set(hb);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        console_log!("VortexEvent deserialization error: {}", e)
                                     }
-                                    VortexEvent::WorkerUpdate { workers, summary } => {
-                                        worker_infos.set(workers);
-                                        changelog_summary.set(summary);
-                                    }
-                                },
-                                Err(e) => console_log!("VortexEvent deserialization error: {}", e),
+                                }
                             }
                         }
+                        is_connected.set(false);
+                        console_log!("WebSocket disconnected; retrying");
                     }
-                    is_connected.set(false);
-                });
+                    Err(e) => {
+                        is_connected.set(false);
+                        console_log!("WebSocket error: {:?}; retrying", e);
+                    }
+                }
+                TimeoutFuture::new(1_000).await;
             }
-            Err(e) => console_log!("WebSocket error: {:?}", e),
-        }
+        });
     });
 
     // Write URL hash on state change (#75)
@@ -2468,17 +2761,13 @@ fn App() -> impl IntoView {
         slice_data.set(None);
     });
 
-    // Fetch initial worker count
-    let api_base_workers_init = Arc::clone(&api_base);
-    leptos::task::spawn_local(async move {
-        if let Ok(resp) = gloo_net::http::Request::get(
-            &format!("{}/api/workers", api_base_workers_init)
-        ).send().await
-            && let Ok(v) = resp.json::<serde_json::Value>().await
-        {
-            if let Some(n) = v["count"].as_u64() {
-                worker_target.set(n as usize);
-            }
+    // Sync worker_target to actual worker count on first non-empty update
+    let worker_target_synced = RwSignal::new(false);
+    Effect::new(move |_| {
+        let infos = worker_infos.get();
+        if !worker_target_synced.get_untracked() && !infos.is_empty() {
+            worker_target.set(infos.len());
+            worker_target_synced.set(true);
         }
     });
 
@@ -2571,8 +2860,13 @@ fn App() -> impl IntoView {
         selected_block.set(None);
         slice_data.set(None);
         selected_page_no.set(Some(blkno));
-        if view_name.is_empty() { return; }
-        let url = format!("{}/api/storage/{}/block/{}", api_base_tier, view_name, blkno);
+        if view_name.is_empty() {
+            return;
+        }
+        let url = format!(
+            "{}/api/storage/{}/block/{}",
+            api_base_tier, view_name, blkno
+        );
         leptos::task::spawn_local(async move {
             if let Ok(resp) = gloo_net::http::Request::get(&url).send().await
                 && let Ok(info) = resp.json::<BlockInfo>().await
@@ -2993,12 +3287,30 @@ fn App() -> impl IntoView {
                                 <rect x="8.5" y="9"   width="2" height="1.5" rx="0.3" fill="currentColor" opacity="0.55"/>
                             </svg>
                         </button>
+                        <button
+                            class=move || {
+                                let active = left_tab.get() == 3;
+                                let on = heartbeat_config.get().enabled;
+                                if active { "ltab ltab-active" } else if on { "ltab ltab-hb-on" } else { "ltab" }
+                            }
+                            title="Heartbeat"
+                            on:click=move |_| left_tab.set(3)>
+                            // Pulse waveform icon
+                            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                                <polyline points="1,7 3.5,7 5,3.5 6.5,10.5 8,5 9.5,7 13,7"
+                                    stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
                     </div>
                     <div class="left-tab-content">
-                        {move || match left_tab.get() {
-                            1 => view! { <CompressionPanel stats=current_stats /> }.into_any(),
-                            2 => view! { <SavingsCalculatorPanel stats=current_stats /> }.into_any(),
-                            _ => view! { <HierarchyTree hierarchy=current_hierarchy_opt selected_tier=selected_tier_view kickoff=kickoff /> }.into_any(),
+                        {move || {
+                            let api = Arc::clone(&api_base);
+                            match left_tab.get() {
+                                1 => view! { <CompressionPanel stats=current_stats /> }.into_any(),
+                                2 => view! { <SavingsCalculatorPanel stats=current_stats /> }.into_any(),
+                                3 => view! { <HeartbeatPanel heartbeat=heartbeat_config config=config api_base=api /> }.into_any(),
+                                _ => view! { <HierarchyTree hierarchy=current_hierarchy_opt selected_tier=selected_tier_view kickoff=kickoff /> }.into_any(),
+                            }
                         }}
                     </div>
                 </aside>
