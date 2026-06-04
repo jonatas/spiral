@@ -1686,6 +1686,200 @@ fn ChangelogTimeline(
 }
 
 #[component]
+fn TenantLegend(
+    tenant_scale: Signal<i64>,
+    selected_tenant: RwSignal<Option<i32>>,
+    slice_data: Signal<Option<SliceResponse>>,
+) -> impl IntoView {
+    view! {
+        <div class="tenant-legend">
+            <span class="legend-title">"TENANTS:"</span>
+            <button
+                class=move || if selected_tenant.get().is_none() { "tl-all tl-active" } else { "tl-all" }
+                on:click=move |_| selected_tenant.set(None)
+            >"ALL"</button>
+            {move || {
+                let scale = tenant_scale.get().max(1) as i32;
+                let tenant_ids: Vec<i32> = match slice_data.get() {
+                    Some(sr) if !sr.rows.is_empty() && !sr.scope_col.is_empty() => {
+                        let mut ids: Vec<i32> = sr.rows.iter()
+                            .filter_map(|r| r.get(&sr.scope_col)
+                                .and_then(|v| v.as_i64())
+                                .map(|v| v as i32))
+                            .collect();
+                        ids.sort();
+                        ids.dedup();
+                        ids
+                    }
+                    _ => {
+                        let steps = 16.min(scale);
+                        if steps <= 1 { vec![0] }
+                        else { (0..steps).map(|i| i * (scale - 1) / (steps - 1)).collect() }
+                    }
+                };
+                tenant_ids.into_iter().map(|tid| {
+                    let color = get_color_for_tenant(tid, scale);
+                    view! {
+                        <button
+                            class=move || if selected_tenant.get() == Some(tid) { "tl-item tl-active" } else { "tl-item" }
+                            on:click=move |_| selected_tenant.update(|s| {
+                                *s = if *s == Some(tid) { None } else { Some(tid) };
+                            })
+                            title=format!("tenant {}", tid)
+                        >
+                            <span class="tl-dot" style=format!("background:{}", color)></span>
+                            <span class="tl-id">{tid}</span>
+                        </button>
+                    }
+                }).collect_view()
+            }}
+        </div>
+    }
+}
+
+#[component]
+fn MultiTierPageMap(
+    hierarchy: Signal<Option<HierarchyConfig>>,
+    stats_by_view: Signal<BTreeMap<String, StorageStats>>,
+    tenant_scale: Signal<i64>,
+    selected_tenant: Signal<Option<i32>>,
+    selected_page: Signal<Option<i32>>,
+    selected_tier: Signal<Option<String>>,
+    dirty_blocks: Signal<BTreeSet<i32>>,
+    stale_blocks: Signal<BTreeSet<i32>>,
+    on_click: impl Fn(String, i32) + 'static + Send + Clone,
+) -> impl IntoView {
+    let tier_offsets = RwSignal::new(BTreeMap::<String, i32>::new());
+
+    Effect::new(move |_| {
+        let _ = hierarchy.get();
+        tier_offsets.set(BTreeMap::new());
+    });
+
+    const CELLS_PER_TIER: i32 = 200;
+
+    let cell_px = |fs: i32| -> usize {
+        match fs {
+            0             => 4,
+            1..=599       => 5,
+            600..=7199    => 7,
+            7200..=172799 => 10,
+            172800..=2591999 => 14,
+            _             => 20,
+        }
+    };
+
+    view! {
+        <div class="tier-section">
+        {move || {
+            let Some(h) = hierarchy.get() else {
+                return view! { <div></div> }.into_any();
+            };
+            let stats = stats_by_view.get();
+            let scale = tenant_scale.get().max(1) as i32;
+
+            let mut tiers: Vec<(String, i32, i64)> = h.aggregation_levels.iter()
+                .filter(|l| l.frame_seconds > 0)
+                .map(|l| {
+                    let pages = stats.get(&l.view_name).map(|s| s.total_pages).unwrap_or(0);
+                    (l.view_name.clone(), l.frame_seconds, pages)
+                })
+                .collect();
+            tiers.sort_by(|(_, a, _), (_, b, _)| b.cmp(a));
+
+            let raw_pages = stats.get(&h.raw_view_name).map(|s| s.total_pages).unwrap_or(0);
+            tiers.push((h.raw_view_name.clone(), 0, raw_pages));
+
+            tiers.into_iter().map(|(view_name, frame_seconds, total_pages)| {
+                if total_pages == 0 { return view! { <span></span> }.into_any(); }
+
+                let cpx = cell_px(frame_seconds);
+                let tier_label = format_timespan(frame_seconds);
+                let is_raw = frame_seconds == 0;
+
+                let vn_pag1 = view_name.clone();
+                let vn_pag2 = view_name.clone();
+                let vn_cells = view_name.clone();
+                let cb_cells = on_click.clone();
+
+                view! {
+                    <div class=if is_raw { "tier-row tier-raw" } else { "tier-row" }>
+                        <div class="tier-label">
+                            <span class="tier-name">{tier_label}</span>
+                            <span class="tier-pages">{total_pages}{" p"}</span>
+                            {(total_pages > CELLS_PER_TIER as i64).then(|| {
+                                let v1a = vn_pag1.clone();
+                                let v1b = vn_pag1.clone();
+                                let v2a = vn_pag2.clone();
+                                let v2b = vn_pag2.clone();
+                                view! {
+                                    <div class="tier-paginator">
+                                        <button
+                                            class="tier-pag-btn"
+                                            disabled=move || tier_offsets.get().get(&v1a).copied().unwrap_or(0) == 0
+                                            on:click=move |_| tier_offsets.update(|m| {
+                                                let o = m.entry(v1b.clone()).or_default();
+                                                *o = (*o - CELLS_PER_TIER).max(0);
+                                            })
+                                        >"◀"</button>
+                                        <button
+                                            class="tier-pag-btn"
+                                            disabled=move || {
+                                                let o = tier_offsets.get().get(&v2a).copied().unwrap_or(0);
+                                                o + CELLS_PER_TIER >= total_pages as i32
+                                            }
+                                            on:click=move |_| tier_offsets.update(|m| {
+                                                let o = m.entry(v2b.clone()).or_default();
+                                                *o = (*o + CELLS_PER_TIER).min(total_pages as i32 - CELLS_PER_TIER).max(0);
+                                            })
+                                        >"▶"</button>
+                                    </div>
+                                }
+                            })}
+                        </div>
+                        <div class="tier-cells">
+                        {move || {
+                            let off = tier_offsets.get().get(&vn_cells).copied().unwrap_or(0);
+                            let end = (off + CELLS_PER_TIER).min(total_pages as i32);
+                            let cb = cb_cells.clone();
+                            (off..end).map(|idx| {
+                                let tid = idx % scale;
+                                let color = get_color_for_tenant(tid, scale);
+                                let vn_class = vn_cells.clone();
+                                let vn_click = vn_cells.clone();
+                                let cb_c = cb.clone();
+                                view! {
+                                    <div
+                                        class=move || {
+                                            let sel_t = selected_tenant.get();
+                                            let is_match = sel_t.map(|t| t == tid).unwrap_or(false);
+                                            let has_filter = sel_t.is_some();
+                                            let is_sel = selected_page.get() == Some(idx)
+                                                && selected_tier.get().as_deref() == Some(vn_class.as_str());
+                                            if is_sel { "page-cell selected" }
+                                            else if stale_blocks.get().contains(&idx) { "page-cell stale" }
+                                            else if dirty_blocks.get().contains(&idx) { "page-cell dirty" }
+                                            else if has_filter && is_match { "page-cell tenant-match" }
+                                            else if has_filter { "page-cell tenant-filtered" }
+                                            else { "page-cell" }
+                                        }
+                                        style=format!("background:{}; width:{}px; height:{}px;", color, cpx, cpx)
+                                        title=format!("Page {} (tenant {})", idx, tid)
+                                        on:click=move |_| cb_c(vn_click.clone(), idx)
+                                    ></div>
+                                }
+                            }).collect_view()
+                        }}
+                        </div>
+                    </div>
+                }.into_any()
+            }).collect_view().into_any()
+        }}
+        </div>
+    }
+}
+
+#[component]
 fn App() -> impl IntoView {
     let stats_by_view = RwSignal::new(BTreeMap::<String, StorageStats>::new());
     let config = RwSignal::new(SystemConfig::default());
@@ -1708,6 +1902,8 @@ fn App() -> impl IntoView {
     let pending_page_restore = RwSignal::new(None::<i32>);
     let timeline_entries = RwSignal::new(Vec::<ChangelogEntryFull>::new());
     let timeline_refresh = RwSignal::new(0u32);
+    let selected_tenant = RwSignal::new(Option::<i32>::None);
+    let suppress_tier_clear = RwSignal::new(false);
     let auto_explain = RwSignal::new({
         web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
@@ -1933,40 +2129,28 @@ fn App() -> impl IntoView {
 
     Effect::new(move |_| {
         let _ = selected_tier_view.get();
+        if suppress_tier_clear.get_untracked() {
+            suppress_tier_clear.set(false);
+            return;
+        }
         selected_block.set(None);
         selected_page_no.set(None);
         slice_data.set(None);
     });
 
-    let api_base_clone = Arc::clone(&api_base);
-    let fetch_block_info = move |blkno: i32| {
+    let api_base_tier = Arc::clone(&api_base);
+    let fetch_block_for_tier = move |view_name: String, blkno: i32| {
+        suppress_tier_clear.set(true);
+        selected_tier_view.set(Some(view_name.clone()));
         selected_block.set(None);
         slice_data.set(None);
         selected_page_no.set(Some(blkno));
-
-        let selected = selected_base_view.get_untracked();
-        let view_name = selected_tier_view.get_untracked().unwrap_or_else(|| {
-            config
-                .get_untracked()
-                .hierarchies
-                .iter()
-                .find(|h| h.base_view == selected)
-                .map(|h| h.raw_view_name.clone())
-                .unwrap_or_default()
-        });
-        if view_name.is_empty() {
-            return;
-        }
-
-        let url = format!(
-            "{}/api/storage/{}/block/{}",
-            api_base_clone, view_name, blkno
-        );
+        if view_name.is_empty() { return; }
+        let url = format!("{}/api/storage/{}/block/{}", api_base_tier, view_name, blkno);
         leptos::task::spawn_local(async move {
             if let Ok(resp) = gloo_net::http::Request::get(&url).send().await
                 && let Ok(info) = resp.json::<BlockInfo>().await
             {
-                console_log!("FETCHED BLOCK INFO: {:?}", info);
                 selected_block.set(Some(info));
             }
         });
@@ -2412,25 +2596,12 @@ fn App() -> impl IntoView {
                             }
                         }}
                     </div>
+                    <TenantLegend
+                        tenant_scale=tenant_scale
+                        selected_tenant=selected_tenant
+                        slice_data=Signal::derive(move || slice_data.get())
+                    />
                     <div class="map-legend">
-                        <span class="legend-title">"COLORS:"</span>
-                        {move || {
-                            let scale = tenant_scale.get().max(1) as i32;
-                            let steps = 8.min(scale);
-                            (0..steps).map(|i| {
-                                let idx = if steps == 1 { 0 } else { i * (scale - 1) / (steps - 1) };
-                                let color = get_color_for_tenant(idx, scale);
-                                view! {
-                                    <span
-                                        class="legend-swatch"
-                                        style=format!("background:{}", color)
-                                        title=format!("tenant {}", idx)
-                                    ></span>
-                                }
-                            }).collect_view()
-                        }}
-                        <span class="legend-label">"tenant id"</span>
-                        <span class="legend-sep">"·"</span>
                         <span class="legend-swatch legend-dirty-swatch"></span>
                         <span class="legend-label">"dirty"</span>
                         <span class="legend-sep">"·"</span>
@@ -2475,15 +2646,16 @@ fn App() -> impl IntoView {
                         }.into_any()
                     }}
 
-                    <PageMap
-                        total_pages=Signal::derive(move || current_stats.get().total_pages)
+                    <MultiTierPageMap
+                        hierarchy=current_hierarchy_opt
+                        stats_by_view=Signal::derive(move || stats_by_view.get())
                         tenant_scale=tenant_scale
-                        kickoff=kickoff
-                        frame_seconds=current_frame_seconds
+                        selected_tenant=Signal::derive(move || selected_tenant.get())
                         selected_page=Signal::derive(move || selected_page_no.get())
+                        selected_tier=Signal::derive(move || selected_tier_view.get())
                         dirty_blocks=Signal::derive(move || dirty_page_nos.get())
                         stale_blocks=Signal::derive(move || stale_blocks.get())
-                        on_click=fetch_block_info
+                        on_click=fetch_block_for_tier
                     />
 
                     {move || {
