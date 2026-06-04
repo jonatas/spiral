@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS spiral.changelog (
     scope_values JSONB NOT NULL DEFAULT '{}',
     t_start BIGINT,
     t_end BIGINT
-);
+) WITH (fillfactor = 50);
+
+-- Apply fillfactor to existing installations without a full VACUUM FULL.
+ALTER TABLE IF EXISTS spiral.changelog SET (fillfactor = 50);
 
 CREATE INDEX IF NOT EXISTS idx_spiral_changelog_base ON spiral.changelog (base_view);
 CREATE INDEX IF NOT EXISTS idx_spiral_changelog_t_start ON spiral.changelog (t_start NULLS FIRST);

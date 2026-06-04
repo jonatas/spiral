@@ -23,6 +23,15 @@ pub const TAM_SLOT_SIZE: usize = 16;
 /// Slots per page for TAM relations (uses 16-byte MVCC slots).
 pub const TAM_DATA_PER_PAGE: usize = (BLCKSZ - HEADER_SIZE - SPECIAL_SIZE) / TAM_SLOT_SIZE;
 
+// XOR-Block geometry — derived from CompressedBlock struct:
+//   first_val: f64  (8 bytes)
+//   data: [u8; 120] (60 × 2-byte XOR deltas)
+// Total: BLOCK_SIZE (128 bytes) for 61 values, occupying 16 Spiral 8-byte slots.
+const XOR_VALUES_PER_BLOCK: usize = 1 + (BLOCK_SIZE - 8) / 2; // 61
+const XOR_SLOTS_PER_BLOCK: usize = BLOCK_SIZE / 8;            // 16
+pub const XOR_ROWS_PER_PAGE: usize =
+    (DATA_PER_PAGE / XOR_SLOTS_PER_BLOCK) * XOR_VALUES_PER_BLOCK; // 63 × 61 = 3843
+
 /// A single tuple slot in a TAM-backed Spiral page.
 /// f64 value + inserting XID + deleting XID (0 = alive).
 /// xmin == 0 means the slot was never written.
@@ -576,6 +585,60 @@ pub fn spiral_read_main_block_range(main_rel_oid: i32, block_id: i64, tenant_id:
     }
 }
 
+/// Compute the expected heap tuple size for a relation using PostgreSQL's
+/// actual alignment rules from `pg_attribute` + `pg_type`.
+///
+/// Mirrors what PG does internally: start after the 24-byte HeapTupleHeaderData,
+/// then for each column align the offset to `typalign`, then advance by `attlen`
+/// (or `pg_stats.avg_width` for varlena columns). Returns 48.0 on failure so the
+/// caller always gets a usable estimate.
+fn compute_heap_tuple_size(rel_oid: i32) -> f64 {
+    Spi::connect(|client| {
+        let query = format!(
+            "SELECT att.attlen::int, typ.typalign::text,
+             COALESCE(
+                 (SELECT avg_width FROM pg_stats
+                  WHERE tablename = (SELECT relname FROM pg_class WHERE oid = {oid})
+                    AND attname = att.attname),
+                 CASE WHEN att.attlen > 0 THEN att.attlen::int ELSE 20 END
+             ) AS col_width
+             FROM pg_attribute att
+             JOIN pg_type typ ON att.atttypid = typ.oid
+             WHERE att.attrelid = {oid} AND att.attnum > 0 AND NOT att.attisdropped
+             ORDER BY att.attnum",
+            oid = rel_oid
+        );
+        let table = client.select(&query, None, &[])?;
+
+        // HeapTupleHeaderData without the flexible null-bitmap tail is 23 bytes;
+        // MAXALIGN(23) = 24, which equals t_hoff for tables with ≤ 8 non-null columns.
+        let mut offset: usize = maxalign!(23usize);
+
+        for row in table.into_iter() {
+            let attlen: i32 = row.get::<i32>(1)?.unwrap_or(-1);
+            let typalign: String = row.get::<String>(2)?.unwrap_or_else(|| "i".to_string());
+            let col_width: i32 = row.get::<i32>(3)?.unwrap_or(8);
+
+            let align_bytes: usize = match typalign.as_str() {
+                "d" => 8, // double (8-byte)
+                "i" => 4, // int (4-byte)
+                "s" => 2, // short (2-byte)
+                _ => 1,   // char (1-byte / no padding)
+            };
+            let col_size = if attlen > 0 { attlen as usize } else { col_width as usize };
+
+            // Advance offset to the required alignment boundary, then store the column.
+            if align_bytes > 1 {
+                offset = (offset + align_bytes - 1) & !(align_bytes - 1);
+            }
+            offset += col_size;
+        }
+
+        Ok::<f64, spi::Error>(offset as f64)
+    })
+    .unwrap_or(48.0)
+}
+
 #[pg_extern]
 pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
     let mut tenant_scale = 1024;
@@ -593,6 +656,15 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
         }
     }
 
+    // Heap comparison metrics — computed from PG schema before acquiring the relation lock.
+    let heap_bytes_per_row = compute_heap_tuple_size(main_rel_oid);
+    // Heap page usable space: full page minus PageHeaderData (no special area on heap pages).
+    // ItemId (line pointer) = 4 bytes per tuple in the line-pointer array.
+    let heap_page_usable = (BLCKSZ - HEADER_SIZE) as f64;
+    let heap_rows_per_page = heap_page_usable / (heap_bytes_per_row + 4.0);
+    let xor_bytes_per_row = BLOCK_SIZE as f64 / XOR_VALUES_PER_BLOCK as f64;
+    let xor_rows_per_page = XOR_ROWS_PER_PAGE as f64;
+
     unsafe {
         let pg_rel = PgRelation::with_lock(
             pg_sys::Oid::from(main_rel_oid as u32),
@@ -603,11 +675,11 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
 
         let rows_per_page = DATA_PER_PAGE as i64;
         let total_rows = nblocks as i64 * rows_per_page;
-        let heap_size_bytes = total_rows * 48;
+        let heap_size_bytes = total_rows as f64 * heap_bytes_per_row;
         let spiral_size_bytes = nblocks as i64 * BLCKSZ as i64;
 
         let compression_ratio = if spiral_size_bytes > 0 {
-            heap_size_bytes as f64 / spiral_size_bytes as f64
+            heap_size_bytes / spiral_size_bytes as f64
         } else {
             0.0
         };
@@ -646,8 +718,12 @@ pub fn spiral_get_storage_stats(main_rel_oid: i32) -> pgrx::JsonB {
             "total_rows_capacity": total_rows,
             "tenant_scale": tenant_scale,
             "spiral_size_kb": spiral_size_bytes / 1024,
-            "projected_heap_size_kb": heap_size_bytes / 1024,
+            "projected_heap_size_kb": (heap_size_bytes / 1024.0) as i64,
             "compression_ratio": compression_ratio,
+            "heap_bytes_per_row": heap_bytes_per_row,
+            "heap_rows_per_page": heap_rows_per_page,
+            "xor_bytes_per_row": xor_bytes_per_row,
+            "xor_rows_per_page": xor_rows_per_page,
             "page_size": BLCKSZ,
             "data_per_page": DATA_PER_PAGE,
             "kickoff_epoch": kickoff,

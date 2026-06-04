@@ -395,15 +395,71 @@ pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
 /// Remove all Spiral catalog entries for a dropped table.
 /// Cleans spiral.metadata, spiral.sources, and spiral.changelog rows whose
 /// base_view or view_name match `table_name` (handles both base tables and rollup tiers).
+/// Cancels any Spiral Worker query touching this table so locks are released immediately.
+/// If no Spiral tables remain after cleanup, cancels all Spiral Workers for this DB.
 pub fn remove_table_from_spiral(table_name: &str) {
     if !spiral_metadata_table_exists() {
         return;
     }
     let name = table_name.replace("'", "''");
+
+    // Cancel any Spiral Worker currently processing this table so its transaction
+    // aborts and releases table locks before we delete the catalog rows.
+    // Cancel any Spiral Worker currently processing this table so its transaction
+    // aborts immediately before we touch the catalog or drop hierarchy tables.
     let _ = Spi::run(&format!(
-        "DELETE FROM spiral.sources WHERE view_name = '{name}' OR base_view = '{name}'; \
-         DELETE FROM spiral.metadata WHERE view_name = '{name}' OR base_view = '{name}'; \
+        "SELECT pg_cancel_backend(pid) \
+         FROM pg_stat_activity \
+         WHERE backend_type LIKE 'Spiral Worker%' \
+           AND query LIKE '%{name}%'"
+    ));
+
+    // Collect hierarchy table names BEFORE deleting them from the catalog so we
+    // can DROP the actual PG tables. The hierarchy tables have no PG dependency
+    // on the base table, so DROP TABLE base CASCADE won't reach them.
+    let hierarchy_tables: Vec<String> = Spi::connect(|client| {
+        Ok(client
+            .select(
+                &format!(
+                    "SELECT view_name FROM spiral.metadata \
+                     WHERE base_view = '{name}' AND view_name <> '{name}'"
+                ),
+                None,
+                &[],
+            )?
+            .map(|row| row.get::<String>(1).unwrap_or(None).unwrap_or_default())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>())
+    })
+    .unwrap_or_default();
+
+    // Drop hierarchy tables (they outlive the base table without this step).
+    for ht in &hierarchy_tables {
+        let safe_ht = ht.replace('\'', "''");
+        let _ = Spi::run(&format!("DROP TABLE IF EXISTS \"{safe_ht}\" CASCADE"));
+    }
+
+    let _ = Spi::run(&format!(
+        "DELETE FROM spiral.sources   WHERE view_name = '{name}' OR base_view = '{name}'; \
+         DELETE FROM spiral.metadata  WHERE view_name = '{name}' OR base_view = '{name}'; \
          DELETE FROM spiral.changelog WHERE base_view = '{name}';"
     ));
+
+    // If no base tables remain, cancel all Spiral Workers — nothing left to process.
+    let remaining = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM spiral.metadata WHERE parent_view = 'BASE'",
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(1);
+
+    if remaining == 0 {
+        let _ = Spi::run(
+            "SELECT pg_cancel_backend(pid) \
+             FROM pg_stat_activity \
+             WHERE backend_type LIKE 'Spiral Worker%'",
+        );
+    }
+
     invalidate_catalog_cache();
 }

@@ -14,6 +14,7 @@ use sqlx::{FromRow, Pool, Postgres, Row};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -180,6 +181,8 @@ struct AppState {
     tx: broadcast::Sender<VortexEvent>,
     recent_changelog: Mutex<VecDeque<ChangelogEntry>>,
     last_worker_update: Mutex<(Vec<WorkerInfo>, Vec<ChangelogSummaryRow>)>,
+    worker_target: AtomicUsize,
+    worker_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[tokio::main]
@@ -213,6 +216,8 @@ async fn main() {
         tx: tx.clone(),
         recent_changelog: Mutex::new(VecDeque::with_capacity(500)),
         last_worker_update: Mutex::new((Vec::new(), Vec::new())),
+        worker_target: AtomicUsize::new(0),
+        worker_handles: Mutex::new(Vec::new()),
     });
 
     let poll_secs = std::env::var("VORTEX_POLL_INTERVAL_SECS")
@@ -437,6 +442,7 @@ async fn main() {
         .route("/api/storage/{name}/changelog", get(get_storage_changelog))
         .route("/api/slice/{view_name}", get(get_slice_data))
         .route("/api/explain", post(run_explain))
+        .route("/api/workers", get(get_workers).post(set_workers))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -1090,6 +1096,60 @@ async fn get_slice_data(
         "count": count,
         "rows": rows,
     })))
+}
+
+async fn get_workers(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let count = state.worker_handles.lock().unwrap()
+        .iter().filter(|h| !h.is_finished()).count();
+    Json(serde_json::json!({ "count": count }))
+}
+
+#[derive(Deserialize)]
+struct SetWorkersRequest { count: usize }
+
+async fn set_workers(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SetWorkersRequest>,
+) -> Json<serde_json::Value> {
+    let target = payload.count.min(8);
+    state.worker_target.store(target, Ordering::Relaxed);
+
+    let mut handles = state.worker_handles.lock().unwrap();
+
+    // Abort excess workers
+    while handles.len() > target {
+        handles.pop().unwrap().abort();
+    }
+
+    // Spawn new workers
+    let needed = target.saturating_sub(handles.len());
+    let new_handles: Vec<_> = (0..needed).map(|_| {
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            loop {
+                let tables_res = sqlx::query_scalar::<_, String>(
+                    "SELECT DISTINCT base_view FROM spiral.changelog LIMIT 9"
+                )
+                .fetch_all(&pool)
+                .await;
+
+                if let Ok(tables) = tables_res {
+                    for table in tables {
+                        let _ = sqlx::query(&format!(
+                            "SELECT spiral_refresh('{}')", table
+                        ))
+                        .execute(&pool)
+                        .await;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        })
+    }).collect();
+
+    handles.extend(new_handles);
+    let active = handles.iter().filter(|h| !h.is_finished()).count();
+    Json(serde_json::json!({ "count": active }))
 }
 
 #[derive(Deserialize)]
