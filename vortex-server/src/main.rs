@@ -96,6 +96,8 @@ struct BlockInfo {
     opaque_tenant_scale: i32,
     #[serde(default)]
     magic_valid: bool,
+    #[serde(default)]
+    is_gap_page: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -635,6 +637,10 @@ async fn get_block_info(
                 .unwrap_or(0);
         }
     }
+
+    // Spiral gap page: valid spiral magic but all data slots zero (never written).
+    // Created by the allocation loop in spiral_pack_delta* when skipping to a target blkno.
+    block_info.is_gap_page = block_info.magic_valid && block_info.live_tuples == 0;
 
     Ok(Json(block_info))
 }

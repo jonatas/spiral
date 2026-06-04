@@ -367,6 +367,8 @@ struct BlockInfo {
     opaque_tenant_scale: i32,
     #[serde(default)]
     magic_valid: bool,
+    #[serde(default)]
+    is_gap_page: bool,
 }
 
 fn current_hierarchy(config: &SystemConfig, base_view: &str) -> Option<HierarchyConfig> {
@@ -615,6 +617,12 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
                 })}
                 {(has_fill && block.fill_pct < 20.0).then(|| view! {
                     <span class="badge-sparse">"SPARSE"</span>
+                })}
+                {block.is_gap_page.then(|| view! {
+                    <span class="badge-gap">"GAP"</span>
+                })}
+                {(!block.magic_valid && !has_fill).then(|| view! {
+                    <span class="badge-gap">"EMPTY"</span>
                 })}
             </div>
             <div class="irow">
@@ -2855,41 +2863,6 @@ fn App() -> impl IntoView {
                             on_bar_click=on_bar_click
                         />
 
-                        // Color editor (always visible when expanded)
-                        {move || changelog_expanded.get().then(|| {
-                            let colors = table_colors.get();
-                            view! {
-                                <div class="cl-color-editor">
-                                    <span class="cl-color-hdr">"TABLE COLORS:"</span>
-                                    {changelog_summary.get().iter().map(|row| {
-                                        let bv = row.base_view.clone();
-                                        let color = resolve_table_color(&bv, &colors);
-                                        let bv2 = bv.clone();
-                                        view! {
-                                            <span class="cl-color-item">
-                                                <input
-                                                    type="color"
-                                                    value={color.clone()}
-                                                    class="cl-color-input"
-                                                    title={format!("Change color for {}", bv)}
-                                                    on:change=move |ev| {
-                                                        use wasm_bindgen::JsCast;
-                                                        let val = ev.target()
-                                                            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
-                                                            .map(|i| i.value())
-                                                            .unwrap_or_default();
-                                                        if is_sufficient_contrast(&val) {
-                                                            table_colors.update(|m| { m.insert(bv2.clone(), val); });
-                                                        }
-                                                    }
-                                                />
-                                                <span class="cl-color-label" style=move || format!("color:{}", color)>{bv.clone()}</span>
-                                            </span>
-                                        }
-                                    }).collect_view()}
-                                </div>
-                            }
-                        })}
                     </div>
                 </div>
 
