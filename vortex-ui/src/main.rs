@@ -901,7 +901,31 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 </div>
             </div>
 
-            <div class="cmp-section-label" style="margin-top:10px;">"SAVINGS CALCULATOR"</div>
+        </div>
+    }
+}
+
+#[component]
+fn SavingsCalculatorPanel(stats: Signal<StorageStats>) -> impl IntoView {
+    let row_count_exp = RwSignal::new(6.0_f64);
+
+    let spiral_bpr = move || {
+        let s = stats.get();
+        if s.total_rows_capacity > 0 && s.spiral_size_kb > 0 {
+            (s.spiral_size_kb * 1024) as f64 / s.total_rows_capacity as f64
+        } else { 8.0 }
+    };
+    let heap_bpr = move || {
+        let s = stats.get();
+        if s.heap_bytes_per_row > 0.0 { s.heap_bytes_per_row } else { 48.0 }
+    };
+    let xor_bpr = move || {
+        let s = stats.get();
+        if s.xor_bytes_per_row > 0.0 { s.xor_bytes_per_row } else { 2.1 }
+    };
+
+    view! {
+        <div class="calc-panel">
             <div class="slider-row">
                 <input
                     type="range" min="3" max="12" step="0.05"
@@ -913,8 +937,8 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 />
                 <span class="slider-label">{move || {
                     let n = 10.0_f64.powf(row_count_exp.get());
-                    if n >= 1e9 { format!("{:.1} Billion rows", n / 1e9) }
-                    else if n >= 1e6 { format!("{:.0} Million rows", n / 1e6) }
+                    if n >= 1e9 { format!("{:.1}B rows", n / 1e9) }
+                    else if n >= 1e6 { format!("{:.0}M rows", n / 1e6) }
                     else { format!("{:.0}K rows", n / 1e3) }
                 }}</span>
             </div>
@@ -949,33 +973,22 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 <div class="tg-cell">
                     <span class="tg-label">"SAVED"</span>
                     <span class="tg-value tg-green">{move || {
-                        let saving = (1.0 - spiral_bpr() / heap_bpr()) * 100.0;
-                        format!("{:.1}%", saving)
+                        format!("{:.1}%", (1.0 - spiral_bpr() / heap_bpr()) * 100.0)
                     }}</span>
                 </div>
             </div>
-
-            <div class="cmp-section-label" style="margin-top:10px;">"1 Billion ROWS PROJECTION (SPIRAL)"</div>
+            <div class="cmp-section-label" style="margin-top:8px;">"1B ROWS PROJECTION"</div>
             <div class="ls-row">
                 <span class="ls-label">"Storage"</span>
-                <span class="ls-value tg-purple">{move || {
-                    let kb = (1_000_000_000.0 * spiral_bpr() / 1024.0) as i64;
-                    format_bytes(kb)
-                }}</span>
+                <span class="ls-value tg-purple">{move || format_bytes((1_000_000_000.0 * spiral_bpr() / 1024.0) as i64)}</span>
             </div>
             <div class="ls-row">
                 <span class="ls-label">"Heap equiv"</span>
-                <span class="ls-value ls-dim">{move || {
-                    let kb = (1_000_000_000.0 * heap_bpr() / 1024.0) as i64;
-                    format_bytes(kb)
-                }}</span>
+                <span class="ls-value ls-dim">{move || format_bytes((1_000_000_000.0 * heap_bpr() / 1024.0) as i64)}</span>
             </div>
             <div class="ls-row">
-                <span class="ls-label">"Estimated Saving"</span>
-                <span class="ls-value ls-green">{move || {
-                    let saving = (1.0 - spiral_bpr() / heap_bpr()) * 100.0;
-                    format!("{:.1}%", saving)
-                }}</span>
+                <span class="ls-label">"Saving"</span>
+                <span class="ls-value ls-green">{move || format!("{:.1}%", (1.0 - spiral_bpr() / heap_bpr()) * 100.0)}</span>
             </div>
         </div>
     }
@@ -2210,10 +2223,14 @@ fn App() -> impl IntoView {
     let changelog_expanded = RwSignal::new(false);
     let pending_page_restore = RwSignal::new(None::<i32>);
     let worker_infos = RwSignal::new(Vec::<WorkerInfo>::new());
+    // 0 = "all", 300 = 5m, 3600 = 1h, 86400 = 1d
+    let changelog_window_secs = RwSignal::new(0i64);
+    let worker_target = RwSignal::new(1usize);
     let changelog_summary = RwSignal::new(Vec::<ChangelogSummaryRow>::new());
     let table_colors = RwSignal::new(BTreeMap::<String, String>::new());
     let selected_tenant = RwSignal::new(Option::<i32>::None);
     let suppress_tier_clear = RwSignal::new(false);
+    let left_tab = RwSignal::new(0u8); // 0=hierarchy 1=storage 2=calc
     let auto_explain = RwSignal::new({
         web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
@@ -2450,6 +2467,38 @@ fn App() -> impl IntoView {
         selected_page_no.set(None);
         slice_data.set(None);
     });
+
+    // Fetch initial worker count
+    let api_base_workers_init = Arc::clone(&api_base);
+    leptos::task::spawn_local(async move {
+        if let Ok(resp) = gloo_net::http::Request::get(
+            &format!("{}/api/workers", api_base_workers_init)
+        ).send().await
+            && let Ok(v) = resp.json::<serde_json::Value>().await
+        {
+            if let Some(n) = v["count"].as_u64() {
+                worker_target.set(n as usize);
+            }
+        }
+    });
+
+    // POST /api/workers helper
+    let api_base_set_workers = Arc::clone(&api_base);
+    let set_worker_count = move |delta: i64| {
+        let current = worker_target.get_untracked() as i64;
+        let next = (current + delta).max(0).min(8) as usize;
+        worker_target.set(next);
+        let url = format!("{}/api/workers", api_base_set_workers);
+        leptos::task::spawn_local(async move {
+            let body = format!("{{\"count\":{}}}", next);
+            if let Ok(req) = gloo_net::http::Request::post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+            {
+                let _ = req.send().await;
+            }
+        });
+    };
 
     let api_base_pagemap = Arc::clone(&api_base);
     Effect::new(move |_| {
@@ -2903,13 +2952,54 @@ fn App() -> impl IntoView {
 
             <div class="main-grid">
                 <aside class="left-panel">
-                    <div class="panel-block">
-                        <div class="panel-hdr">"HIERARCHY"</div>
-                        <HierarchyTree hierarchy=current_hierarchy_opt selected_tier=selected_tier_view kickoff=kickoff />
+                    <div class="left-tab-bar">
+                        <button
+                            class=move || if left_tab.get() == 0 { "ltab ltab-active" } else { "ltab" }
+                            title="Hierarchy"
+                            on:click=move |_| left_tab.set(0)>
+                            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                                <circle cx="7" cy="2.5" r="1.5" fill="currentColor"/>
+                                <circle cx="3" cy="11" r="1.5" fill="currentColor"/>
+                                <circle cx="11" cy="11" r="1.5" fill="currentColor"/>
+                                <line x1="7" y1="4" x2="7" y2="8" stroke="currentColor" stroke-width="1.2"/>
+                                <line x1="7" y1="8" x2="3" y2="9.5" stroke="currentColor" stroke-width="1.2"/>
+                                <line x1="7" y1="8" x2="11" y2="9.5" stroke="currentColor" stroke-width="1.2"/>
+                            </svg>
+                        </button>
+                        <button
+                            class=move || if left_tab.get() == 1 { "ltab ltab-active" } else { "ltab" }
+                            title="Storage Analysis"
+                            on:click=move |_| left_tab.set(1)>
+                            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                                <ellipse cx="7" cy="3.5" rx="4.5" ry="1.6" stroke="currentColor" stroke-width="1.2"/>
+                                <line x1="2.5" y1="3.5" x2="2.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/>
+                                <line x1="11.5" y1="3.5" x2="11.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/>
+                                <ellipse cx="7" cy="10.5" rx="4.5" ry="1.6" stroke="currentColor" stroke-width="1.2"/>
+                                <ellipse cx="7" cy="7" rx="4.5" ry="1.6" stroke="currentColor" stroke-width="1.2" opacity="0.45"/>
+                            </svg>
+                        </button>
+                        <button
+                            class=move || if left_tab.get() == 2 { "ltab ltab-active" } else { "ltab" }
+                            title="Savings Calculator"
+                            on:click=move |_| left_tab.set(2)>
+                            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                                <rect x="2" y="1" width="10" height="12" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+                                <rect x="3.5" y="2.5" width="7" height="2.5" rx="0.5" fill="currentColor" opacity="0.65"/>
+                                <rect x="3.5" y="6.5" width="2" height="1.5" rx="0.3" fill="currentColor" opacity="0.55"/>
+                                <rect x="6"   y="6.5" width="2" height="1.5" rx="0.3" fill="currentColor" opacity="0.55"/>
+                                <rect x="8.5" y="6.5" width="2" height="1.5" rx="0.3" fill="currentColor" opacity="0.55"/>
+                                <rect x="3.5" y="9"   width="2" height="1.5" rx="0.3" fill="currentColor" opacity="0.55"/>
+                                <rect x="6"   y="9"   width="2" height="1.5" rx="0.3" fill="currentColor" opacity="0.55"/>
+                                <rect x="8.5" y="9"   width="2" height="1.5" rx="0.3" fill="currentColor" opacity="0.55"/>
+                            </svg>
+                        </button>
                     </div>
-                    <div class="panel-block">
-                        <div class="panel-hdr">"STORAGE ANALYSIS"</div>
-                        <CompressionPanel stats=current_stats />
+                    <div class="left-tab-content">
+                        {move || match left_tab.get() {
+                            1 => view! { <CompressionPanel stats=current_stats /> }.into_any(),
+                            2 => view! { <SavingsCalculatorPanel stats=current_stats /> }.into_any(),
+                            _ => view! { <HierarchyTree hierarchy=current_hierarchy_opt selected_tier=selected_tier_view kickoff=kickoff /> }.into_any(),
+                        }}
                     </div>
                 </aside>
 
@@ -3127,16 +3217,49 @@ fn App() -> impl IntoView {
 
                     // Changelog timeline panel (#62)
                     <div class="changelog-panel">
-                        <div class="changelog-hdr" on:click=move |_| changelog_expanded.update(|v| *v = !*v)>
-                            {move || {
-                                let count: i64 = changelog_summary.get().iter().map(|r| r.pending_count).sum();
-                                let w_count = worker_infos.get().len();
-                                if changelog_expanded.get() {
-                                    format!("▼ CHANGELOG ({} pending, {} workers)", count, w_count)
-                                } else {
-                                    format!("▶ CHANGELOG ({} pending, {} workers)", count, w_count)
-                                }
-                            }}
+                        <div style="display:flex; align-items:center; gap:6px;">
+                            <div class="changelog-hdr" style="flex:1; cursor:pointer;"
+                                on:click=move |_| changelog_expanded.update(|v| *v = !*v)>
+                                {move || {
+                                    let count: i64 = changelog_summary.get().iter().map(|r| r.pending_count).sum();
+                                    let w_count = worker_infos.get().len();
+                                    if changelog_expanded.get() {
+                                        format!("▼ CHANGELOG ({} pending, {} workers)", count, w_count)
+                                    } else {
+                                        format!("▶ CHANGELOG ({} pending, {} workers)", count, w_count)
+                                    }
+                                }}
+                            </div>
+                            // Worker +/- controls
+                            <div style="display:flex; align-items:center; gap:2px; font-size:11px;">
+                                <button class="ctrl-btn"
+                                    on:click={
+                                        let swc = set_worker_count.clone();
+                                        move |_| swc(-1)
+                                    }>"-"</button>
+                                <span style="min-width:18px; text-align:center; color:var(--muted);">
+                                    {move || worker_target.get()}
+                                </span>
+                                <button class="ctrl-btn"
+                                    on:click={
+                                        let swc = set_worker_count.clone();
+                                        move |_| swc(1)
+                                    }>"+"</button>
+                            </div>
+                            // Time window filter
+                            <div style="display:flex; gap:2px; font-size:10px;">
+                                {[("5m", 300i64), ("1h", 3600), ("1d", 86400), ("all", 0)].iter().map(|(label, secs)| {
+                                    let secs = *secs;
+                                    let label = *label;
+                                    view! {
+                                        <button class="ctrl-btn"
+                                            class:ctrl-btn-active={move || changelog_window_secs.get() == secs}
+                                            on:click=move |_| changelog_window_secs.set(secs)>
+                                            {label}
+                                        </button>
+                                    }
+                                }).collect_view()}
+                            </div>
                         </div>
 
                         // Worker strip + summary pills (always visible)
@@ -3149,7 +3272,16 @@ fn App() -> impl IntoView {
 
                         // Multi-lane swim lane timeline: all tables, bars by time range, worker dots
                         <ChangelogTimeline
-                            entries=Signal::derive(move || changelog_buffer.get())
+                            entries=Signal::derive(move || {
+                                let buf = changelog_buffer.get();
+                                let win = changelog_window_secs.get();
+                                if win == 0 {
+                                    buf
+                                } else {
+                                    let cutoff = (js_sys::Date::now() / 1000.0) as i64 - win;
+                                    buf.into_iter().filter(|e| e.t_end >= cutoff).collect()
+                                }
+                            })
                             table_colors=Signal::derive(move || table_colors.get())
                             worker_infos=Signal::derive(move || worker_infos.get())
                             selected_base_view=Signal::derive(move || selected_base_view.get())

@@ -175,6 +175,36 @@
                 margin-bottom: 8px;
             }
 
+            /* ─── LEFT PANEL ICON TABS ───────────────── */
+            .left-tab-bar {
+                display: flex;
+                align-items: center;
+                gap: 2px;
+                padding-bottom: 6px;
+                margin-bottom: 8px;
+                border-bottom: 1px solid var(--border);
+            }
+            .ltab {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                color: var(--muted);
+                padding: 4px 6px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: color 0.15s, border-color 0.15s, background 0.15s;
+            }
+            .ltab:hover { color: var(--text); border-color: var(--border); }
+            .ltab-active {
+                color: var(--blue);
+                border-color: color-mix(in srgb, var(--blue) 40%, transparent);
+                background: color-mix(in srgb, var(--blue) 12%, transparent);
+            }
+            .left-tab-content { flex: 1; overflow-y: auto; min-height: 0; }
+            .calc-panel { display: flex; flex-direction: column; gap: 4px; }
+
             /* ─── HIERARCHY TREE ──────────────────────── */
             .tree { display: flex; flex-direction: column; gap: 1px; }
 
@@ -552,6 +582,19 @@
                 user-select: none;
             }
             .changelog-hdr:hover { color: var(--text); }
+            .ctrl-btn {
+                background: var(--bg2);
+                border: 1px solid var(--border);
+                color: var(--muted);
+                border-radius: 3px;
+                padding: 1px 5px;
+                font-size: 10px;
+                cursor: pointer;
+                line-height: 1.4;
+                font-family: inherit;
+            }
+            .ctrl-btn:hover { color: var(--text); border-color: var(--muted); }
+            .ctrl-btn-active { color: var(--green) !important; border-color: var(--green) !important; }
             .changelog-timeline {
                 margin: 4px 0;
                 border: 1px solid var(--border);
