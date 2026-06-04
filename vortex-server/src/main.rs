@@ -1060,7 +1060,7 @@ async fn get_slice_data(
     // Build query with safe identifiers (all from our own metadata, not user input)
     let sql = format!(
         "SELECT json_agg(row_to_json(d)) FROM (
-           SELECT *, extract(epoch from {time_col})::bigint AS t_epoch
+           SELECT *
            FROM {view_name}
            WHERE {time_col} >= to_timestamp($1)
              AND {time_col} < to_timestamp($2)

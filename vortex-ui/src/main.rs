@@ -172,17 +172,56 @@ fn format_epoch_seconds(epoch: i64) -> String {
         + "Z"
 }
 
-fn format_date_short(epoch: i64) -> String {
+fn format_tick_label(epoch: i64, span_seconds: i64) -> String {
     if epoch <= 0 {
         return "?".to_string();
     }
     let date = js_sys::Date::new(&JsValue::from_f64(epoch as f64 * 1000.0));
-    format!(
-        "{:04}-{:02}-{:02}",
-        date.get_utc_full_year(),
-        date.get_utc_month() + 1,
-        date.get_utc_date()
-    )
+    if span_seconds < 86400 {
+        format!("{:02}:{:02}", date.get_utc_hours(), date.get_utc_minutes())
+    } else {
+        format!(
+            "{:04}-{:02}-{:02}",
+            date.get_utc_full_year(),
+            date.get_utc_month() + 1,
+            date.get_utc_date()
+        )
+    }
+}
+
+// Parse a timestamptz string or numeric epoch to seconds-since-epoch.
+fn parse_time_col(val: &serde_json::Value) -> Option<f64> {
+    if let Some(f) = val.as_f64() {
+        return Some(f);
+    }
+    if let Some(s) = val.as_str() {
+        let ms = js_sys::Date::parse(s);
+        if ms.is_finite() {
+            return Some(ms / 1000.0);
+        }
+    }
+    None
+}
+
+// Format a timestamptz string in local timezone as "YYYY-MM-DD HH:MM:SS".
+// Returns (short_label, full_tooltip). short_label omits sub-second fraction.
+fn format_ts_local(s: &str) -> (String, String) {
+    let ms = js_sys::Date::parse(s);
+    if !ms.is_finite() {
+        return (s.to_string(), s.to_string());
+    }
+    let date = js_sys::Date::new(&JsValue::from_f64(ms));
+    let short = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds(),
+    );
+    let full = format!("{} ({} ms)", short, date.get_milliseconds());
+    (short, full)
 }
 
 fn format_age(seconds: i64) -> String {
@@ -948,6 +987,7 @@ fn SvgCandlestickChart(
     scope_col: String,
     metric_col: String,
     volume_col: Option<String>,
+    time_col: String,
 ) -> impl IntoView {
     const W: f64 = 300.0;
     const H: f64 = 140.0;
@@ -981,7 +1021,7 @@ fn SvgCandlestickChart(
     let mut by_tenant: BTreeMap<i64, Vec<Candle>> = BTreeMap::new();
 
     for row in &rows {
-        let Some(t) = row.get("t_epoch").and_then(|v| v.as_f64()) else {
+        let Some(t) = row.get(&time_col).and_then(|v| parse_time_col(v)) else {
             continue;
         };
         let Some(m) = row.get(&metric_col).and_then(|v| v.as_object()) else {
@@ -1174,6 +1214,7 @@ fn SvgBarChart(
     rows: Vec<serde_json::Value>,
     scope_col: String,
     metric_col: String,
+    time_col: String,
 ) -> impl IntoView {
     const W: f64 = 300.0;
     const H: f64 = 120.0;
@@ -1190,7 +1231,7 @@ fn SvgBarChart(
     let mut has_data = false;
 
     for row in &rows {
-        let Some(t) = row.get("t_epoch").and_then(|v| v.as_f64()) else {
+        let Some(t) = row.get(&time_col).and_then(|v| parse_time_col(v)) else {
             continue;
         };
         let Some(v) = row.get(&metric_col).and_then(|v| v.as_f64()) else {
@@ -1334,6 +1375,7 @@ fn SvgStatsChart(
     rows: Vec<serde_json::Value>,
     scope_col: String,
     metric_col: String,
+    time_col: String,
 ) -> impl IntoView {
     let mut rows_mean = Vec::new();
     let mut rows_var = Vec::new();
@@ -1341,9 +1383,10 @@ fn SvgStatsChart(
     let mut rows_min = Vec::new();
 
     for row in &rows {
-        let Some(t_epoch) = row.get("t_epoch").cloned() else {
+        let Some(t_epoch) = row.get(&time_col).and_then(|v| parse_time_col(v)) else {
             continue;
         };
+        let t_val = serde_json::json!(t_epoch);
         let Some(scope) = row.get(&scope_col).cloned() else {
             continue;
         };
@@ -1360,25 +1403,25 @@ fn SvgStatsChart(
         let variance = if n > 1.0 { m2 / (n - 1.0) } else { 0.0 };
 
         let mut r_mean = serde_json::Map::new();
-        r_mean.insert("t_epoch".to_string(), t_epoch.clone());
+        r_mean.insert("t_epoch".to_string(), t_val.clone());
         r_mean.insert(scope_col.clone(), scope.clone());
         r_mean.insert("val".to_string(), serde_json::json!(m1));
         rows_mean.push(serde_json::Value::Object(r_mean));
 
         let mut r_var = serde_json::Map::new();
-        r_var.insert("t_epoch".to_string(), t_epoch.clone());
+        r_var.insert("t_epoch".to_string(), t_val.clone());
         r_var.insert(scope_col.clone(), scope.clone());
         r_var.insert("val".to_string(), serde_json::json!(variance));
         rows_var.push(serde_json::Value::Object(r_var));
 
         let mut r_max = serde_json::Map::new();
-        r_max.insert("t_epoch".to_string(), t_epoch.clone());
+        r_max.insert("t_epoch".to_string(), t_val.clone());
         r_max.insert(scope_col.clone(), scope.clone());
         r_max.insert("val".to_string(), serde_json::json!(max));
         rows_max.push(serde_json::Value::Object(r_max));
 
         let mut r_min = serde_json::Map::new();
-        r_min.insert("t_epoch".to_string(), t_epoch.clone());
+        r_min.insert("t_epoch".to_string(), t_val.clone());
         r_min.insert(scope_col.clone(), scope.clone());
         r_min.insert("val".to_string(), serde_json::json!(min));
         rows_min.push(serde_json::Value::Object(r_min));
@@ -1388,19 +1431,19 @@ fn SvgStatsChart(
         <div class="stats-group" style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; border: 1px solid var(--border); padding: 8px; border-radius: 4px; grid-column: 1 / -1;">
             <div style="grid-column: 1 / -1; font-size: 10px; font-weight: 700; color: var(--muted); margin-bottom: 4px;">{format!("{} (stats breakdown)", metric_col)}</div>
             <div class="chart-item">
-                <SvgLineChart rows={rows_mean} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <SvgLineChart rows={rows_mean} scope_col={scope_col.clone()} metric_col="val".to_string() time_col="t_epoch".to_string() />
                 <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"MEAN"</div>
             </div>
             <div class="chart-item">
-                <SvgLineChart rows={rows_var} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <SvgLineChart rows={rows_var} scope_col={scope_col.clone()} metric_col="val".to_string() time_col="t_epoch".to_string() />
                 <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"VARIANCE"</div>
             </div>
             <div class="chart-item">
-                <SvgLineChart rows={rows_max} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <SvgLineChart rows={rows_max} scope_col={scope_col.clone()} metric_col="val".to_string() time_col="t_epoch".to_string() />
                 <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"MAX"</div>
             </div>
             <div class="chart-item">
-                <SvgLineChart rows={rows_min} scope_col={scope_col.clone()} metric_col="val".to_string() />
+                <SvgLineChart rows={rows_min} scope_col={scope_col.clone()} metric_col="val".to_string() time_col="t_epoch".to_string() />
                 <div style="font-size:7px; color:var(--muted); text-align:center; margin-top:-18px; position:relative;">"MIN"</div>
             </div>
         </div>
@@ -1412,6 +1455,7 @@ fn SvgLineChart(
     rows: Vec<serde_json::Value>,
     scope_col: String,
     metric_col: String,
+    time_col: String,
 ) -> impl IntoView {
     const W: f64 = 300.0;
     const H: f64 = 120.0;
@@ -1429,7 +1473,7 @@ fn SvgLineChart(
     let mut by_tenant: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new();
 
     for row in &rows {
-        let Some(t) = row.get("t_epoch").and_then(|v| v.as_f64()) else {
+        let Some(t) = row.get(&time_col).and_then(|v| parse_time_col(v)) else {
             continue;
         };
         let Some(v) = row.get(&metric_col).and_then(|v| v.as_f64()) else {
@@ -1571,17 +1615,36 @@ fn DataTable(slice: SliceResponse) -> impl IntoView {
     let Some(obj) = first.as_object() else {
         return view! { <div class="empty-state">"invalid data format"</div> }.into_any();
     };
-    let mut keys: Vec<String> = obj.keys().cloned().collect();
-    // Prioritize t_epoch and common time/scope columns
+    let time_col = slice.time_col.clone();
+    let scope_col = slice.scope_col.clone();
+    let mut keys: Vec<String> = obj.keys()
+        .filter(|k| k.as_str() != "t_epoch")
+        .cloned()
+        .collect();
     keys.sort_by_key(|k| {
-        if k == "t_epoch" || k == &slice.time_col {
-            (0, k.clone())
-        } else if k == &slice.scope_col {
-            (1, k.clone())
-        } else {
-            (2, k.clone())
-        }
+        if k == &time_col { (0, k.clone()) }
+        else if k == &scope_col { (1, k.clone()) }
+        else { (2, k.clone()) }
     });
+
+    // Detect column types by scanning all rows
+    let mut col_is_bool: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut col_is_int: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for k in &keys {
+        if k == &time_col { continue; }
+        let mut all_bool = true;
+        let mut all_int = true;
+        let mut any_num = false;
+        for row in &rows {
+            if let Some(f) = row.get(k).and_then(|v| v.as_f64()) {
+                any_num = true;
+                if f != 0.0 && f != 1.0 { all_bool = false; }
+                if f.fract() != 0.0 { all_int = false; }
+            }
+        }
+        col_is_bool.insert(k.clone(), any_num && all_bool);
+        col_is_int.insert(k.clone(), any_num && all_int && !all_bool);
+    }
 
     view! {
         <div class="data-table-container">
@@ -1595,11 +1658,28 @@ fn DataTable(slice: SliceResponse) -> impl IntoView {
                     {rows.into_iter().map(|row| {
                         let Some(obj) = row.as_object() else { return view! { <tr></tr> }.into_any() };
                         let keys_c = keys.clone();
+                        let tc = time_col.clone();
+                        let cb = col_is_bool.clone();
+                        let ci = col_is_int.clone();
                         view! {
                             <tr>
-                                {keys_c.into_iter().map(|k| {
+                                {keys_c.into_iter().map(move |k| {
                                     let val = obj.get(&k).unwrap_or(&serde_json::Value::Null);
-                                    let (val_str, cls) = if let Some(f) = val.as_f64() {
+                                    if k == tc {
+                                        // Timestamp: local timezone, seconds precision, tooltip with ms
+                                        let s = val.as_str().unwrap_or("");
+                                        let (short, full) = format_ts_local(s);
+                                        return view! {
+                                            <td class="td-ts" title={full}>{short}</td>
+                                        }.into_any();
+                                    }
+                                    let (val_str, cls) = if cb.get(&k).copied().unwrap_or(false) {
+                                        let b = val.as_f64().map(|f| f != 0.0).unwrap_or(false);
+                                        (if b { "true".to_string() } else { "false".to_string() }, "td-bool")
+                                    } else if ci.get(&k).copied().unwrap_or(false) {
+                                        let i = val.as_f64().unwrap_or(0.0) as i64;
+                                        (i.to_string(), "td-num")
+                                    } else if let Some(f) = val.as_f64() {
                                         (format!("{:.4}", f), "td-num")
                                     } else if let Some(i) = val.as_i64() {
                                         (i.to_string(), "td-num")
@@ -1608,7 +1688,7 @@ fn DataTable(slice: SliceResponse) -> impl IntoView {
                                     } else {
                                         (val.to_string().replace("\"", ""), "")
                                     };
-                                    view! { <td class={cls}>{val_str}</td> }
+                                    view! { <td class={cls}>{val_str}</td> }.into_any()
                                 }).collect_view()}
                             </tr>
                         }.into_any()
@@ -1624,6 +1704,7 @@ fn PageDataCharts(slice: SliceResponse, sources: Vec<SourceInfo>) -> impl IntoVi
     let charts = determine_charts(&slice, &sources);
     let rows = slice.rows.clone();
     let sc = slice.scope_col.clone();
+    let tc = slice.time_col.clone();
     let count = slice.count;
     let fetch_ms = slice.fetch_ms;
     let slice_c = slice.clone();
@@ -1638,25 +1719,26 @@ fn PageDataCharts(slice: SliceResponse, sources: Vec<SourceInfo>) -> impl IntoVi
                 {charts.into_iter().map(|chart| {
                     let rows_c = rows.clone();
                     let sc_c = sc.clone();
+                    let tc_c = tc.clone();
                     match chart {
                         ChartDef::Line(col) => view! {
                             <div class="chart-item">
-                                <SvgLineChart rows=rows_c scope_col=sc_c metric_col=col />
+                                <SvgLineChart rows=rows_c scope_col=sc_c metric_col=col time_col=tc_c />
                             </div>
                         }.into_any(),
                         ChartDef::Bar(col) => view! {
                             <div class="chart-item">
-                                <SvgBarChart rows=rows_c scope_col=sc_c metric_col=col />
+                                <SvgBarChart rows=rows_c scope_col=sc_c metric_col=col time_col=tc_c />
                             </div>
                         }.into_any(),
                         ChartDef::Candlestick(col) => view! {
                             <div class="chart-item" style="grid-column: 1 / -1;">
-                                <SvgCandlestickChart rows=rows_c scope_col=sc_c metric_col=col volume_col=None />
+                                <SvgCandlestickChart rows=rows_c scope_col=sc_c metric_col=col volume_col=None time_col=tc_c />
                             </div>
                         }.into_any(),
                         ChartDef::Stats(col) => view! {
                             <div class="chart-item" style="grid-column: 1 / -1;">
-                                <SvgStatsChart rows=rows_c scope_col=sc_c metric_col=col />
+                                <SvgStatsChart rows=rows_c scope_col=sc_c metric_col=col time_col=tc_c />
                             </div>
                         }.into_any(),
                     }
@@ -1793,9 +1875,12 @@ fn ChangelogTimeline(
                 let t = t0 + (t1 - t0) * i / 4;
                 let x = LABEL_W + (i as f64 / 4.0) * bar_w;
                 let anchor = if i == 4 { "end" } else if i == 0 { "start" } else { "middle" };
+                let label = format_tick_label(t, t1 - t0);
+                let full_ts = format_epoch_seconds(t);
                 view! {
                     <text x={x} y={axis_y} font-size="7" fill="var(--muted)" text-anchor={anchor}>
-                        {format_date_short(t)}
+                        <title>{full_ts}</title>
+                        {label}
                     </text>
                 }
             }).collect_view();
@@ -2922,16 +3007,17 @@ fn App() -> impl IntoView {
                         };
                         let range = t_end - t_start;
                         if range <= 0 { return view! { <div></div> }.into_any(); }
-                        let labels: Vec<(i32, String)> = (0i64..=4).map(|i| {
+                        let labels: Vec<(i32, String, String)> = (0i64..=4).map(|i| {
                             let t = t_start + range * i / 4;
-                            (i as i32 * 25, format_date_short(t))
+                            (i as i32 * 25, format_tick_label(t, range), format_epoch_seconds(t))
                         }).collect();
                         view! {
                             <div class="time-axis">
-                                {labels.into_iter().map(|(pct, label)| view! {
+                                {labels.into_iter().map(|(pct, label, full_ts)| view! {
                                     <span
                                         class="time-axis-label"
                                         style=format!("left:{}%", pct)
+                                        title={full_ts}
                                     >{label}</span>
                                 }).collect_view()}
                             </div>
