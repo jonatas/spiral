@@ -3,7 +3,7 @@ use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use wasm_bindgen::JsValue;
 
@@ -32,6 +32,14 @@ struct StorageStats {
     data_per_page: i64,
     #[serde(default)]
     page_size: i64,
+    #[serde(default)]
+    heap_bytes_per_row: f64,
+    #[serde(default)]
+    heap_rows_per_page: f64,
+    #[serde(default)]
+    xor_bytes_per_row: f64,
+    #[serde(default)]
+    xor_rows_per_page: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -57,12 +65,28 @@ struct SystemConfig {
     hierarchies: Vec<HierarchyConfig>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+struct WorkerInfo {
+    pid: i32,
+    state: String,
+    duration_ms: i64,
+    query_snippet: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+struct ChangelogSummaryRow {
+    base_view: String,
+    pending_count: i64,
+    oldest_age_seconds: i64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", content = "data")]
 enum VortexEvent {
     ChangelogUpdate(ChangelogEntry),
     StorageStats(StorageStats),
     SystemConfig(SystemConfig),
+    WorkerUpdate { workers: Vec<WorkerInfo>, summary: Vec<ChangelogSummaryRow> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -89,9 +113,15 @@ struct ExplainResult {
     error: String,
 }
 
-const HEAP_BYTES_PER_ROW: f64 = 48.0;
-const HEAP_ROWS_PER_PAGE: f64 = 8192.0 / HEAP_BYTES_PER_ROW;
-const XOR_BLOCK_BYTES_PER_ROW: f64 = 128.0 / 61.0;
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PageTimeRange {
+    blkno: i32,
+    t_start: i64,
+    t_end: i64,
+}
+
+// No hardcoded storage constants — all values come from the server's spiral_get_storage_stats
+// which derives them from pg_attribute + pg_type for heap and from CompressedBlock struct for XOR.
 
 fn format_timespan(sec: i32) -> String {
     if sec == 0 {
@@ -167,14 +197,46 @@ fn format_age(seconds: i64) -> String {
     }
 }
 
-fn age_color(seconds: i64) -> &'static str {
-    if seconds < 3600 {
-        "#fbbf24"
-    } else if seconds < 21600 {
-        "#f97316"
-    } else {
-        "#ef4444"
+// High-contrast palette for dark background (#0d1117), all ≥ 4.5:1 contrast ratio
+const TABLE_PALETTE: &[&str] = &[
+    "#3fb950", "#58a6ff", "#ff7b72", "#d2a8ff", "#ffa657",
+    "#79c0ff", "#56d364", "#e3b341", "#f778ba", "#40c4ff",
+    "#ff9800", "#b39ddb", "#00e5ff", "#69ff47", "#ff4081",
+];
+
+fn palette_index(base_view: &str) -> usize {
+    let mut h: u32 = 0x811c9dc5;
+    for b in base_view.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
     }
+    h as usize % TABLE_PALETTE.len()
+}
+
+fn default_table_color(base_view: &str) -> String {
+    TABLE_PALETTE[palette_index(base_view)].to_string()
+}
+
+fn resolve_table_color(base_view: &str, overrides: &BTreeMap<String, String>) -> String {
+    overrides.get(base_view).cloned().unwrap_or_else(|| default_table_color(base_view))
+}
+
+fn hex_luminance(hex: &str) -> f64 {
+    let h = hex.trim_start_matches('#');
+    if h.len() < 6 { return 0.0; }
+    let parse = |s: &str| u8::from_str_radix(s, 16).unwrap_or(0) as f64 / 255.0;
+    let r = parse(&h[0..2]);
+    let g = parse(&h[2..4]);
+    let b = parse(&h[4..6]);
+    let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+fn is_sufficient_contrast(hex: &str) -> bool {
+    let bg = hex_luminance("#0d1117");
+    let fg = hex_luminance(hex);
+    let (l1, l2) = if fg > bg { (fg, bg) } else { (bg, fg) };
+    (l1 + 0.05) / (l2 + 0.05) >= 3.0
 }
 
 fn format_bytes(kb: i64) -> String {
@@ -268,18 +330,6 @@ struct ChangelogEntry {
     scope_values: serde_json::Value,
     t_start: i64,
     t_end: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-struct ChangelogEntryFull {
-    event_id: i64,
-    base_view: String,
-    #[serde(default)]
-    t_start: i64,
-    #[serde(default)]
-    t_end: i64,
-    #[serde(default)]
-    age_seconds: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -418,8 +468,7 @@ fn HierarchyTree(
 fn PageMap(
     total_pages: Signal<i64>,
     tenant_scale: Signal<i64>,
-    kickoff: Signal<i64>,
-    frame_seconds: Signal<i32>,
+    page_times: Signal<HashMap<i32, (i64, i64)>>,
     selected_page: Signal<Option<i32>>,
     dirty_blocks: Signal<BTreeSet<i32>>,
     stale_blocks: Signal<BTreeSet<i32>>,
@@ -488,14 +537,13 @@ fn PageMap(
                                 on:click=move |_| on_click(idx)
                                 title=move || {
                                     let scale = tenant_scale.get().max(1) as i32;
-                                    let k = kickoff.get();
-                                    let fs = frame_seconds.get().max(1);
                                     let tenant_id = idx % scale;
-                                    let time_step = idx / scale;
-                                    let est_t = k + (time_step as i64 * fs as i64);
-                                    let t_str = if k > 0 {
-                                        format!("\nEst. Time: {}", format_epoch_seconds(est_t))
-                                    } else { "".into() };
+                                    let times = page_times.get();
+                                    let t_str = times.get(&idx).map(|(t_start, t_end)| {
+                                        format!("\nTime: {} – {}",
+                                            format_epoch_seconds(*t_start),
+                                            format_epoch_seconds(*t_end))
+                                    }).unwrap_or_default();
                                     format!("Page {}\nTenant: {}{}", idx, tenant_id, t_str)
                                 }
                             ></div>
@@ -698,6 +746,7 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
 fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
     let row_count_exp = RwSignal::new(6.0_f64);
 
+    // Actual Spiral bytes/row from live storage data
     let spiral_bpr = move || {
         let s = stats.get();
         if s.total_rows_capacity > 0 && s.spiral_size_kb > 0 {
@@ -707,16 +756,36 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
         }
     };
 
-    let spiral_rows_per_page = move || {
+    // Heap bytes/row from server (pg_attribute + typalign alignment rules)
+    // Falls back to 48 (the MAXALIGN-correct value for a 3-col IoT schema)
+    let heap_bpr = move || {
         let s = stats.get();
-        if s.data_per_page > 0 {
-            s.data_per_page as f64
-        } else {
-            1018.0
-        }
+        if s.heap_bytes_per_row > 0.0 { s.heap_bytes_per_row } else { 48.0 }
     };
 
-    let xor_rows_per_page = || (1018.0 / 16.0) * 61.0;
+    // XOR-Block bytes/row: BLOCK_SIZE / VALUES_PER_XOR_BLOCK = 128 / 61
+    // Derived from CompressedBlock struct on the server, not hardcoded here
+    let xor_bpr = move || {
+        let s = stats.get();
+        if s.xor_bytes_per_row > 0.0 { s.xor_bytes_per_row } else { 128.0 / 61.0 }
+    };
+
+    let spiral_rows_per_page = move || {
+        let s = stats.get();
+        if s.data_per_page > 0 { s.data_per_page as f64 } else { 1018.0 }
+    };
+
+    // Heap rows/page: (BLCKSZ - PageHeaderData) / (tuple_size + ItemId)
+    let heap_rows_per_page = move || {
+        let s = stats.get();
+        if s.heap_rows_per_page > 0.0 { s.heap_rows_per_page } else { 8168.0 / (heap_bpr() + 4.0) }
+    };
+
+    // XOR rows/page: (DATA_PER_PAGE / 16 slots/block) × 61 values/block = 3843
+    let xor_rows_per_page = move || {
+        let s = stats.get();
+        if s.xor_rows_per_page > 0.0 { s.xor_rows_per_page } else { (1018.0_f64 / 16.0).floor() * 61.0 }
+    };
 
     view! {
         <div class="cmp-panel">
@@ -748,13 +817,13 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
             <div class="cmp-bar-row">
                 <span class="cmp-lbl">"Heap"</span>
                 <div class="cmp-outer"><div class="cmp-inner cmp-heap" style="width:100%;"></div></div>
-                <span class="cmp-val">"48 B"</span>
+                <span class="cmp-val">{move || format!("{:.0} B", heap_bpr())}</span>
             </div>
             <div class="cmp-bar-row">
                 <span class="cmp-lbl">"Spiral"</span>
                 <div class="cmp-outer">
                     <div class="cmp-inner cmp-spiral" style={move || {
-                        format!("width:{:.1}%;", (spiral_bpr() / HEAP_BYTES_PER_ROW * 100.0).min(100.0))
+                        format!("width:{:.1}%;", (spiral_bpr() / heap_bpr() * 100.0).min(100.0))
                     }}></div>
                 </div>
                 <span class="cmp-val">{move || format!("{:.1} B", spiral_bpr())}</span>
@@ -762,18 +831,18 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
             <div class="cmp-bar-row">
                 <span class="cmp-lbl">"XOR"</span>
                 <div class="cmp-outer">
-                    <div class="cmp-inner cmp-xor" style={format!(
-                        "width:{:.1}%;", XOR_BLOCK_BYTES_PER_ROW / HEAP_BYTES_PER_ROW * 100.0
-                    )}></div>
+                    <div class="cmp-inner cmp-xor" style={move || {
+                        format!("width:{:.1}%;", xor_bpr() / heap_bpr() * 100.0)
+                    }}></div>
                 </div>
-                <span class="cmp-val">"~2.1 B"</span>
+                <span class="cmp-val">{move || format!("{:.1} B", xor_bpr())}</span>
             </div>
 
             <div class="cmp-section-label" style="margin-top:10px;">"IO TAX — PAGES / 1K ROWS"</div>
             <div class="three-grid">
                 <div class="tg-cell">
                     <span class="tg-label">"HEAP"</span>
-                    <span class="tg-value tg-red">{format!("{:.1}", 1000.0_f64 / HEAP_ROWS_PER_PAGE)}</span>
+                    <span class="tg-value tg-red">{move || format!("{:.1}", 1000.0_f64 / heap_rows_per_page())}</span>
                 </div>
                 <div class="tg-cell">
                     <span class="tg-label">"SPIRAL"</span>
@@ -781,7 +850,7 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 </div>
                 <div class="tg-cell">
                     <span class="tg-label">"XOR-BK"</span>
-                    <span class="tg-value tg-purple">{format!("{:.2}", 1000.0_f64 / xor_rows_per_page())}</span>
+                    <span class="tg-value tg-purple">{move || format!("{:.2}", 1000.0_f64 / xor_rows_per_page())}</span>
                 </div>
             </div>
 
@@ -806,7 +875,7 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 <div class="tg-cell">
                     <span class="tg-label">"HEAP"</span>
                     <span class="tg-value tg-red">{move || {
-                        let bytes = 10.0_f64.powf(row_count_exp.get()) * HEAP_BYTES_PER_ROW;
+                        let bytes = 10.0_f64.powf(row_count_exp.get()) * heap_bpr();
                         if bytes >= 1099511627776.0 { format!("{:.2}TB", bytes / 1099511627776.0) }
                         else if bytes >= 1073741824.0 { format!("{:.1}GB", bytes / 1073741824.0) }
                         else { format!("{:.0}MB", bytes / 1048576.0) }
@@ -824,7 +893,7 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 <div class="tg-cell">
                     <span class="tg-label">"XOR"</span>
                     <span class="tg-value tg-purple">{move || {
-                        let bytes = 10.0_f64.powf(row_count_exp.get()) * XOR_BLOCK_BYTES_PER_ROW;
+                        let bytes = 10.0_f64.powf(row_count_exp.get()) * xor_bpr();
                         if bytes >= 1099511627776.0 { format!("{:.2}TB", bytes / 1099511627776.0) }
                         else if bytes >= 1073741824.0 { format!("{:.1}GB", bytes / 1073741824.0) }
                         else { format!("{:.0}MB", bytes / 1048576.0) }
@@ -833,7 +902,7 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
                 <div class="tg-cell">
                     <span class="tg-label">"SAVED"</span>
                     <span class="tg-value tg-green">{move || {
-                        let saving = (1.0 - spiral_bpr() / HEAP_BYTES_PER_ROW) * 100.0;
+                        let saving = (1.0 - spiral_bpr() / heap_bpr()) * 100.0;
                         format!("{:.1}%", saving)
                     }}</span>
                 </div>
@@ -850,14 +919,14 @@ fn CompressionPanel(stats: Signal<StorageStats>) -> impl IntoView {
             <div class="ls-row">
                 <span class="ls-label">"Heap equiv"</span>
                 <span class="ls-value ls-dim">{move || {
-                    let kb = (1_000_000_000.0 * HEAP_BYTES_PER_ROW / 1024.0) as i64;
+                    let kb = (1_000_000_000.0 * heap_bpr() / 1024.0) as i64;
                     format_bytes(kb)
                 }}</span>
             </div>
             <div class="ls-row">
                 <span class="ls-label">"Estimated Saving"</span>
                 <span class="ls-value ls-green">{move || {
-                    let saving = (1.0 - spiral_bpr() / HEAP_BYTES_PER_ROW) * 100.0;
+                    let saving = (1.0 - spiral_bpr() / heap_bpr()) * 100.0;
                     format!("{:.1}%", saving)
                 }}</span>
             </div>
@@ -1594,94 +1663,240 @@ fn PageDataCharts(slice: SliceResponse, sources: Vec<SourceInfo>) -> impl IntoVi
 
 #[component]
 fn ChangelogTimeline(
-    entries: Signal<Vec<ChangelogEntryFull>>,
-    t_min: Signal<i64>,
-    t_max: Signal<i64>,
+    entries: Signal<VecDeque<ChangelogEntry>>,
+    table_colors: Signal<BTreeMap<String, String>>,
+    worker_infos: Signal<Vec<WorkerInfo>>,
+    selected_base_view: Signal<String>,
     on_bar_click: impl Fn(i64, i64) + 'static + Send + Clone,
 ) -> impl IntoView {
+    let selected_entry = RwSignal::new(None::<ChangelogEntry>);
+
     view! {
+        <div class="changelog-timeline">
         {move || {
-            let entries = entries.get();
-            let t0 = t_min.get();
-            let t1 = t_max.get();
+            let all_entries: Vec<ChangelogEntry> = entries.get().into_iter().collect();
+            let colors = table_colors.get();
+            let workers = worker_infos.get();
+            let sel_bv = selected_base_view.get();
 
-            const W: f64 = 600.0;
-            const H: f64 = 80.0;
-            const MX: f64 = 8.0;
-            const BAR_Y: f64 = 20.0;
-            const BAR_H: f64 = 28.0;
-
-            if entries.is_empty() {
+            if all_entries.is_empty() {
                 return view! {
-                    <div style="color:var(--muted); font-size:10px; padding:6px 0;">"no changelog entries"</div>
+                    <div style="color:var(--muted); font-size:10px; padding:6px 0;">"no pending changelog entries"</div>
                 }.into_any();
             }
 
-            let t_range = (t1 - t0) as f64;
-            let plot_w = W - MX * 2.0;
-
-            let oldest_age = entries.iter().map(|e| e.age_seconds).max().unwrap_or(0);
-            let summary = format!("{} pending · oldest: {} ago", entries.len(), format_age(oldest_age));
-
-            let bars = entries.iter().cloned().map(|entry| {
-                let (x0, bw) = if t_range > 0.0 {
-                    let rx0 = MX + ((entry.t_start - t0) as f64 / t_range * plot_w).clamp(0.0, plot_w);
-                    let rx1 = MX + ((entry.t_end - t0) as f64 / t_range * plot_w).clamp(0.0, plot_w);
-                    (rx0, (rx1 - rx0).max(2.0))
+            // Group by base_view preserving first-seen order
+            let mut lanes: Vec<(String, Vec<ChangelogEntry>)> = Vec::new();
+            for entry in all_entries.iter() {
+                if let Some(lane) = lanes.iter_mut().find(|(bv, _)| bv == &entry.base_view) {
+                    lane.1.push(entry.clone());
                 } else {
-                    (MX, 2.0)
-                };
-                let color = age_color(entry.age_seconds);
-                let ts = entry.t_start;
-                let te = entry.t_end;
-                let cb = on_bar_click.clone();
-                let tooltip = format!(
-                    "#{} {} → {} (age: {})",
-                    entry.event_id,
-                    format_epoch_seconds(entry.t_start),
-                    format_epoch_seconds(entry.t_end),
-                    format_age(entry.age_seconds)
-                );
+                    lanes.push((entry.base_view.clone(), vec![entry.clone()]));
+                }
+            }
+
+            let t0 = all_entries.iter().map(|e| e.t_start).filter(|&t| t > 0).min().unwrap_or(0);
+            let t1 = all_entries.iter().map(|e| e.t_end).filter(|&t| t > 0).max().unwrap_or(t0 + 3600);
+            let t_range = (t1 - t0).max(1) as f64;
+
+            const W: f64 = 600.0;
+            const LABEL_W: f64 = 88.0;
+            const MX: f64 = 3.0;
+            const LANE_H: f64 = 13.0;
+            const LANE_GAP: f64 = 2.0;
+            const AXIS_H: f64 = 14.0;
+            let bar_w = W - LABEL_W - MX;
+            let n = lanes.len();
+            let total_h = MX + n as f64 * (LANE_H + LANE_GAP) + AXIS_H;
+
+            // Determine which tables have active workers
+            let active_tables: std::collections::BTreeSet<String> = workers.iter()
+                .filter(|w| w.state == "active")
+                .filter_map(|w| {
+                    lanes.iter()
+                        .find(|(bv, _)| w.query_snippet.contains(bv.as_str()))
+                        .map(|(bv, _)| bv.clone())
+                })
+                .collect();
+            let any_active = workers.iter().any(|w| w.state == "active");
+
+            let lane_svgs = lanes.iter().enumerate().map(|(i, (bv, lane_entries))| {
+                let lane_y = MX + i as f64 * (LANE_H + LANE_GAP);
+                let color = resolve_table_color(bv, &colors);
+                let is_sel = sel_bv.is_empty() || bv == &sel_bv;
+                let is_active = active_tables.contains(bv) || (any_active && active_tables.is_empty());
+                let label_str = if bv.len() > 12 { bv[..12].to_string() } else { bv.clone() };
+                let label_weight = if bv == &sel_bv { "700" } else { "400" };
+                let label_opacity = if is_sel { "1" } else { "0.45" };
+
+                let dot = is_active.then(|| {
+                    let dc = color.clone();
+                    view! {
+                        <circle cx={LABEL_W - 5.0} cy={lane_y + LANE_H / 2.0} r="3"
+                            fill={dc} class="worker-lane-dot" />
+                    }
+                });
+
+                let lane_bars = lane_entries.iter().map(|entry| {
+                    let x0 = LABEL_W + ((entry.t_start - t0) as f64 / t_range * bar_w).clamp(0.0, bar_w);
+                    let x1 = LABEL_W + ((entry.t_end - t0) as f64 / t_range * bar_w).clamp(0.0, bar_w);
+                    let bw = (x1 - x0).max(2.0);
+                    let bc = color.clone();
+                    let opacity = if is_sel { "0.85" } else { "0.25" };
+                    let ts = entry.t_start;
+                    let te = entry.t_end;
+                    let entry_cl = entry.clone();
+                    let cb = on_bar_click.clone();
+                    let tip = format!("#{} {} → {}",
+                        entry.event_id,
+                        format_epoch_seconds(ts),
+                        format_epoch_seconds(te));
+                    view! {
+                        <rect
+                            x={x0} y={lane_y} width={bw} height={LANE_H}
+                            fill={bc} opacity={opacity} rx="2"
+                            style="cursor:pointer;"
+                            title={tip}
+                            on:click=move |_| {
+                                selected_entry.set(Some(entry_cl.clone()));
+                                cb(ts, te);
+                            }
+                        />
+                    }
+                }).collect_view();
+
+                let bg_opacity = if bv == &sel_bv { "0.06" } else { "0.01" };
+                let lc = color.clone();
                 view! {
-                    <rect
-                        x={x0} y={BAR_Y} width={bw} height={BAR_H}
-                        fill={color} opacity="0.8" rx="2"
-                        style="cursor:pointer;"
-                        title={tooltip}
-                        on:click=move |_| cb(ts, te)
-                    />
+                    <g>
+                        <rect x="0" y={lane_y} width={W} height={LANE_H}
+                            fill="white" opacity={bg_opacity} />
+                        <text x={MX} y={lane_y + LANE_H - 3.0}
+                            font-size="9" font-weight={label_weight}
+                            fill={lc} opacity={label_opacity}>{label_str}</text>
+                        {dot}
+                        {lane_bars}
+                    </g>
                 }
             }).collect_view();
 
-            let axis_y = BAR_Y + BAR_H + 12.0;
-            let axis_labels = if t_range > 0.0 {
-                (0i64..=4).map(|i| {
-                    let t = t0 + (t1 - t0) * i / 4;
-                    let x = MX + (i as f64 / 4.0) * plot_w;
-                    let anchor = if i == 4 { "end" } else if i == 0 { "start" } else { "middle" };
-                    view! {
-                        <text x={x} y={axis_y} font-size="8" fill="var(--blue)" text-anchor={anchor}>
-                            {format_date_short(t)}
-                        </text>
-                    }
-                }).collect_view()
-            } else {
-                Vec::new().collect_view()
-            };
+            let axis_y = MX + n as f64 * (LANE_H + LANE_GAP) + 11.0;
+            let axis_lines = (0i64..=4).map(|i| {
+                let t = t0 + (t1 - t0) * i / 4;
+                let x = LABEL_W + (i as f64 / 4.0) * bar_w;
+                let anchor = if i == 4 { "end" } else if i == 0 { "start" } else { "middle" };
+                view! {
+                    <text x={x} y={axis_y} font-size="7" fill="var(--muted)" text-anchor={anchor}>
+                        {format_date_short(t)}
+                    </text>
+                }
+            }).collect_view();
 
-            let vb = format!("0 0 {} {}", W, H);
+            let vb = format!("0 0 {} {:.0}", W, total_h);
             view! {
-                <div class="changelog-timeline">
-                    <svg viewBox={vb} style="width:100%; height:80px; display:block; overflow:visible;">
-                        <text x={MX} y="13" font-size="9" font-weight="700" fill="var(--muted)">{summary}</text>
-                        <line x1={MX} y1={BAR_Y - 2.0} x2={W - MX} y2={BAR_Y - 2.0} stroke="var(--border)" stroke-width="0.5" />
-                        {bars}
-                        <line x1={MX} y1={BAR_Y + BAR_H + 2.0} x2={W - MX} y2={BAR_Y + BAR_H + 2.0} stroke="var(--border)" stroke-width="0.5" />
-                        {axis_labels}
-                    </svg>
-                </div>
+                <svg viewBox={vb} style=format!("width:100%; height:{:.0}px; display:block;", total_h)>
+                    <line x1={LABEL_W} y1={MX} x2={LABEL_W} y2={axis_y - 11.0}
+                        stroke="var(--border)" stroke-width="0.5"/>
+                    <line x1={LABEL_W} y1={axis_y - 11.0} x2={W} y2={axis_y - 11.0}
+                        stroke="var(--border)" stroke-width="0.5"/>
+                    {lane_svgs}
+                    {axis_lines}
+                </svg>
             }.into_any()
         }}
+        </div>
+
+        // Payload inspector — appears below timeline on bar click
+        {move || selected_entry.get().map(|e| {
+            let scope = serde_json::to_string_pretty(&e.scope_values).unwrap_or_default();
+            let title = format!("#{} {} → {}",
+                e.event_id,
+                format_epoch_seconds(e.t_start),
+                format_epoch_seconds(e.t_end));
+            view! {
+                <div class="cl-payload-bar">
+                    <span class="cl-payload-title">{title}</span>
+                    <span class="cl-payload-close" on:click=move |_| selected_entry.set(None)>"×"</span>
+                    <div class="cl-payload">{scope}</div>
+                </div>
+            }
+        })}
+    }
+}
+
+#[component]
+fn WorkerStrip(
+    workers: Signal<Vec<WorkerInfo>>,
+    summary: Signal<Vec<ChangelogSummaryRow>>,
+    table_colors: Signal<BTreeMap<String, String>>,
+    selected_base_view: Signal<String>,
+) -> impl IntoView {
+    view! {
+        <div class="worker-strip">
+            {move || {
+                let ws = workers.get();
+                let sm = summary.get();
+                let colors = table_colors.get();
+                let selected = selected_base_view.get();
+
+                if ws.is_empty() && sm.is_empty() {
+                    return view! {
+                        <span class="worker-idle">"○ no active workers"</span>
+                    }.into_any();
+                }
+
+                let worker_pills = ws.iter().map(|w| {
+                    let bv = w.query_snippet.split("spiral_refresh_scope").nth(1)
+                        .and_then(|s| s.split_whitespace().next())
+                        .unwrap_or("?")
+                        .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                        .to_string();
+                    let color = resolve_table_color(&bv, &colors);
+                    let dur = if w.duration_ms > 1000 {
+                        format!("{:.1}s", w.duration_ms as f64 / 1000.0)
+                    } else {
+                        format!("{}ms", w.duration_ms)
+                    };
+                    let active = w.state == "active";
+                    view! {
+                        <span class="worker-pill" class:worker-active={active}>
+                            <span class="worker-dot" style=move || format!("background:{}", color)></span>
+                            <span class="worker-pid">"["{w.pid}"]"</span>
+                            <span class="worker-table">{bv}</span>
+                            <span class="worker-dur">{dur}</span>
+                        </span>
+                    }
+                }).collect_view();
+
+                let summary_pills = sm.iter().map(|row| {
+                    let color = resolve_table_color(&row.base_view, &colors);
+                    let is_sel = row.base_view == selected;
+                    let label = format!("{}: {} ({})",
+                        row.base_view,
+                        row.pending_count,
+                        format_age(row.oldest_age_seconds));
+                    let color2 = color.clone();
+                    view! {
+                        <span
+                            class="cl-summary-pill"
+                            class:cl-summary-selected={is_sel}
+                            style=move || format!("border-color:{}", color)
+                        >
+                            <span class="cl-summary-dot" style=move || format!("background:{}", color2)></span>
+                            {label}
+                        </span>
+                    }
+                }).collect_view();
+
+                view! {
+                    <div style="display:flex; flex-wrap:wrap; gap:4px; align-items:center;">
+                        {worker_pills}
+                        <span class="worker-sep">"|"</span>
+                        {summary_pills}
+                    </div>
+                }.into_any()
+            }}
+        </div>
     }
 }
 
@@ -1703,11 +1918,13 @@ fn App() -> impl IntoView {
     let explain_last_block = RwSignal::new(None::<BlockInfo>);
     let dirty_page_nos = RwSignal::new(BTreeSet::<i32>::new());
     let stale_blocks = RwSignal::new(BTreeSet::<i32>::new());
+    let page_time_map = RwSignal::new(HashMap::<i32, (i64, i64)>::new());
     let changelog_buffer = RwSignal::new(VecDeque::<ChangelogEntry>::new());
     let changelog_expanded = RwSignal::new(false);
     let pending_page_restore = RwSignal::new(None::<i32>);
-    let timeline_entries = RwSignal::new(Vec::<ChangelogEntryFull>::new());
-    let timeline_refresh = RwSignal::new(0u32);
+    let worker_infos = RwSignal::new(Vec::<WorkerInfo>::new());
+    let changelog_summary = RwSignal::new(Vec::<ChangelogSummaryRow>::new());
+    let table_colors = RwSignal::new(BTreeMap::<String, String>::new());
     let auto_explain = RwSignal::new({
         web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
@@ -1852,7 +2069,6 @@ fn App() -> impl IntoView {
                                             "#{} {} @ {}",
                                             entry.event_id, entry.base_view, entry.t_start
                                         )));
-                                        timeline_refresh.update(|v| *v += 1);
                                         if entry.base_view == selected_base_view.get_untracked() {
                                             let h = config
                                                 .get_untracked()
@@ -1902,6 +2118,10 @@ fn App() -> impl IntoView {
                                             }
                                         }
                                     }
+                                    VortexEvent::WorkerUpdate { workers, summary } => {
+                                        worker_infos.set(workers);
+                                        changelog_summary.set(summary);
+                                    }
                                 },
                                 Err(e) => console_log!("VortexEvent deserialization error: {}", e),
                             }
@@ -1938,6 +2158,36 @@ fn App() -> impl IntoView {
         slice_data.set(None);
     });
 
+    let api_base_pagemap = Arc::clone(&api_base);
+    Effect::new(move |_| {
+        let selected = selected_base_view.get();
+        let tier = selected_tier_view.get();
+        let conf = config.get_untracked();
+        let view_name = tier.unwrap_or_else(|| {
+            conf.hierarchies
+                .iter()
+                .find(|h| h.base_view == selected)
+                .map(|h| h.raw_view_name.clone())
+                .unwrap_or_default()
+        });
+        if view_name.is_empty() {
+            return;
+        }
+        let url = format!("{}/api/storage/{}/pagemap", api_base_pagemap, view_name);
+        page_time_map.set(HashMap::new());
+        leptos::task::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await
+                && let Ok(ranges) = resp.json::<Vec<PageTimeRange>>().await
+            {
+                let map: HashMap<i32, (i64, i64)> = ranges
+                    .into_iter()
+                    .map(|r| (r.blkno, (r.t_start, r.t_end)))
+                    .collect();
+                page_time_map.set(map);
+            }
+        });
+    });
+
     let api_base_clone = Arc::clone(&api_base);
     let fetch_block_info = move |blkno: i32| {
         selected_block.set(None);
@@ -1971,27 +2221,6 @@ fn App() -> impl IntoView {
             }
         });
     };
-
-    // Fetch changelog timeline entries when base view changes or new WS events arrive (#62)
-    let api_base_timeline = Arc::clone(&api_base);
-    Effect::new(move |_| {
-        let base = selected_base_view.get();
-        let _ = timeline_refresh.get();
-        if base.is_empty() {
-            return;
-        }
-        let url = format!(
-            "{}/api/storage/{}/changelog?limit=100",
-            api_base_timeline, base
-        );
-        leptos::task::spawn_local(async move {
-            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await
-                && let Ok(entries) = resp.json::<Vec<ChangelogEntryFull>>().await
-            {
-                timeline_entries.set(entries);
-            }
-        });
-    });
 
     let api_base_bar_click = Arc::clone(&api_base);
     let on_bar_click = move |ts: i64, te: i64| {
@@ -2298,20 +2527,41 @@ fn App() -> impl IntoView {
                             }.into_any()
                         } else {
                             current_config.hierarchies.into_iter().map(|h| {
-                                let t = h.base_view.clone();
-                                let t_class = t.clone();
+                                let bv = h.base_view.clone();
+                                let bv_click = bv.clone();
+                                let bv_class = bv.clone();
+                                let label = bv.to_uppercase();
                                 view! {
                                     <button
-                                        class=move || if selected_base_view.get() == t_class { "tab tab-active" } else { "tab" }
+                                        class=move || if selected_base_view.get() == bv_class { "tab tab-active" } else { "tab" }
                                         on:click=move |_| {
-                                            selected_base_view.set(t.clone());
+                                            selected_base_view.set(bv_click.clone());
                                             selected_tier_view.set(None);
                                             selected_block.set(None);
                                             selected_page_no.set(None);
                                             dirty_page_nos.set(BTreeSet::new());
                                             stale_blocks.set(BTreeSet::new());
                                         }
-                                    >{h.base_view.to_uppercase()}</button>
+                                        style=move || {
+                                            let color = resolve_table_color(&bv, &table_colors.get());
+                                            // Health: 1.0 = fresh, 0.0 = very stale (>1h)
+                                            let age = changelog_summary.get()
+                                                .iter()
+                                                .find(|r| r.base_view == bv)
+                                                .map(|r| r.oldest_age_seconds)
+                                                .unwrap_or(0);
+                                            let health = (1.0 - (age as f64 / 3600.0).min(1.0));
+                                            let bar_w = (health * 100.0) as u32;
+                                            // health color: green → yellow → red
+                                            let bar_color = if health > 0.6 { "#3fb950" }
+                                                else if health > 0.3 { "#e3b341" }
+                                                else { "#f85149" };
+                                            format!(
+                                                "--tab-color:{}; --tab-health:{:.0}%; --tab-bar-color:{};",
+                                                color, bar_w, bar_color
+                                            )
+                                        }
+                                    >{label}</button>
                                 }
                             }).collect_view().into_any()
                         }
@@ -2478,8 +2728,7 @@ fn App() -> impl IntoView {
                     <PageMap
                         total_pages=Signal::derive(move || current_stats.get().total_pages)
                         tenant_scale=tenant_scale
-                        kickoff=kickoff
-                        frame_seconds=current_frame_seconds
+                        page_times=Signal::derive(move || page_time_map.get())
                         selected_page=Signal::derive(move || selected_page_no.get())
                         dirty_blocks=Signal::derive(move || dirty_page_nos.get())
                         stale_blocks=Signal::derive(move || stale_blocks.get())
@@ -2579,32 +2828,64 @@ fn App() -> impl IntoView {
                     <div class="changelog-panel">
                         <div class="changelog-hdr" on:click=move |_| changelog_expanded.update(|v| *v = !*v)>
                             {move || {
-                                let count = timeline_entries.get().len();
+                                let count: i64 = changelog_summary.get().iter().map(|r| r.pending_count).sum();
+                                let w_count = worker_infos.get().len();
                                 if changelog_expanded.get() {
-                                    format!("▼ CHANGELOG TIMELINE ({})", count)
+                                    format!("▼ CHANGELOG ({} pending, {} workers)", count, w_count)
                                 } else {
-                                    format!("▶ CHANGELOG TIMELINE ({})", count)
+                                    format!("▶ CHANGELOG ({} pending, {} workers)", count, w_count)
                                 }
                             }}
                         </div>
+
+                        // Worker strip + summary pills (always visible)
+                        <WorkerStrip
+                            workers=Signal::derive(move || worker_infos.get())
+                            summary=Signal::derive(move || changelog_summary.get())
+                            table_colors=Signal::derive(move || table_colors.get())
+                            selected_base_view=Signal::derive(move || selected_base_view.get())
+                        />
+
+                        // Multi-lane swim lane timeline: all tables, bars by time range, worker dots
                         <ChangelogTimeline
-                            entries=Signal::derive(move || timeline_entries.get())
-                            t_min=Signal::derive(move || current_stats.get().min_t)
-                            t_max=Signal::derive(move || current_stats.get().max_t)
+                            entries=Signal::derive(move || changelog_buffer.get())
+                            table_colors=Signal::derive(move || table_colors.get())
+                            worker_infos=Signal::derive(move || worker_infos.get())
+                            selected_base_view=Signal::derive(move || selected_base_view.get())
                             on_bar_click=on_bar_click
                         />
+
+                        // Color editor (always visible when expanded)
                         {move || changelog_expanded.get().then(|| {
-                            let entries: Vec<_> = changelog_buffer.get().into_iter().collect();
+                            let colors = table_colors.get();
                             view! {
-                                <div class="changelog-list">
-                                    {entries.into_iter().map(|e| view! {
-                                        <div class="changelog-row">
-                                            <span class="cl-id">"#"{e.event_id}</span>
-                                            <span class="cl-base">{e.base_view}</span>
-                                            <span class="cl-time">{format_epoch_seconds(e.t_start)}</span>
-                                            <span class="cl-sep">"→"</span>
-                                            <span class="cl-time">{format_epoch_seconds(e.t_end)}</span>
-                                        </div>
+                                <div class="cl-color-editor">
+                                    <span class="cl-color-hdr">"TABLE COLORS:"</span>
+                                    {changelog_summary.get().iter().map(|row| {
+                                        let bv = row.base_view.clone();
+                                        let color = resolve_table_color(&bv, &colors);
+                                        let bv2 = bv.clone();
+                                        view! {
+                                            <span class="cl-color-item">
+                                                <input
+                                                    type="color"
+                                                    value={color.clone()}
+                                                    class="cl-color-input"
+                                                    title={format!("Change color for {}", bv)}
+                                                    on:change=move |ev| {
+                                                        use wasm_bindgen::JsCast;
+                                                        let val = ev.target()
+                                                            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                                                            .map(|i| i.value())
+                                                            .unwrap_or_default();
+                                                        if is_sufficient_contrast(&val) {
+                                                            table_colors.update(|m| { m.insert(bv2.clone(), val); });
+                                                        }
+                                                    }
+                                                />
+                                                <span class="cl-color-label" style=move || format!("color:{}", color)>{bv.clone()}</span>
+                                            </span>
+                                        }
                                     }).collect_view()}
                                 </div>
                             }

@@ -117,6 +117,14 @@ struct StorageStats {
     min_t: i64,
     #[serde(default)]
     max_t: i64,
+    #[serde(default)]
+    heap_bytes_per_row: f64,
+    #[serde(default)]
+    heap_rows_per_page: f64,
+    #[serde(default)]
+    xor_bytes_per_row: f64,
+    #[serde(default)]
+    xor_rows_per_page: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -142,17 +150,34 @@ struct SystemConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+struct WorkerInfo {
+    pid: i32,
+    state: String,
+    duration_ms: i64,
+    query_snippet: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, FromRow)]
+struct ChangelogSummaryRow {
+    base_view: String,
+    pending_count: i64,
+    oldest_age_seconds: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "data")]
 enum VortexEvent {
     ChangelogUpdate(ChangelogEntry),
     StorageStats(StorageStats),
     SystemConfig(SystemConfig),
+    WorkerUpdate { workers: Vec<WorkerInfo>, summary: Vec<ChangelogSummaryRow> },
 }
 
 struct AppState {
     pool: Pool<Postgres>,
     tx: broadcast::Sender<VortexEvent>,
     recent_changelog: Mutex<VecDeque<ChangelogEntry>>,
+    last_worker_update: Mutex<(Vec<WorkerInfo>, Vec<ChangelogSummaryRow>)>,
 }
 
 #[tokio::main]
@@ -185,6 +210,7 @@ async fn main() {
         pool: pool.clone(),
         tx: tx.clone(),
         recent_changelog: Mutex::new(VecDeque::with_capacity(500)),
+        last_worker_update: Mutex::new((Vec::new(), Vec::new())),
     });
 
     let poll_secs = std::env::var("VORTEX_POLL_INTERVAL_SECS")
@@ -278,6 +304,47 @@ async fn main() {
                 Err(e) => log_db_error("metadata poll", &e),
             }
 
+            // 3. Poll active workers + per-table changelog summary
+            let workers: Vec<WorkerInfo> = sqlx::query(
+                "SELECT pid::int as pid,
+                        COALESCE(state, 'idle') as state,
+                        COALESCE(EXTRACT(EPOCH FROM (now() - query_start))::bigint * 1000, 0) AS duration_ms,
+                        COALESCE(left(query, 300), '') AS query_snippet
+                 FROM pg_stat_activity
+                 WHERE application_name LIKE 'spiral%'
+                    OR (query ILIKE '%spiral_refresh_scope%' AND state IS DISTINCT FROM 'idle')"
+            )
+            .fetch_all(&polling_state.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                Some(WorkerInfo {
+                    pid: row.try_get::<i32, _>("pid").ok()?,
+                    state: row.try_get::<String, _>("state").unwrap_or_default(),
+                    duration_ms: row.try_get::<i64, _>("duration_ms").unwrap_or(0),
+                    query_snippet: row.try_get::<String, _>("query_snippet").unwrap_or_default(),
+                })
+            })
+            .collect();
+
+            let summary = sqlx::query_as::<_, ChangelogSummaryRow>(
+                "SELECT base_view,
+                        count(*)::bigint AS pending_count,
+                        GREATEST(0, EXTRACT(EPOCH FROM now())::bigint - min(t_end)) AS oldest_age_seconds
+                 FROM spiral.changelog
+                 GROUP BY base_view
+                 ORDER BY oldest_age_seconds DESC"
+            )
+            .fetch_all(&polling_state.pool)
+            .await
+            .unwrap_or_default();
+
+            if let Ok(mut wu) = polling_state.last_worker_update.lock() {
+                *wu = (workers.clone(), summary.clone());
+            }
+            let _ = polling_state.tx.send(VortexEvent::WorkerUpdate { workers, summary });
+
             tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
         }
     });
@@ -364,6 +431,7 @@ async fn main() {
         .route("/api/metadata/{name}", get(get_metadata))
         .route("/api/changelog", get(get_changelog))
         .route("/api/storage/{name}/block/{blkno}", get(get_block_info))
+        .route("/api/storage/{name}/pagemap", get(get_pagemap))
         .route("/api/storage/{name}/changelog", get(get_storage_changelog))
         .route("/api/slice/{view_name}", get(get_slice_data))
         .route("/api/explain", post(run_explain))
@@ -571,6 +639,84 @@ async fn get_block_info(
     Ok(Json(block_info))
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct PageTimeRange {
+    blkno: i32,
+    t_start: i64,
+    t_end: i64,
+}
+
+async fn get_pagemap(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<PageTimeRange>>, (axum::http::StatusCode, String)> {
+    if !valid_identifier(&name) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid view name".into()));
+    }
+
+    let meta_row =
+        sqlx::query("SELECT base_view, columns_metadata FROM spiral.metadata WHERE view_name = $1")
+            .bind(&name)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut time_col = meta_row.as_ref().and_then(|row| {
+        let cm: serde_json::Value = row.get("columns_metadata");
+        cm.get("time_column")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    if time_col.is_none()
+        && let Some(ref row) = meta_row
+    {
+        let base_view: String = row.get("base_view");
+        if let Ok(Some(base_meta)) =
+            sqlx::query("SELECT columns_metadata FROM spiral.metadata WHERE view_name = $1")
+                .bind(&base_view)
+                .fetch_optional(&state.pool)
+                .await
+        {
+            let cm: serde_json::Value = base_meta.get("columns_metadata");
+            time_col = cm
+                .get("time_column")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+
+    let time_col = time_col.unwrap_or_else(|| "t".to_string());
+    if !valid_identifier(&time_col) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid time column".into()));
+    }
+
+    let sql = format!(
+        "SELECT (ctid::text::point)[0]::int AS blkno, \
+         extract(epoch from min(\"{tc}\"))::bigint AS t_start, \
+         extract(epoch from max(\"{tc}\"))::bigint AS t_end \
+         FROM \"{view}\" GROUP BY 1 ORDER BY 1",
+        tc = time_col,
+        view = name,
+    );
+
+    let rows = sqlx::query(&sql)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let result = rows
+        .iter()
+        .map(|row| PageTimeRange {
+            blkno: row.get::<i32, _>("blkno"),
+            t_start: row.get::<i64, _>("t_start"),
+            t_end: row.get::<i64, _>("t_end"),
+        })
+        .collect();
+
+    Ok(Json(result))
+}
+
 async fn get_all_metadata(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Metadata>>, (axum::http::StatusCode, String)> {
@@ -684,6 +830,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
         }
+    }
+
+    // Send last known worker status so client doesn't wait for next poll cycle
+    let worker_update_msg = state.last_worker_update.lock().ok().and_then(|wu| {
+        let (workers, summary) = wu.clone();
+        serde_json::to_string(&VortexEvent::WorkerUpdate { workers, summary }).ok()
+    });
+    if let Some(msg) = worker_update_msg {
+        let _ = sender.send(Message::Text(msg.into())).await;
     }
 
     let mut rx = state.tx.subscribe();
