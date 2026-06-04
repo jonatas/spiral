@@ -313,23 +313,6 @@ fn refresh_incremental(
             )
         };
 
-        let delete_sql = format!(
-            "DELETE FROM \"{view_name}\" AS target
-             WHERE {target_scope_where}
-               AND EXISTS (
-                 SELECT 1 FROM spiral.changelog c
-                 WHERE c.base_view = '{safe_key}'
-                   AND {changelog_scope_match}
-                   AND (c.t_start IS NULL OR spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds})
-                   AND (c.t_end IS NULL OR spiral(target.t) < c.t_end)
-               )",
-            view_name = view_name,
-            target_scope_where = target_scope_where,
-            safe_key = safe_key,
-            changelog_scope_match = changelog_scope_match,
-            frame_seconds = frame_seconds
-        );
-
         let group_by_clause = if scope_cols.is_empty() {
             "1".to_string()
         } else {
@@ -377,7 +360,31 @@ fn refresh_incremental(
             .map(|c| format!("\"{}\"", c))
             .collect::<Vec<_>>()
             .join(", ");
-        let insert_sql = format!(
+
+        // Conflict target: (t, scope_cols...) — matches the idx_u_* unique index.
+        let conflict_cols_str = {
+            let mut cols = vec!["\"t\"".to_string()];
+            cols.extend(scope_cols.iter().cloned());
+            cols.join(", ")
+        };
+
+        // Update set: all non-key columns (exclude t and scope cols).
+        let update_set: String = all_cols
+            .iter()
+            .filter(|c| c.as_str() != "t" && !scope_cols_raw.contains(c))
+            .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let on_conflict = if update_set.is_empty() {
+            "ON CONFLICT DO NOTHING".to_string()
+        } else {
+            format!("ON CONFLICT ({conflict_cols_str}) DO UPDATE SET {update_set}")
+        };
+
+        // UPSERT: replaces the INSERT half of the old DELETE+INSERT.
+        // Uses in-place HOT updates instead of creating dead tuples on every refresh cycle.
+        let upsert_sql = format!(
             "INSERT INTO \"{view_name}\" ({all_cols_joined})
              SELECT {select_part} FROM \"{source_table}\" AS s
              WHERE EXISTS (
@@ -388,7 +395,8 @@ fn refresh_incremental(
                    AND (c.t_end IS NULL OR spiral(s.\"{source_time_col}\") < c.t_end)
              )
              {extra_filter}
-             GROUP BY {group_by_clause}",
+             GROUP BY {group_by_clause}
+             {on_conflict}",
             view_name = view_name,
             all_cols_joined = all_cols_joined,
             select_part = select_part,
@@ -398,15 +406,50 @@ fn refresh_incremental(
             source_time_col = source_time_col,
             frame_seconds = frame_seconds,
             extra_filter = if let Some(ref w) = base_where { format!("AND ({})", w) } else { "".to_string() },
-            group_by_clause = group_by_clause
+            group_by_clause = group_by_clause,
+            on_conflict = on_conflict,
+        );
+
+        // Sparse DELETE: remove aggregate rows whose time bucket was touched by the changelog
+        // but now has no source data (handles source-row deletion).
+        // Runs after the upsert so it only removes truly orphaned rows.
+        let source_scope_match: String = scope_cols_raw
+            .iter()
+            .map(|sc| format!("AND s.\"{}\" = target.\"{}\"", sc, sc))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let sparse_delete_sql = format!(
+            "DELETE FROM \"{view_name}\" AS target
+             WHERE {target_scope_where}
+               AND EXISTS (
+                 SELECT 1 FROM spiral.changelog c
+                 WHERE c.base_view = '{safe_key}'
+                   AND {changelog_scope_match}
+                   AND (c.t_start IS NULL OR spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds})
+                   AND (c.t_end IS NULL OR spiral(target.t) < c.t_end)
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM \"{source_table}\" AS s
+                 WHERE (spiral(s.\"{source_time_col}\") / {frame_seconds}) * {frame_seconds} = spiral(target.t)
+                 {source_scope_match}
+               )",
+            view_name = view_name,
+            target_scope_where = target_scope_where,
+            safe_key = safe_key,
+            changelog_scope_match = changelog_scope_match,
+            frame_seconds = frame_seconds,
+            source_table = source_table,
+            source_time_col = source_time_col,
+            source_scope_match = source_scope_match,
         );
 
         SKIP_ACCELERATION.with(|s| s.set(true));
-        let run_delete = Spi::run(&delete_sql);
-        let run_result = if run_delete.is_ok() {
-            Spi::run(&insert_sql)
+        let run_upsert = Spi::run(&upsert_sql);
+        let run_result = if run_upsert.is_ok() {
+            Spi::run(&sparse_delete_sql)
         } else {
-            run_delete
+            run_upsert
         };
         SKIP_ACCELERATION.with(|s| s.set(false));
 
@@ -415,7 +458,7 @@ fn refresh_incremental(
                 "Spiral: refresh_incremental failed for '{}': {:?}\nSQL: {}",
                 view_name,
                 e,
-                insert_sql
+                upsert_sql
             );
             return false;
         }
