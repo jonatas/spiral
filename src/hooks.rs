@@ -412,6 +412,21 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
                 );
                 create_reconstruction_view(&name);
 
+                if !scope_columns.is_empty() {
+                    let scope_cols_str = scope_columns
+                        .iter()
+                        .map(|s| format!("\"{}\"", s.trim()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let zorder_sql = format!(
+                        "CREATE INDEX IF NOT EXISTS idx_z_{name} ON \"{name}\" (spiral_zorder(spiral(\"{anchor_col}\"), ARRAY[{scope_cols_str}]::text[]))",
+                        name = name,
+                        anchor_col = anchor_col,
+                        scope_cols_str = scope_cols_str
+                    );
+                    let _ = Spi::run(&zorder_sql);
+                }
+
                 install_changelog_triggers(&name, &frames_str);
 
                 // 5. Generate the entire hierarchy automatically (even with no column formulas)

@@ -64,8 +64,8 @@ SET client_min_messages = notice;
 CREATE TABLE trades (
     t       timestamptz NOT NULL,
     symbol  text        NOT NULL,
-    price   float8,                -- ohlcv
-    volume  float8,                -- sum
+    price   float8,                -- Spiral: ohlcv
+    volume  float8,                -- Spiral: sum
     side    smallint
 ) WITH (spiral.frames = '1m,1h,1d', spiral.tenant = 'symbol');
 
@@ -96,10 +96,10 @@ CREATE TABLE iot_readings (
     t          timestamptz NOT NULL,
     device_id  int         NOT NULL,
     location   text        NOT NULL,
-    temp       float8,              -- ohlcv
-    humidity   float8,              -- stats
+    temp       float8,              -- Spiral: ohlcv
+    humidity   float8,              -- Spiral: stats
     pressure   float8,
-    battery    float8               -- stats
+    battery    float8               -- Spiral: stats
 ) WITH (spiral.frames = '1m,1h,1d', spiral.tenant = 'device_id');
 
 CREATE OR REPLACE FUNCTION iot_readings_sample()
@@ -131,9 +131,9 @@ CREATE TABLE api_metrics (
     t           timestamptz NOT NULL,
     service     text        NOT NULL,
     status_code int,
-    duration_ms float8,             -- stats
-    bytes_sent  float8,             -- sum
-    error_count float8              -- sum
+    duration_ms float8,             -- Spiral: stats
+    bytes_sent  float8,             -- Spiral: sum
+    error_count float8              -- Spiral: sum
 ) WITH (spiral.frames = '1m,1h,1d', spiral.tenant = 'service');
 
 CREATE OR REPLACE FUNCTION api_metrics_sample()
@@ -165,11 +165,11 @@ INSERT INTO api_metrics SELECT * FROM api_metrics_sample();
 CREATE TABLE energy_grid (
     t           timestamptz NOT NULL,
     zone_id     int         NOT NULL,
-    load_mw     float8,             -- stats
-    solar_mw    float8,             -- sum
+    load_mw     float8,             -- Spiral: stats
+    solar_mw    float8,             -- Spiral: sum
     wind_mw     float8,
     storage_mwh float8,
-    price_mwh   float8              -- ohlcv
+    price_mwh   float8              -- Spiral: ohlcv
 ) WITH (spiral.frames = '1h,1d', spiral.tenant = 'zone_id');
 
 CREATE OR REPLACE FUNCTION energy_grid_sample()
@@ -200,7 +200,7 @@ CREATE TABLE user_events (
     user_id     int         NOT NULL,
     event_type  text        NOT NULL,
     page        text,
-    duration_ms float8,             -- stats
+    duration_ms float8,             -- Spiral: stats
     country     text
 ) WITH (spiral.frames = '1m,1h,1d', spiral.tenant = 'user_id');
 

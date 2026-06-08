@@ -53,10 +53,10 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
             }
         }
 
-        BackgroundWorker::transaction(|| {
-            let _ = Spi::connect(|client| {
+        let (scopes, debug_logging, batch_size) = BackgroundWorker::transaction(|| {
+            Spi::connect(|client| {
                 if !crate::WORKER_ENABLED.get() {
-                    return Ok::<(), spi::Error>(());
+                    return Ok::<_, spi::Error>(None);
                 }
 
                 let table_exists = !client
@@ -68,7 +68,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     )?
                     .is_empty();
                 if !table_exists {
-                    return Ok::<(), spi::Error>(());
+                    return Ok(None);
                 }
 
                 let debug_logging = crate::WORKER_DEBUG.get();
@@ -76,8 +76,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
 
                 // Scope-affinity scheduling:
                 // Claim (base_view, scope_values) pairs ordered by oldest t_start first
-                // (highest lag processed first). Each pair is protected by a transaction-level
-                // advisory lock so concurrent workers process disjoint scopes.
+                // (highest lag processed first).
                 let scopes: Vec<(String, String)> = client
                     .select(
                         &format!(
@@ -86,7 +85,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                              FROM spiral.changelog \
                              ORDER BY base_view, scope_values, t_start ASC \
                              LIMIT {}",
-                            batch_size * 4 // fetch extras so workers can skip locked ones
+                            batch_size * 2 // fetch extras so workers can skip locked ones
                         ),
                         None,
                         &[],
@@ -101,15 +100,23 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     })
                     .collect();
 
-                let mut processed = 0i32;
-                for (base_view, scope_json) in &scopes {
-                    if processed >= batch_size {
-                        break;
-                    }
+                Ok(Some((scopes, debug_logging, batch_size)))
+            })
+        })
+        .unwrap_or(None)
+        .unwrap_or((vec![], false, 10));
 
-                    let lock_key = format!("{}:{}", base_view, scope_json);
-                    let lock_hash = crate::zorder::fnv1a_64(lock_key.as_bytes()) as i32;
+        let mut processed = 0i32;
+        for (base_view, scope_json) in scopes {
+            if processed >= batch_size {
+                break;
+            }
 
+            let lock_key = format!("{}:{}", base_view, scope_json);
+            let lock_hash = crate::zorder::fnv1a_64(lock_key.as_bytes()) as i32;
+
+            let success = BackgroundWorker::transaction(|| {
+                Spi::connect(|client| {
                     let got_lock: bool = client
                         .select(
                             &format!(
@@ -125,7 +132,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         .unwrap_or(false);
 
                     if !got_lock {
-                        continue; // another worker owns this scope
+                        return Ok(false);
                     }
 
                     if debug_logging {
@@ -143,20 +150,22 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         "SELECT spiral_refresh_scope('{}', '{}')",
                         safe_bv, safe_sv
                     ));
+                    Ok(true)
+                })
+            })
+            .unwrap_or(false);
 
-                    processed += 1;
-                }
+            if success {
+                processed += 1;
+            }
+        }
 
-                if processed > 0 && !debug_logging {
-                    info!(
-                        "Spiral Worker (Slot {}): processed {} scope(s)",
-                        slot, processed
-                    );
-                }
-
-                Ok::<(), spi::Error>(())
-            });
-        });
+        if processed > 0 && !debug_logging {
+            info!(
+                "Spiral Worker (Slot {}): processed {} scope(s)",
+                slot, processed
+            );
+        }
     }
 }
 

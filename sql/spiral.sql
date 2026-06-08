@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS spiral.metadata (
     scope_columns TEXT[] NOT NULL DEFAULT '{}',
     columns_metadata JSONB NOT NULL DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS idx_spiral_metadata_base ON spiral.metadata (base_view);
 
 CREATE TABLE IF NOT EXISTS spiral.sources (
     view_name TEXT NOT NULL,
@@ -34,6 +35,7 @@ ALTER TABLE IF EXISTS spiral.changelog SET (fillfactor = 50);
 
 CREATE INDEX IF NOT EXISTS idx_spiral_changelog_base ON spiral.changelog (base_view);
 CREATE INDEX IF NOT EXISTS idx_spiral_changelog_t_start ON spiral.changelog (t_start NULLS FIRST);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_spiral_changelog_unique ON spiral.changelog (base_view, scope_values, t_start, t_end);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_spiral_changelog_event_id ON spiral.changelog (event_id);
 
 CREATE TYPE time_value_spiral AS (v double precision, t bigint);
@@ -229,8 +231,8 @@ dirty AS (
         COUNT(*)                                      AS dirty_entries,
         COUNT(DISTINCT scope_values)                  AS dirty_scopes,
         SUM(t_end - t_start)                          AS dirty_seconds,
-        to_timestamp(MIN(t_start)::double precision)           AS oldest_dirty_ts,
-        to_timestamp(MAX(t_end)::double precision)             AS newest_dirty_ts
+        to_timestamptz(MIN(t_start))                  AS oldest_dirty_ts,
+        to_timestamptz(MAX(t_end))                    AS newest_dirty_ts
     FROM spiral.changelog
     GROUP BY base_view
 )

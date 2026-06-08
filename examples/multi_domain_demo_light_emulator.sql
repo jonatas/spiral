@@ -53,9 +53,11 @@ CREATE TABLE IF NOT EXISTS spiral.heartbeat_registry (
 -- Idempotent reload: drop entries for this demo's tables then re-insert.
 DELETE FROM spiral.heartbeat_registry
 WHERE table_name IN ('trades','iot_readings','api_metrics','energy_grid','user_events');
-
 -- ── 1. TRADES ─────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_heartbeat_trades ON trades (symbol, t DESC);
+
 CREATE OR REPLACE FUNCTION trades_tick(n int DEFAULT 1) RETURNS void AS $$
+...
 DECLARE
     prev trades;
     i    int;
@@ -93,6 +95,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ── 2. IoT READINGS ───────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_heartbeat_iot ON iot_readings (device_id, t DESC);
 CREATE OR REPLACE FUNCTION iot_readings_tick(n int DEFAULT 1) RETURNS void AS $$
 DECLARE
     prev iot_readings;
@@ -131,6 +134,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ── 3. API METRICS ────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_heartbeat_metrics ON api_metrics (service, t DESC);
 CREATE OR REPLACE FUNCTION api_metrics_tick(n int DEFAULT 1) RETURNS void AS $$
 DECLARE
     prev api_metrics;
@@ -169,6 +173,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ── 4. ENERGY GRID ────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_heartbeat_energy ON energy_grid (zone_id, t DESC);
 CREATE OR REPLACE FUNCTION energy_grid_tick(n int DEFAULT 1) RETURNS void AS $$
 DECLARE
     prev energy_grid;
@@ -207,6 +212,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ── 5. USER EVENTS ────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_heartbeat_events ON user_events (user_id, t DESC);
 CREATE OR REPLACE FUNCTION user_events_tick(n int DEFAULT 1) RETURNS void AS $$
 DECLARE
     prev user_events;
