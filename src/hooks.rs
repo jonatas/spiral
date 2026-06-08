@@ -1257,26 +1257,52 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                 col_types.insert(name.clone(), typ.clone());
                             }
 
+                            let rollup_cols_with_formulas: std::collections::HashSet<String> =
+                                Spi::connect(|client| {
+                                    let q = format!(
+                                        "SELECT DISTINCT base_column FROM spiral.sources WHERE base_view = '{}'",
+                                        base_table.replace("'", "''")
+                                    );
+                                    Ok::<std::collections::HashSet<String>, spi::Error>(
+                                        client
+                                            .select(&q, None, &[])?
+                                            .map(|r| r.get::<String>(1).unwrap().unwrap())
+                                            .collect()
+                                    )
+                                }).unwrap_or_default();
+
+                            // Include ALL columns in their original order to preserve attnos.
+                            for (c, _typ) in &base_table_columns {
+                                if c == "t" {
+                                    continue;
+                                }
+                                let agg = if let Some(found) = query_cols.iter().find(|(name, _)| name == c) {
+                                    found.1.clone()
+                                } else if rollup_cols_with_formulas.contains(c) {
+                                    // Potential type mismatch if included as simple ref in rollup branches
+                                    Some("__UNUSED__".to_string())
+                                } else {
+                                    // Safe to include as simple reference (e.g. scope columns missed by detector)
+                                    None
+                                };
+
+                                if let Some(ref a) = agg {
+                                    if a == "__UNUSED__" {
+                                        // notice!("Spiral: column '{}' marked as UNUSED", c);
+                                    } else {
+                                        // notice!("Spiral: column '{}' has aggregate '{}'", c, a);
+                                    }
+                                } else {
+                                    // notice!("Spiral: column '{}' used as simple reference", c);
+                                }
+                                cols.push((c.clone(), agg));
+                            }
+
                             if query_cols
                                 .iter()
                                 .any(|(name, agg)| name == "*" && agg.as_deref() == Some("count"))
                             {
                                 cols.push(("*".to_string(), Some("count".to_string())));
-                            }
-
-                            for (c, _typ) in &base_table_columns {
-                                if c == "t" {
-                                    continue;
-                                }
-                                if let Some((_, agg)) =
-                                    query_cols.iter().find(|(name, _)| name == c)
-                                {
-                                    cols.push((c.clone(), agg.clone()));
-                                }
-                                // Omit columns not referenced by the outer query: including them
-                                // causes type-mismatch errors in UNION ALL branches because
-                                // rollup columns (e.g. OHLCV stored as JSONB) differ in type
-                                // from the base-table originals (e.g. double precision).
                             }
 
                             let scope_vals: Vec<(String, String)> = qc_opt
@@ -1360,7 +1386,12 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                     Ok::<(), spi::Error>(())
                                 }).unwrap_or(());
 
-                                rewrite_query_aggregates(query, &column_formulas, varno);
+                                let star_attno = if let Some(pos) = cols.iter().position(|(n, _)| n == "*") {
+                                    (pos + 2) as i32 // 1 for t, then 1-based index in cols
+                                } else {
+                                    0
+                                };
+                                rewrite_query_aggregates(query, &column_formulas, varno, star_attno);
 
                                 if let Some(qc) = qc_opt {
                                     if let Some(node) = qc.start_node {
@@ -2209,6 +2240,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
     query: *mut pg_sys::Query,
     column_formulas: &std::collections::HashMap<String, String>,
     varno: i32,
+    star_attno: i32,
 ) {
     if !(*query).hasAggs {
         return;
@@ -2283,6 +2315,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
         rtable: *mut pg_sys::List,
         oids: &[Option<pg_sys::Oid>],
         varno: i32,
+        star_attno: i32,
     ) {
         if node.is_null() {
             return;
@@ -2379,7 +2412,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                         use std::os::raw::c_void;
                         (*agg).aggstar = false;
                         let var =
-                            pg_sys::makeVar(varno, 2, pg_sys::JSONBOID, -1, pg_sys::InvalidOid, 0);
+                            pg_sys::makeVar(varno, star_attno as i16, pg_sys::JSONBOID, -1, pg_sys::InvalidOid, 0);
                         let tle = pg_sys::makeTargetEntry(
                             var as *mut pg_sys::Expr,
                             1,
@@ -2441,6 +2474,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                         rtable,
                         oids,
                         varno,
+                        star_attno,
                     );
                 }
             }
@@ -2454,6 +2488,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                         rtable,
                         oids,
                         varno,
+                        star_attno,
                     );
                 }
             }
@@ -2468,6 +2503,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
             (*query).rtable,
             &oids,
             varno,
+            star_attno,
         );
     }
 }
@@ -2503,22 +2539,31 @@ pub(crate) unsafe fn extract_supported_query_columns(
         match (*node).type_ {
             pg_sys::NodeTag::T_Var => {
                 let var = node as *mut pg_sys::Var;
+                if (*var).varno == 0 || (*var).varno as usize > (*rtable).length as usize {
+                    return false;
+                }
                 let rte = pg_sys::list_nth(rtable, (*var).varno - 1) as *mut pg_sys::RangeTblEntry;
                 if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
-                    return (*rte).rtekind == pg_sys::RTEKind::RTE_GROUP;
+                    let is_group = (*rte).rtekind == pg_sys::RTEKind::RTE_GROUP;
+                    // if is_group { notice!("Spiral: walk_expr found RTE_GROUP Var"); }
+                    return is_group;
                 }
                 let relname_ptr = pg_sys::get_rel_name((*rte).relid);
                 if relname_ptr.is_null() {
                     return false;
                 }
-                if CStr::from_ptr(relname_ptr).to_string_lossy() != base_table {
+                let relname = CStr::from_ptr(relname_ptr).to_string_lossy();
+                if relname != base_table {
+                    // notice!("Spiral: walk_expr saw relation '{}', expected '{}'", relname, base_table);
                     return false;
                 }
-                let varname = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
-                if varname.is_null() {
+                let varname_ptr = pg_sys::get_attname((*rte).relid, (*var).varattno, true);
+                if varname_ptr.is_null() {
                     return false;
                 }
-                cols.push((CStr::from_ptr(varname).to_string_lossy().into_owned(), None));
+                let varname = CStr::from_ptr(varname_ptr).to_string_lossy().into_owned();
+                // notice!("Spiral: walk_expr found column '{}'", varname);
+                cols.push((varname, None));
                 true
             }
             pg_sys::NodeTag::T_Aggref => {
@@ -2876,6 +2921,14 @@ fn construct_union_sql_hierarchical(
                 if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) {
                     inner_select.push(if orig_type.is_empty() {
                         format!("NULL::jsonb AS \"{}\"", col)
+                    } else {
+                        format!("NULL::{} AS \"{}\"", orig_type, col)
+                    });
+                    continue;
+                }
+                if agg_fn == "__UNUSED__" {
+                    inner_select.push(if orig_type.is_empty() {
+                        format!("NULL AS \"{}\"", col)
                     } else {
                         format!("NULL::{} AS \"{}\"", orig_type, col)
                     });

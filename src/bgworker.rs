@@ -132,7 +132,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         .unwrap_or(false);
 
                     if !got_lock {
-                        return Ok(false);
+                        return Ok::<bool, spi::Error>(false);
                     }
 
                     if debug_logging {
@@ -150,7 +150,7 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         "SELECT spiral_refresh_scope('{}', '{}')",
                         safe_bv, safe_sv
                     ));
-                    Ok(true)
+                    Ok::<bool, spi::Error>(true)
                 })
             })
             .unwrap_or(false);
