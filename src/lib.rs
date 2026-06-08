@@ -361,10 +361,10 @@ fn refresh_incremental(
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Conflict target: (t, scope_cols...) — matches the idx_u_* unique index.
+        // Conflict target: (scope_cols..., t) — matches the idx_u_* unique index.
         let conflict_cols_str = {
-            let mut cols = vec!["\"t\"".to_string()];
-            cols.extend(scope_cols.iter().cloned());
+            let mut cols = scope_cols.clone();
+            cols.push("\"t\"".to_string());
             cols.join(", ")
         };
 
@@ -391,8 +391,8 @@ fn refresh_incremental(
                  SELECT 1 FROM spiral.changelog c
                  WHERE c.base_view = '{safe_key}'
                    AND {source_changelog_scope_match}
-                   AND (c.t_start IS NULL OR spiral(s.\"{source_time_col}\") >= (c.t_start/{frame_seconds})*{frame_seconds})
-                   AND (c.t_end IS NULL OR spiral(s.\"{source_time_col}\") < c.t_end)
+                   AND spiral(s.\"{source_time_col}\") >= (c.t_start/{frame_seconds})*{frame_seconds}
+                   AND spiral(s.\"{source_time_col}\") < c.t_end
              )
              {extra_filter}
              GROUP BY {group_by_clause}
@@ -426,8 +426,8 @@ fn refresh_incremental(
                  SELECT 1 FROM spiral.changelog c
                  WHERE c.base_view = '{safe_key}'
                    AND {changelog_scope_match}
-                   AND (c.t_start IS NULL OR spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds})
-                   AND (c.t_end IS NULL OR spiral(target.t) < c.t_end)
+                   AND spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds}
+                   AND spiral(target.t) < c.t_end
                )
                AND NOT EXISTS (
                  SELECT 1 FROM \"{source_table}\" AS s

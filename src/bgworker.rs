@@ -80,10 +80,10 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                 let scopes: Vec<(String, String)> = client
                     .select(
                         &format!(
-                            "SELECT DISTINCT ON (base_view, scope_values) \
-                                base_view, scope_values::text \
+                            "SELECT base_view, scope_values::text \
                              FROM spiral.changelog \
-                             ORDER BY base_view, scope_values, t_start ASC \
+                             GROUP BY base_view, scope_values \
+                             ORDER BY MIN(t_start) ASC \
                              LIMIT {}",
                             batch_size * 2 // fetch extras so workers can skip locked ones
                         ),

@@ -121,7 +121,8 @@ BEGIN
                      'FROM (SELECT DISTINCT ' || v_cols_csv || ', ' ||
                      '      (spiral(t::timestamptz) / ' || v_bucket_secs || ') * ' || v_bucket_secs || ' AS bucket ' ||
                      '      FROM (' || v_union_sql || ') sub) sub ' ||
-                     'GROUP BY ' || v_cols_csv || ', bucket';
+                     'GROUP BY ' || v_cols_csv || ', bucket ' ||
+                     'ON CONFLICT (base_view, scope_values, t_start, t_end) DO NOTHING';
 
             EXECUTE v_sql USING v_base_view;
         END;
@@ -143,7 +144,8 @@ BEGIN
             v_sql := 'INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) ' ||
                      'SELECT DISTINCT $1, ''{}''::jsonb, bucket, bucket + ' || v_bucket_secs || ' ' ||
                      'FROM (SELECT (spiral(t::timestamptz) / ' || v_bucket_secs || ') * ' || v_bucket_secs || ' AS bucket ' ||
-                     '      FROM (' || v_union_sql || ') sub) sub';
+                     '      FROM (' || v_union_sql || ') sub) sub ' ||
+                     'ON CONFLICT (base_view, scope_values, t_start, t_end) DO NOTHING';
 
             EXECUTE v_sql USING v_base_view;
         END;

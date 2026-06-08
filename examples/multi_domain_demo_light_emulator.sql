@@ -57,7 +57,6 @@ WHERE table_name IN ('trades','iot_readings','api_metrics','energy_grid','user_e
 CREATE INDEX IF NOT EXISTS idx_heartbeat_trades ON trades (symbol, t DESC);
 
 CREATE OR REPLACE FUNCTION trades_tick(n int DEFAULT 1) RETURNS void AS $$
-...
 DECLARE
     prev trades;
     i    int;

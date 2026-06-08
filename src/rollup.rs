@@ -349,7 +349,7 @@ pub fn derive_child_sql(
             format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t)")
         } else {
             format!(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}(t, {scope_cols_str});
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_u_{child_name} ON {child_name}({scope_cols_str}, t);
                  CREATE INDEX IF NOT EXISTS idx_z_{child_name} ON {child_name} (
                     spiral_zorder(spiral(t), ARRAY[{scope_cols_str}]::text[])
                 )"
