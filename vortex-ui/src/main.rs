@@ -1833,6 +1833,7 @@ fn PageDataCharts(slice: SliceResponse, sources: Vec<SourceInfo>) -> impl IntoVi
 #[component]
 fn ChangelogTimeline(
     entries: Signal<VecDeque<ChangelogEntry>>,
+    window_secs: Signal<i64>,
     table_colors: Signal<BTreeMap<String, String>>,
     worker_infos: Signal<Vec<WorkerInfo>>,
     selected_base_view: Signal<String>,
@@ -1847,6 +1848,7 @@ fn ChangelogTimeline(
             let colors = table_colors.get();
             let workers = worker_infos.get();
             let sel_bv = selected_base_view.get();
+            let win = window_secs.get();
 
             if all_entries.is_empty() {
                 return view! {
@@ -1864,7 +1866,13 @@ fn ChangelogTimeline(
                 }
             }
 
-            let t0 = all_entries.iter().map(|e| e.t_start).filter(|&t| t > 0).min().unwrap_or(0);
+            let t0_data = all_entries.iter().map(|e| e.t_start).filter(|&t| t > 0).min().unwrap_or(0);
+            let t0 = if win > 0 {
+                let cutoff = (js_sys::Date::now() / 1000.0) as i64 - win;
+                t0_data.max(cutoff)
+            } else {
+                t0_data
+            };
             let t1 = all_entries.iter().map(|e| e.t_end).filter(|&t| t > 0).max().unwrap_or(t0 + 3600);
             let t_range = (t1 - t0).max(1) as f64;
 
@@ -3582,23 +3590,26 @@ fn App() -> impl IntoView {
                             selected_base_view=Signal::derive(move || selected_base_view.get())
                         />
 
-                        // Multi-lane swim lane timeline: all tables, bars by time range, worker dots
-                        <ChangelogTimeline
-                            entries=Signal::derive(move || {
-                                let buf = changelog_buffer.get();
-                                let win = changelog_window_secs.get();
-                                if win == 0 {
-                                    buf
-                                } else {
-                                    let cutoff = (js_sys::Date::now() / 1000.0) as i64 - win;
-                                    buf.into_iter().filter(|e| e.t_end >= cutoff).collect()
-                                }
-                            })
-                            table_colors=Signal::derive(move || table_colors.get())
-                            worker_infos=Signal::derive(move || worker_infos.get())
-                            selected_base_view=Signal::derive(move || selected_base_view.get())
-                            on_bar_click=on_bar_click
-                        />
+                        // Multi-lane swim lane timeline: expandable, all tables, bars by time range, worker dots
+                        {move || changelog_expanded.get().then(|| view! {
+                            <ChangelogTimeline
+                                entries=Signal::derive(move || {
+                                    let buf = changelog_buffer.get();
+                                    let win = changelog_window_secs.get();
+                                    if win == 0 {
+                                        buf
+                                    } else {
+                                        let cutoff = (js_sys::Date::now() / 1000.0) as i64 - win;
+                                        buf.into_iter().filter(|e| e.t_end >= cutoff).collect()
+                                    }
+                                })
+                                window_secs=Signal::derive(move || changelog_window_secs.get())
+                                table_colors=Signal::derive(move || table_colors.get())
+                                worker_infos=Signal::derive(move || worker_infos.get())
+                                selected_base_view=Signal::derive(move || selected_base_view.get())
+                                on_bar_click=on_bar_click.clone()
+                            />
+                        })}
 
                     </div>
                 </div>
