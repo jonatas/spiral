@@ -18,10 +18,9 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
 
     let my_slot_id: Option<i32> = BackgroundWorker::transaction(|| {
         let mut slot = None;
-        for i in 0..max_workers {
-            let lock_id: i64 = 0x41535049 + i as i64;
+        for i in 1..=max_workers {
             let got_lock: bool =
-                Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_lock({})", lock_id))
+                Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_lock({}, {})", db_oid_val.to_u32(), i))
                     .unwrap_or(Some(false))
                     .unwrap_or(false);
 
@@ -117,6 +116,23 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
 
             let success = BackgroundWorker::transaction(|| {
                 Spi::connect(|client| {
+                    // 1. Check if jobs are paused for this DB (e.g. during DDL/testing)
+                    let can_work: bool = client
+                        .select(
+                            &format!("SELECT pg_try_advisory_xact_lock_shared({}, 0)", db_oid_val.to_u32()),
+                            Some(1),
+                            &[],
+                        )?
+                        .first()
+                        .get_one::<bool>()
+                        .unwrap_or(Some(false))
+                        .unwrap_or(false);
+
+                    if !can_work {
+                        return Ok::<bool, spi::Error>(false);
+                    }
+
+                    // 2. Try to get the scope lock
                     let got_lock: bool = client
                         .select(
                             &format!(
@@ -179,6 +195,10 @@ thread_local! {
 /// This function is unsafe because it interacts with PostgreSQL's background worker system.
 pub unsafe fn maybe_start_worker() {
     if WORKER_STARTED.with(|f| f.get()) {
+        return;
+    }
+
+    if !crate::WORKER_ENABLED.get() {
         return;
     }
 

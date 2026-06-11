@@ -225,9 +225,11 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
         }
 
         let mut count = 0;
+        let xmin = pg_sys::GetCurrentTransactionId().into_inner();
+
         for (t, tenant_id, price) in rows {
-            let logical_offset = (t * tenant_scale * 8) + (tenant_id * 8);
-            let (blkno, page_offset) = logical_to_physical_offset(logical_offset);
+            let slot_index = (t * tenant_scale) + tenant_id;
+            let (blkno, page_offset) = tam_logical_to_physical_offset(slot_index);
 
             let mut nblocks = get_block_count(rel);
             while nblocks <= blkno {
@@ -248,8 +250,12 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
 
             let page = pg_sys::BufferGetPage(buffer);
-            let ptr = (page as *mut u8).add(page_offset as usize);
-            *(ptr as *mut f64) = price;
+            let tam = TamSlot {
+                value: price,
+                xmin,
+                xmax: 0,
+            };
+            tam_write_slot(page, page_offset, tam);
 
             pg_sys::MarkBufferDirty(buffer);
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);

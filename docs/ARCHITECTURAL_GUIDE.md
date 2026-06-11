@@ -13,6 +13,21 @@ Spiral tests ideas for transparent hierarchical query acceleration. It is curren
 
 ## Current Limitations & Research Areas
 
+### Testing and Isolation
+
+For testing scenarios or safe manual DDL operations, the autonomous background worker can be paused using specific isolation functions. These functions utilize database-scoped advisory locks to ensure that no background processes interfere with your transactions.
+
+```sql
+-- Pauses background workers until resumed or the session ends
+SELECT spiral.stop_bg_workers();
+
+-- Safe to perform DDLs or isolated testing here
+-- ...
+
+-- Resumes background workers
+SELECT spiral.start_bg_workers();
+```
+
 ## Consolidated Aggregation States
 
 Spiral uses consolidated JSONB states for complex aggregations. This allows for $O(1)$ merging of statistics and sketches across hierarchical tiers.

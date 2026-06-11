@@ -355,6 +355,21 @@ Spiral's background worker is fully autonomous. It automatically starts for any 
 - **`spiral.max_workers` (int, default `1`)**: Caps the number of background workers that can refresh materialized views concurrently. Increase this value (e.g., to 2-4) if you have many active tables or high write throughput, provided you have sufficient CPU cores.
 - **`spiral.worker_batch_size` (int, default `10`)**: The maximum number of `(base_view, scope)` pairs a worker will process per 1-second tick. Increase this if you have many partitioned tenants/scopes receiving updates simultaneously and want the worker to catch up faster.
 
+##### Testing and Isolation
+
+For testing scenarios or safe manual DDL operations, you can temporarily pause workers for the *current database* using advisory locks, guaranteeing no worker process interferes with your transactions:
+
+```sql
+-- Pauses background workers until resumed or the session ends
+SELECT spiral.stop_bg_workers();
+
+-- Safe to perform DDLs or isolated testing here
+-- ...
+
+-- Resumes background workers
+SELECT spiral.start_bg_workers();
+```
+
 #### Query Planner Settings
 
 - **`spiral.enable_planner_hook` (boolean, default `true`)**: Enables or disables Spiral's query planner optimizations. When `false`, the standard PostgreSQL planner is used without sub-query flattening, Z-order pushdowns, or Cost-Based Slicing. Useful for debugging plan performance. Can be overridden per-session using `SET spiral.enable_planner_hook = off;`.

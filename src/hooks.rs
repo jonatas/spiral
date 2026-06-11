@@ -457,6 +457,18 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
         }
     }
 
+    // Pause background workers during DROP/TRUNCATE to prevent them from hitting missing tables.
+    let needs_pause = !utility_stmt.is_null()
+        && ((*utility_stmt).type_ == pg_sys::NodeTag::T_DropStmt
+            || (*utility_stmt).type_ == pg_sys::NodeTag::T_TruncateStmt);
+
+    if needs_pause {
+        let db_oid = pg_sys::MyDatabaseId;
+        if let Err(e) = Spi::run(&format!("SELECT pg_advisory_xact_lock({}, 0)", db_oid.to_u32())) {
+            warning!("Failed to acquire worker pause lock: {:?}", e);
+        }
+    }
+
     // Collect table names to clean up BEFORE drop executes (relations still exist here).
     let drop_table_names: Vec<String> = if !utility_stmt.is_null()
         && (*utility_stmt).type_ == pg_sys::NodeTag::T_DropStmt

@@ -914,18 +914,21 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                     pscan as *mut pg_sys::ParallelBlockTableScanDescData,
                 );
                 if state.current_blkno == pg_sys::InvalidBlockNumber {
+                    pg_sys::ExecClearTuple(slot);
                     return false;
                 }
             }
             pg_sys::ReadBuffer(rel, state.current_blkno)
         } else {
             if state.current_blkno >= blk_limit {
+                pg_sys::ExecClearTuple(slot);
                 return false;
             }
             pg_sys::ReadBuffer(rel, state.current_blkno)
         };
 
         if buffer == 0 {
+            pg_sys::ExecClearTuple(slot);
             return false;
         }
 
@@ -982,11 +985,16 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                         (items_before + 1) as u16,
                     );
                     pg_sys::ExecStoreVirtualTuple(slot);
-                }
 
-                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
-                pg_sys::ReleaseBuffer(buffer);
-                return true;
+                    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                    pg_sys::ReleaseBuffer(buffer);
+                    return true;
+                } else {
+                    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                    pg_sys::ReleaseBuffer(buffer);
+                    // Continue to next slot if we couldn't store this one
+                    continue;
+                }
             }
         }
 
@@ -1131,15 +1139,20 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                     *values.add(2) = tam.value.into_datum().unwrap();
                     *isnull.add(2) = false;
                     pg_sys::ExecStoreVirtualTuple(slot);
-                }
 
-                if !liverows.is_null() {
-                    *liverows += 1.0;
-                }
+                    if !liverows.is_null() {
+                        *liverows += 1.0;
+                    }
 
-                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
-                pg_sys::ReleaseBuffer(buffer);
-                return true;
+                    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                    pg_sys::ReleaseBuffer(buffer);
+                    return true;
+                } else {
+                    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                    pg_sys::ReleaseBuffer(buffer);
+                    // Continue to next slot
+                    continue;
+                }
             }
         }
 
@@ -1148,8 +1161,10 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
         state.current_blkno += 1;
         state.current_offset_in_page = crate::storage::HEADER_SIZE as u32;
 
+        pg_sys::ExecClearTuple(slot);
         return false;
     }
+    pg_sys::ExecClearTuple(slot);
     false
 }
 
@@ -1285,6 +1300,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_bitmap_next_tuple(
 
         // 2. No more offsets in current page, get next page from bitmap
         if !pg_sys::tbm_iterate(tbm_iterator, &mut state.tbm_res) {
+            pg_sys::ExecClearTuple(slot);
             return false;
         }
 
