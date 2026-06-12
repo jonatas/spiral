@@ -1195,6 +1195,60 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_tz_day_group_mixed_dirty_and_tier_segments() {
+        // Writes after a refresh leave a dirty range: the slicer must serve it
+        // from a raw segment while clean ranges still come from the 1h tier,
+        // and the tz-localized day regroup must combine both correctly.
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run("CREATE TABLE tz_mix (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('tz_mix', 'BASE', 0, 'tz_mix', '{}')").unwrap();
+        Spi::run("SELECT spiral_register_view('tz_mix_1h', 'tz_mix', 3600, 'tz_mix', '{}')")
+            .unwrap();
+
+        // America/Sao_Paulo is UTC-3 (no DST since 2019): Jan 2 02:00 UTC is
+        // still Jan 1 local, so the local day crosses the UTC day boundary.
+        Spi::run(
+            "INSERT INTO tz_mix (t, val) VALUES
+             ('2024-01-01 12:00:00+00', 10),  -- Jan 1 09:00 SP
+             ('2024-01-02 02:00:00+00', 20),  -- Jan 1 23:00 SP
+             ('2024-01-02 12:00:00+00', 30)   -- Jan 2 09:00 SP",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('tz_mix')").unwrap();
+
+        // Post-refresh write: this range is dirty, has no 1h bucket yet, and
+        // can only be served by a raw segment.
+        Spi::run("INSERT INTO tz_mix (t, val) VALUES ('2024-01-02 15:00:00+00', 5)").unwrap();
+
+        let day_sums_sql = "SELECT string_agg(to_char(d AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD') || ':' || s::text, ',' ORDER BY d)
+             FROM (SELECT date_trunc('day', t, 'America/Sao_Paulo') d, sum(val)::int s
+                   FROM tz_mix GROUP BY 1) x";
+
+        // Including the dirty row's 5 proves the raw branch was read: the
+        // hourly tier has no bucket containing it.
+        let accelerated: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            accelerated, "2024-01-01:30,2024-01-02:35",
+            "mixed dirty+tier slicing must regroup tz-local days correctly"
+        );
+
+        Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+        let raw: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+        assert_eq!(accelerated, raw, "accelerated result must match raw scan");
+
+        // Poison a clean-range rollup row: the change must show up, proving
+        // the clean segment still comes from the 1h tier.
+        Spi::run("UPDATE tz_mix_1h SET val = val + 100 WHERE t = '2024-01-01 12:00:00+00'")
+            .unwrap();
+        let poisoned: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            poisoned, "2024-01-01:130,2024-01-02:35",
+            "clean ranges must still be served by the hourly tier"
+        );
+    }
+
+    #[pg_test]
     fn test_tz_half_hour_offset_falls_back_raw() {
         // Asia/Kolkata (+05:30): hourly buckets straddle local midnight, so
         // with only a 1h tier the planner must fall back to a raw scan and
