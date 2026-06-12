@@ -41,6 +41,12 @@ pub static ENABLE_PLANNER_HOOK: GucSetting<bool> = GucSetting::<bool>::new(true)
 pub static PLANNER_MAX_SEGMENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
 pub static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Timezone used to align calendar-frame (month/quarter/year) rollup bucket
+/// boundaries. Defaults to UTC so boundaries are deterministic instead of
+/// silently following the server's TimeZone. Set to '' for legacy
+/// server-local behavior.
+pub static CALENDAR_TIMEZONE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"UTC"));
 pub static MINIMAL_PACE: GucSetting<f64> = GucSetting::<f64>::new(60.0);
 /// When true (default), a WARNING is emitted on the first Spiral TAM write
 /// per session to indicate that MVCC / rollback semantics are absent.
@@ -119,6 +125,17 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     );
 
     GucRegistry::define_string_guc(
+        c"spiral.calendar_timezone",
+        c"Timezone for calendar-frame (month/quarter/year) rollup boundaries",
+        c"Month/quarter/year rollup buckets are truncated in this timezone. \
+          Defaults to UTC for deterministic boundaries. Set to an empty string \
+          to use the server's TimeZone (legacy behavior).",
+        &CALENDAR_TIMEZONE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
         c"spiral.kickoff_date",
         c"Base date for time-relative indexing",
         c"Timestamps are stored as offsets from this date. Defaults to 2000-01-01.",
@@ -164,7 +181,10 @@ fn spiral_stop_bg_workers() {
     if let Err(e) = pgrx::Spi::run(&format!("SELECT pg_advisory_lock({}, 0)", db_oid.to_u32())) {
         pgrx::warning!("Failed to acquire worker pause lock: {:?}", e);
     } else {
-        pgrx::info!("Spiral background workers paused for database OID {}", db_oid.to_u32());
+        pgrx::info!(
+            "Spiral background workers paused for database OID {}",
+            db_oid.to_u32()
+        );
     }
 }
 
@@ -172,10 +192,16 @@ fn spiral_stop_bg_workers() {
 #[pg_extern]
 fn spiral_start_bg_workers() {
     let db_oid = unsafe { pgrx::pg_sys::MyDatabaseId };
-    if let Err(e) = pgrx::Spi::run(&format!("SELECT pg_advisory_unlock({}, 0)", db_oid.to_u32())) {
+    if let Err(e) = pgrx::Spi::run(&format!(
+        "SELECT pg_advisory_unlock({}, 0)",
+        db_oid.to_u32()
+    )) {
         pgrx::warning!("Failed to release worker pause lock: {:?}", e);
     } else {
-        pgrx::info!("Spiral background workers resumed for database OID {}", db_oid.to_u32());
+        pgrx::info!(
+            "Spiral background workers resumed for database OID {}",
+            db_oid.to_u32()
+        );
     }
 }
 
@@ -901,9 +927,8 @@ mod tests {
         Spi::run("SELECT spiral_register_view('monthly_ticks_1mon', 'monthly_ticks', 2592000, 'monthly_ticks', '{}')")
             .unwrap();
 
-        // Use mid-month timestamps to avoid timezone-boundary ambiguity:
-        // date_trunc('month', t) uses the server TZ; timestamps near midnight UTC
-        // at month-start can appear in the prior month in negative-offset zones.
+        // Calendar tiers truncate in spiral.calendar_timezone (default UTC),
+        // so boundaries are deterministic regardless of the server TimeZone.
         Spi::run(
             "INSERT INTO monthly_ticks (t, val)
              VALUES
@@ -922,28 +947,31 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(row_count, 3, "expected 3 monthly buckets (Jan, Feb, Mar)");
 
-        // Each bucket t must be the first-of-month at the server's local timezone.
-        // Use date_trunc('month', ...) to produce the expected value regardless of TZ.
+        // Each bucket t must be the first-of-month at the UTC boundary
+        // (spiral.calendar_timezone default).
         let jan_t: bool = Spi::get_one(
             "SELECT EXISTS(
                SELECT 1 FROM monthly_ticks_1mon
-               WHERE t = date_trunc('month', '2024-01-15 12:00:00+00'::timestamptz)
+               WHERE t = date_trunc('month', '2024-01-15 12:00:00+00'::timestamptz, 'UTC')
              )",
         )
         .unwrap()
         .unwrap_or(false);
-        assert!(jan_t, "January bucket must be at first-of-month boundary");
+        assert!(
+            jan_t,
+            "January bucket must be at first-of-month UTC boundary"
+        );
 
         let feb_sum: Option<pgrx::AnyNumeric> = Spi::get_one(
             "SELECT val FROM monthly_ticks_1mon
-             WHERE t = date_trunc('month', '2024-02-15 12:00:00+00'::timestamptz)",
+             WHERE t = date_trunc('month', '2024-02-15 12:00:00+00'::timestamptz, 'UTC')",
         )
         .unwrap();
         assert!(feb_sum.is_some(), "February bucket must exist");
 
         let mar_sum: Option<pgrx::AnyNumeric> = Spi::get_one(
             "SELECT val FROM monthly_ticks_1mon
-             WHERE t = date_trunc('month', '2024-03-15 12:00:00+00'::timestamptz)",
+             WHERE t = date_trunc('month', '2024-03-15 12:00:00+00'::timestamptz, 'UTC')",
         )
         .unwrap();
         assert!(mar_sum.is_some(), "March bucket must exist");
@@ -1024,6 +1052,241 @@ mod tests {
         )
         .unwrap();
         assert!(t2_total.is_some(), "tenant 2 total must be non-null");
+    }
+
+    #[pg_test]
+    fn test_group_granularity_tz_forms() {
+        // Tz-localized date_trunc grouping must cap the rollup tier so each
+        // bucket maps wholly into one local day (issue #88).
+        Spi::run("CREATE TABLE tzg (t timestamptz NOT NULL, val float8)").unwrap();
+        Spi::run("CREATE TABLE tzg_naive (t timestamp NOT NULL, val float8)").unwrap();
+
+        unsafe {
+            let g = |sql: &str, session_off: i64| -> Option<i64> {
+                let q = hooks::parse_sql_to_query(sql);
+                assert!(!q.is_null(), "expected parser output for {sql}");
+                hooks::extract_group_granularity_secs(q, session_off)
+            };
+
+            // UTC session, no tz arg: unchanged.
+            assert_eq!(
+                g("SELECT sum(val) FROM tzg GROUP BY date_trunc('day', t)", 0),
+                Some(86400)
+            );
+            // Non-UTC session truncates in session tz: cap to hourly.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg GROUP BY date_trunc('day', t)",
+                    -10800
+                ),
+                Some(3600)
+            );
+            // Naive timestamp column is tz-independent: no cap.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg_naive GROUP BY date_trunc('day', t)",
+                    -10800
+                ),
+                Some(86400)
+            );
+            // 3-arg form, whole-hour offset: hourly tier.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg GROUP BY date_trunc('day', t, 'America/Sao_Paulo')",
+                    0
+                ),
+                Some(3600)
+            );
+            // Explicit UTC: full day tier stays usable.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg GROUP BY date_trunc('day', t, 'UTC')",
+                    0
+                ),
+                Some(86400)
+            );
+            // AT TIME ZONE form.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg \
+                     GROUP BY date_trunc('day', t AT TIME ZONE 'America/Sao_Paulo')",
+                    0
+                ),
+                Some(3600)
+            );
+            // :30 offset needs a 30m tier.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg GROUP BY date_trunc('day', t, 'Asia/Kolkata')",
+                    0
+                ),
+                Some(1800)
+            );
+            // :45 offset needs a 15m tier.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg GROUP BY date_trunc('day', t, 'Asia/Kathmandu')",
+                    0
+                ),
+                Some(900)
+            );
+            // Tz week grouping regroups from hourly too.
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg GROUP BY date_trunc('week', t, 'America/Sao_Paulo')",
+                    0
+                ),
+                Some(3600)
+            );
+            // Unknown zone: raw fallback (0 disqualifies every tier).
+            assert_eq!(
+                g(
+                    "SELECT sum(val) FROM tzg GROUP BY date_trunc('day', t, 'Not/AZone')",
+                    0
+                ),
+                Some(0)
+            );
+        }
+    }
+
+    #[pg_test]
+    fn test_tz_day_group_acceleration_dst() {
+        // GROUP BY date_trunc('day', t, tz) must route through the hourly tier
+        // and regroup correctly across a DST transition (issue #88).
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run("CREATE TABLE tz_ny (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('tz_ny', 'BASE', 0, 'tz_ny', '{}')").unwrap();
+        Spi::run("SELECT spiral_register_view('tz_ny_1h', 'tz_ny', 3600, 'tz_ny', '{}')").unwrap();
+
+        // US spring-forward 2024-03-10: local midnight moves from 05:00 UTC
+        // to 04:00 UTC. A constant-offset shift would misbucket the third row.
+        Spi::run(
+            "INSERT INTO tz_ny (t, val) VALUES
+             ('2024-03-10 04:00:00+00', 1),  -- Mar 9 23:00 EST
+             ('2024-03-11 03:30:00+00', 4),  -- Mar 10 23:30 EDT
+             ('2024-03-11 04:30:00+00', 2)   -- Mar 11 00:30 EDT",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('tz_ny')").unwrap();
+
+        let day_sums_sql = "SELECT string_agg(to_char(d AT TIME ZONE 'America/New_York', 'YYYY-MM-DD') || ':' || s::text, ',' ORDER BY d)
+             FROM (SELECT date_trunc('day', t, 'America/New_York') d, sum(val)::int s
+                   FROM tz_ny GROUP BY 1) x";
+
+        let accelerated: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            accelerated, "2024-03-09:1,2024-03-10:4,2024-03-11:2",
+            "tz-localized day sums must be correct across DST"
+        );
+
+        Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+        let raw: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+        assert_eq!(accelerated, raw, "accelerated result must match raw scan");
+
+        // Prove the hourly tier is actually read: poison one rollup row and
+        // check the accelerated result reflects it.
+        Spi::run("UPDATE tz_ny_1h SET val = val + 10 WHERE t = '2024-03-11 04:00:00+00'").unwrap();
+        let poisoned: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            poisoned, "2024-03-09:1,2024-03-10:4,2024-03-11:12",
+            "tz day grouping must route through the hourly tier"
+        );
+    }
+
+    #[pg_test]
+    fn test_tz_day_group_mixed_dirty_and_tier_segments() {
+        // Writes after a refresh leave a dirty range: the slicer must serve it
+        // from a raw segment while clean ranges still come from the 1h tier,
+        // and the tz-localized day regroup must combine both correctly.
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run("CREATE TABLE tz_mix (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('tz_mix', 'BASE', 0, 'tz_mix', '{}')").unwrap();
+        Spi::run("SELECT spiral_register_view('tz_mix_1h', 'tz_mix', 3600, 'tz_mix', '{}')")
+            .unwrap();
+
+        // America/Sao_Paulo is UTC-3 (no DST since 2019): Jan 2 02:00 UTC is
+        // still Jan 1 local, so the local day crosses the UTC day boundary.
+        Spi::run(
+            "INSERT INTO tz_mix (t, val) VALUES
+             ('2024-01-01 12:00:00+00', 10),  -- Jan 1 09:00 SP
+             ('2024-01-02 02:00:00+00', 20),  -- Jan 1 23:00 SP
+             ('2024-01-02 12:00:00+00', 30)   -- Jan 2 09:00 SP",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('tz_mix')").unwrap();
+
+        // Post-refresh write: this range is dirty, has no 1h bucket yet, and
+        // can only be served by a raw segment.
+        Spi::run("INSERT INTO tz_mix (t, val) VALUES ('2024-01-02 15:00:00+00', 5)").unwrap();
+
+        let day_sums_sql = "SELECT string_agg(to_char(d AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD') || ':' || s::text, ',' ORDER BY d)
+             FROM (SELECT date_trunc('day', t, 'America/Sao_Paulo') d, sum(val)::int s
+                   FROM tz_mix GROUP BY 1) x";
+
+        // Including the dirty row's 5 proves the raw branch was read: the
+        // hourly tier has no bucket containing it.
+        let accelerated: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            accelerated, "2024-01-01:30,2024-01-02:35",
+            "mixed dirty+tier slicing must regroup tz-local days correctly"
+        );
+
+        Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+        let raw: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+        assert_eq!(accelerated, raw, "accelerated result must match raw scan");
+
+        // Poison a clean-range rollup row: the change must show up, proving
+        // the clean segment still comes from the 1h tier.
+        Spi::run("UPDATE tz_mix_1h SET val = val + 100 WHERE t = '2024-01-01 12:00:00+00'")
+            .unwrap();
+        let poisoned: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            poisoned, "2024-01-01:130,2024-01-02:35",
+            "clean ranges must still be served by the hourly tier"
+        );
+    }
+
+    #[pg_test]
+    fn test_tz_half_hour_offset_falls_back_raw() {
+        // Asia/Kolkata (+05:30): hourly buckets straddle local midnight, so
+        // with only a 1h tier the planner must fall back to a raw scan and
+        // still produce correct local-day sums.
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run("CREATE TABLE tz_ist (t timestamptz NOT NULL, val numeric)").unwrap();
+        Spi::run("INSERT INTO spiral.metadata (view_name, parent_view, frame_seconds, base_view, scope_columns) VALUES ('tz_ist', 'BASE', 0, 'tz_ist', '{}')").unwrap();
+        Spi::run("SELECT spiral_register_view('tz_ist_1h', 'tz_ist', 3600, 'tz_ist', '{}')")
+            .unwrap();
+
+        // Both rows fall in the same UTC hour bucket [18:00, 19:00) but on
+        // different IST days (midnight IST = 18:30 UTC).
+        Spi::run(
+            "INSERT INTO tz_ist (t, val) VALUES
+             ('2024-01-01 18:00:00+00', 1),  -- Jan 1 23:30 IST
+             ('2024-01-01 18:45:00+00', 2)   -- Jan 2 00:15 IST",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('tz_ist')").unwrap();
+
+        let day_sums_sql = "SELECT string_agg(to_char(d AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') || ':' || s::text, ',' ORDER BY d)
+             FROM (SELECT date_trunc('day', t, 'Asia/Kolkata') d, sum(val)::int s
+                   FROM tz_ist GROUP BY 1) x";
+
+        let result: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            result, "2024-01-01:1,2024-01-02:2",
+            "half-hour-offset tz must not merge rows across local midnight"
+        );
+
+        // Prove the hourly tier is NOT read: poison it and check the result
+        // is unchanged (raw fallback).
+        Spi::run("UPDATE tz_ist_1h SET val = val + 100").unwrap();
+        let poisoned: String = Spi::get_one(day_sums_sql).unwrap().unwrap();
+        assert_eq!(
+            poisoned, result,
+            "half-hour tz query with only a 1h tier must use a raw scan"
+        );
     }
 
     #[pg_test]
@@ -2225,7 +2488,10 @@ mod tests {
         )
         .unwrap()
         .unwrap_or(-1);
-        assert_eq!(meta_gone, 0, "spiral.metadata must be cleaned up after DROP TABLE");
+        assert_eq!(
+            meta_gone, 0,
+            "spiral.metadata must be cleaned up after DROP TABLE"
+        );
     }
 }
 
