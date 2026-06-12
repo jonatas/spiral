@@ -3223,7 +3223,28 @@ fn construct_union_sql_hierarchical(
                         Ok((String::new(), col.clone()))
                     }).unwrap_or_else(|_| (String::new(), col.clone()))
                 } else {
-                    (String::new(), col.clone())
+                    // Raw branch: whether the aggregate needs a JSONB
+                    // accumulator (stats/ohlcv/...) depends on the column's
+                    // rollup formula. Without this lookup plain-sum columns
+                    // were cast to jsonb, breaking mixed raw+tier plans.
+                    let f = Spi::connect(|client| -> Result<String, spi::Error> {
+                        let sql = format!(
+                            "SELECT formula FROM spiral.sources \
+                             WHERE view_name = (SELECT view_name FROM spiral.metadata \
+                                                WHERE base_view = '{}' AND frame_seconds > 0 \
+                                                LIMIT 1) \
+                               AND base_column = '{}' LIMIT 1",
+                            base_table.replace('\'', "''"),
+                            col.replace('\'', "''")
+                        );
+                        let mut rows = client.select(&sql, Some(1), &[])?;
+                        if let Some(row) = rows.next() {
+                            return Ok(row.get::<String>(1)?.unwrap_or_default());
+                        }
+                        Ok(String::new())
+                    })
+                    .unwrap_or_default();
+                    (f, col.clone())
                 };
                 if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) {
                     inner_select.push(if orig_type.is_empty() {
@@ -3258,10 +3279,19 @@ fn construct_union_sql_hierarchical(
                             | "spiral_sketch_merge"
                             | "spiral_ohlcv_merge"
                     ) || (matches!(agg_fn.to_lowercase().as_str(), "sum" | "count" | "avg")
-                        && (formula_for_col == "stats"
-                            || formula_for_col == "ohlcv"
-                            || (formula_for_col == "count" && is_rollup)
-                            || !is_rollup));
+                        && if is_rollup {
+                            formula_for_col == "stats"
+                                || formula_for_col == "ohlcv"
+                                || formula_for_col == "count"
+                        } else {
+                            // jsonb only when map_agg_inner wraps an
+                            // accumulator; plain-formula columns stay native.
+                            col == "*"
+                                || matches!(
+                                    formula_for_col.as_str(),
+                                    "stats" | "ohlcv" | "tdigest" | "sketch"
+                                )
+                        });
                 inner_select.push(if !orig_type.is_empty() && !is_json_target {
                     format!("({})::{} AS \"{}\"", col_expr, orig_type, col)
                 } else {
