@@ -6,8 +6,9 @@ pub struct Frame {
     pub seconds: i32,
     /// Non-None for calendar-aligned tiers (month, quarter, year).
     /// Holds the `date_trunc` field name (e.g. "month", "quarter", "year").
-    /// When set, rollup SQL uses `date_trunc(field, t)` instead of epoch
-    /// arithmetic so bucket boundaries align with calendar boundaries.
+    /// When set, rollup SQL uses `date_trunc(field, t, spiral.calendar_timezone)`
+    /// (default UTC) instead of epoch arithmetic so bucket boundaries align
+    /// with calendar boundaries in a deterministic timezone.
     pub calendar_field: Option<String>,
 }
 
@@ -208,11 +209,48 @@ pub fn derive_child_sql(
         } else { ("t".to_string(), Vec::new()) };
 
         let (time_select, time_group) = if let Some(field) = calendar_field {
-            // Calendar-aligned tier: snap to month/quarter/year boundaries.
-            (
-                format!("date_trunc('{}', \"{}\") as t", field, anchor_col),
-                format!("date_trunc('{}', \"{}\")", field, anchor_col),
-            )
+            // Calendar-aligned tier: snap to month/quarter/year boundaries in
+            // spiral.calendar_timezone (default UTC) so boundaries don't
+            // silently depend on the refreshing session's TimeZone. An empty
+            // GUC keeps the legacy server-local 2-arg form.
+            let cal_tz = crate::CALENDAR_TIMEZONE
+                .get()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // The 3-arg date_trunc only exists for timestamptz; naive
+            // timestamp columns are already timezone-independent.
+            let anchor_is_tstz = client
+                .select(
+                    &format!(
+                        "SELECT atttypid = 'timestamptz'::regtype FROM pg_attribute \
+                         WHERE attrelid = to_regclass('\"{}\"') AND attname = '{}'",
+                        parent_name.replace('"', "\"\""),
+                        anchor_col.replace('\'', "''")
+                    ),
+                    Some(1),
+                    &[],
+                )
+                .ok()
+                .and_then(|r| {
+                    if r.is_empty() {
+                        None
+                    } else {
+                        r.first().get::<bool>(1).ok().flatten()
+                    }
+                })
+                .unwrap_or(true);
+            if cal_tz.is_empty() || !anchor_is_tstz {
+                (
+                    format!("date_trunc('{}', \"{}\") as t", field, anchor_col),
+                    format!("date_trunc('{}', \"{}\")", field, anchor_col),
+                )
+            } else {
+                let tz = cal_tz.replace('\'', "''");
+                (
+                    format!("date_trunc('{}', \"{}\", '{}') as t", field, anchor_col, tz),
+                    format!("date_trunc('{}', \"{}\", '{}')", field, anchor_col, tz),
+                )
+            }
         } else {
             (
                 format!(
