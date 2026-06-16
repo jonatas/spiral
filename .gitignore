@@ -13,3 +13,4 @@ tests/pg_regress/regression.out
 vortex-ui/dist/
 node_modules/
 test-results/
+clickbench/*.csv

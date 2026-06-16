@@ -2,6 +2,7 @@ use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[repr(C)]
 pub struct StatsState {
     pub n: f64,
     pub m1: f64,
@@ -248,6 +249,7 @@ impl SketchState {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[repr(C)]
 pub struct OHLCVState {
     pub open: f64,
     pub open_t: i64,
@@ -320,211 +322,166 @@ impl OHLCVState {
     }
 }
 
+// BINARY HELPERS
+
+fn to_binary<T: Serialize>(val: &T) -> Vec<u8> {
+    bincode::serialize(val).unwrap()
+}
+
+fn from_binary<'a, T: Deserialize<'a>>(data: &'a [u8]) -> T {
+    bincode::deserialize(data).unwrap()
+}
+
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_from_count(count: f64) -> pgrx::JsonB {
+pub fn spiral_stats_from_count(count: f64) -> Vec<u8> {
     let mut s = StatsState::default();
     s.n = count;
-    pgrx::JsonB(serde_json::to_value(s).unwrap())
+    to_binary(&s)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
-    let mut s = state
-        .map(|j| serde_json::from_value::<StatsState>(j.0).unwrap())
-        .unwrap_or_default();
+pub fn spiral_stats_accum(state: Option<Vec<u8>>, val: f64) -> Vec<u8> {
+    let mut s = state.map(|b| from_binary::<StatsState>(&b)).unwrap_or_default();
     s.add(val);
-    pgrx::JsonB(serde_json::to_value(s).unwrap())
+    to_binary(&s)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB {
-    let mut s1 = state
-        .and_then(|j| serde_json::from_value::<StatsState>(j.0).ok())
-        .unwrap_or_default();
-    let s2 = other
-        .and_then(|j| serde_json::from_value::<StatsState>(j.0).ok())
-        .unwrap_or_default();
-    s1.merge(&s2);
-    pgrx::JsonB(serde_json::to_value(s1).unwrap())
+pub fn spiral_stats_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) -> Vec<u8> {
+    let mut s1 = state.map(|b| from_binary::<StatsState>(&b)).unwrap_or_default();
+    if let Some(b2) = other {
+        let s2 = from_binary::<StatsState>(&b2);
+        s1.merge(&s2);
+    }
+    to_binary(&s1)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_mean(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .mean()
+pub fn spiral_stats_mean(state: Vec<u8>) -> f64 {
+    from_binary::<StatsState>(&state).mean()
 }
+
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_count_final(state: pgrx::JsonB) -> i64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .n as i64
+pub fn spiral_stats_count_final(state: Vec<u8>) -> i64 {
+    from_binary::<StatsState>(&state).n as i64
 }
+
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_sum_final(state: pgrx::JsonB) -> f64 {
-    let s = serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default();
+pub fn spiral_stats_sum_final(state: Vec<u8>) -> f64 {
+    let s = from_binary::<StatsState>(&state);
     s.m1 * s.n
 }
+
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_min_final(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .min
-}
-#[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_max_final(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .max
-}
-#[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_variance(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .variance()
-}
-#[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_stddev(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .stddev()
-}
-#[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_skewness(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .skewness()
-}
-#[pg_extern(immutable, parallel_safe)]
-pub fn spiral_stats_kurtosis(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<StatsState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .kurtosis()
+pub fn spiral_stats_min_final(state: Vec<u8>) -> f64 {
+    from_binary::<StatsState>(&state).min
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_sketch_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
-    let mut s = state
-        .and_then(|j| serde_json::from_value::<SketchState>(j.0).ok())
-        .unwrap_or_default();
+pub fn spiral_stats_max_final(state: Vec<u8>) -> f64 {
+    from_binary::<StatsState>(&state).max
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_stats_variance(state: Vec<u8>) -> f64 {
+    from_binary::<StatsState>(&state).variance()
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_stats_stddev(state: Vec<u8>) -> f64 {
+    from_binary::<StatsState>(&state).stddev()
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_stats_skewness(state: Vec<u8>) -> f64 {
+    from_binary::<StatsState>(&state).skewness()
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_stats_kurtosis(state: Vec<u8>) -> f64 {
+    from_binary::<StatsState>(&state).kurtosis()
+}
+
+#[pg_extern(immutable, parallel_safe)]
+pub fn spiral_sketch_accum(state: Option<Vec<u8>>, val: f64) -> Vec<u8> {
+    let mut s = state.map(|b| from_binary::<SketchState>(&b)).unwrap_or_default();
     s.add(val);
-    pgrx::JsonB(serde_json::to_value(s).unwrap())
+    to_binary(&s)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_sketch_combine(
-    state: Option<pgrx::JsonB>,
-    other: Option<pgrx::JsonB>,
-) -> pgrx::JsonB {
-    let mut s1 = state
-        .and_then(|j| serde_json::from_value::<SketchState>(j.0).ok())
-        .unwrap_or_default();
-    let s2 = other
-        .and_then(|j| serde_json::from_value::<SketchState>(j.0).ok())
-        .unwrap_or_default();
-    s1.merge(&s2);
-    pgrx::JsonB(serde_json::to_value(s1).unwrap())
+pub fn spiral_sketch_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) -> Vec<u8> {
+    let mut s1 = state.map(|b| from_binary::<SketchState>(&b)).unwrap_or_default();
+    if let Some(b2) = other {
+        let s2 = from_binary::<SketchState>(&b2);
+        s1.merge(&s2);
+    }
+    to_binary(&s1)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_quantile(state: pgrx::JsonB, q: f64) -> f64 {
-    serde_json::from_value::<SketchState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .quantile(q)
+pub fn spiral_quantile(state: Vec<u8>, q: f64) -> f64 {
+    from_binary::<SketchState>(&state).quantile(q)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_tdigest_accum(state: Option<pgrx::JsonB>, val: f64) -> pgrx::JsonB {
+pub fn spiral_tdigest_accum(state: Option<Vec<u8>>, val: f64) -> Vec<u8> {
     spiral_sketch_accum(state, val)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_tdigest_combine(
-    state: Option<pgrx::JsonB>,
-    other: Option<pgrx::JsonB>,
-) -> pgrx::JsonB {
+pub fn spiral_tdigest_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) -> Vec<u8> {
     spiral_sketch_combine(state, other)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_accum(state: Option<pgrx::JsonB>, val: f64, t: i64) -> pgrx::JsonB {
-    let mut s = state
-        .and_then(|j| serde_json::from_value::<OHLCVState>(j.0).ok())
-        .unwrap_or_default();
+pub fn spiral_ohlcv_accum(state: Option<Vec<u8>>, val: f64, t: i64) -> Vec<u8> {
+    let mut s = state.map(|b| from_binary::<OHLCVState>(&b)).unwrap_or_default();
     s.add(val, t);
-    pgrx::JsonB(serde_json::to_value(s).unwrap())
+    to_binary(&s)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_combine(state: Option<pgrx::JsonB>, other: Option<pgrx::JsonB>) -> pgrx::JsonB {
-    let mut s1 = state
-        .and_then(|j| serde_json::from_value::<OHLCVState>(j.0).ok())
-        .unwrap_or_default();
-    let s2 = other
-        .and_then(|j| serde_json::from_value::<OHLCVState>(j.0).ok())
-        .unwrap_or_default();
-    s1.merge(&s2);
-    pgrx::JsonB(serde_json::to_value(s1).unwrap())
+pub fn spiral_ohlcv_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) -> Vec<u8> {
+    let mut s1 = state.map(|b| from_binary::<OHLCVState>(&b)).unwrap_or_default();
+    if let Some(b2) = other {
+        let s2 = from_binary::<OHLCVState>(&b2);
+        s1.merge(&s2);
+    }
+    to_binary(&s1)
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_open(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .open
+pub fn spiral_ohlcv_open(state: Vec<u8>) -> f64 {
+    from_binary::<OHLCVState>(&state).open
 }
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_high(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .high
+pub fn spiral_ohlcv_high(state: Vec<u8>) -> f64 {
+    from_binary::<OHLCVState>(&state).high
 }
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_low(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .low
+pub fn spiral_ohlcv_low(state: Vec<u8>) -> f64 {
+    from_binary::<OHLCVState>(&state).low
 }
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_close(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .close
+pub fn spiral_ohlcv_close(state: Vec<u8>) -> f64 {
+    from_binary::<OHLCVState>(&state).close
 }
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_volume(state: pgrx::JsonB) -> f64 {
-    serde_json::from_value::<OHLCVState>(state.0)
-        .ok()
-        .unwrap_or_default()
-        .volume
+pub fn spiral_ohlcv_volume(state: Vec<u8>) -> f64 {
+    from_binary::<OHLCVState>(&state).volume
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_to_array(state: pgrx::JsonB) -> Vec<f64> {
-    let s = serde_json::from_value::<OHLCVState>(state.0)
-        .ok()
-        .unwrap_or_default();
+pub fn spiral_ohlcv_to_array(state: Vec<u8>) -> Vec<f64> {
+    let s = from_binary::<OHLCVState>(&state);
     vec![s.open, s.high, s.low, s.close, s.volume]
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn spiral_ohlcv_to_json(state: pgrx::JsonB) -> pgrx::JsonB {
-    state
+pub fn spiral_ohlcv_to_json(state: Vec<u8>) -> pgrx::JsonB {
+    let s = from_binary::<OHLCVState>(&state);
+    pgrx::JsonB(serde_json::to_value(s).unwrap())
 }
 
 extension_sql!(
@@ -535,24 +492,24 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION spiral_stats_skewness(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
     CREATE OR REPLACE FUNCTION spiral_stats_kurtosis(double precision) RETURNS double precision AS 'SELECT 0.0::double precision' LANGUAGE SQL IMMUTABLE PARALLEL SAFE;
 
-    CREATE AGGREGATE spiral_stats(double precision) (SFUNC = spiral_stats_accum, STYPE = jsonb, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_stats_merge(jsonb) (SFUNC = spiral_stats_combine, STYPE = jsonb, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_sketch(double precision) (SFUNC = spiral_sketch_accum, STYPE = jsonb, COMBINEFUNC = spiral_sketch_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_sketch_merge(jsonb) (SFUNC = spiral_sketch_combine, STYPE = jsonb, COMBINEFUNC = spiral_sketch_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_tdigest(double precision) (SFUNC = spiral_tdigest_accum, STYPE = jsonb, COMBINEFUNC = spiral_tdigest_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_tdigest_merge(jsonb) (SFUNC = spiral_tdigest_combine, STYPE = jsonb, COMBINEFUNC = spiral_tdigest_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_avg(jsonb) (SFUNC = spiral_stats_combine, STYPE = jsonb, FINALFUNC = spiral_stats_mean, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_count(jsonb) (SFUNC = spiral_stats_combine, STYPE = jsonb, FINALFUNC = spiral_stats_count_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_sum(jsonb) (SFUNC = spiral_stats_combine, STYPE = jsonb, FINALFUNC = spiral_stats_sum_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_min(jsonb) (SFUNC = spiral_stats_combine, STYPE = jsonb, FINALFUNC = spiral_stats_min_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_max(jsonb) (SFUNC = spiral_stats_combine, STYPE = jsonb, FINALFUNC = spiral_stats_max_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_ohlcv(double precision, bigint) (SFUNC = spiral_ohlcv_accum, STYPE = jsonb, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_ohlcv_merge(jsonb) (SFUNC = spiral_ohlcv_combine, STYPE = jsonb, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_open(jsonb) (SFUNC = spiral_ohlcv_combine, STYPE = jsonb, FINALFUNC = spiral_ohlcv_open, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_high(jsonb) (SFUNC = spiral_ohlcv_combine, STYPE = jsonb, FINALFUNC = spiral_ohlcv_high, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_low(jsonb) (SFUNC = spiral_ohlcv_combine, STYPE = jsonb, FINALFUNC = spiral_ohlcv_low, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_close(jsonb) (SFUNC = spiral_ohlcv_combine, STYPE = jsonb, FINALFUNC = spiral_ohlcv_close, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
-    CREATE AGGREGATE spiral_volume(jsonb) (SFUNC = spiral_ohlcv_combine, STYPE = jsonb, FINALFUNC = spiral_ohlcv_volume, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_stats(double precision) (SFUNC = spiral_stats_accum, STYPE = bytea, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_stats_merge(bytea) (SFUNC = spiral_stats_combine, STYPE = bytea, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_sketch(double precision) (SFUNC = spiral_sketch_accum, STYPE = bytea, COMBINEFUNC = spiral_sketch_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_sketch_merge(bytea) (SFUNC = spiral_sketch_combine, STYPE = bytea, COMBINEFUNC = spiral_sketch_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_tdigest(double precision) (SFUNC = spiral_tdigest_accum, STYPE = bytea, COMBINEFUNC = spiral_tdigest_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_tdigest_merge(bytea) (SFUNC = spiral_tdigest_combine, STYPE = bytea, COMBINEFUNC = spiral_tdigest_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_avg(bytea) (SFUNC = spiral_stats_combine, STYPE = bytea, FINALFUNC = spiral_stats_mean, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_count(bytea) (SFUNC = spiral_stats_combine, STYPE = bytea, FINALFUNC = spiral_stats_count_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_sum(bytea) (SFUNC = spiral_stats_combine, STYPE = bytea, FINALFUNC = spiral_stats_sum_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_min(bytea) (SFUNC = spiral_stats_combine, STYPE = bytea, FINALFUNC = spiral_stats_min_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_max(bytea) (SFUNC = spiral_stats_combine, STYPE = bytea, FINALFUNC = spiral_stats_max_final, COMBINEFUNC = spiral_stats_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_ohlcv(double precision, bigint) (SFUNC = spiral_ohlcv_accum, STYPE = bytea, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_ohlcv_merge(bytea) (SFUNC = spiral_ohlcv_combine, STYPE = bytea, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_open(bytea) (SFUNC = spiral_ohlcv_combine, STYPE = bytea, FINALFUNC = spiral_ohlcv_open, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_high(bytea) (SFUNC = spiral_ohlcv_combine, STYPE = bytea, FINALFUNC = spiral_ohlcv_high, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_low(bytea) (SFUNC = spiral_ohlcv_combine, STYPE = bytea, FINALFUNC = spiral_ohlcv_low, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_close(bytea) (SFUNC = spiral_ohlcv_combine, STYPE = bytea, FINALFUNC = spiral_ohlcv_close, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
+    CREATE AGGREGATE spiral_volume(bytea) (SFUNC = spiral_ohlcv_combine, STYPE = bytea, FINALFUNC = spiral_ohlcv_volume, COMBINEFUNC = spiral_ohlcv_combine, PARALLEL = SAFE);
     "#,
     name = "create_spiral_stats_aggregates",
     requires = [
