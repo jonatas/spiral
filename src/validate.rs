@@ -362,4 +362,20 @@ mod tests {
             "scope_values must not encode integer columns as JSON strings"
         );
     }
+
+    #[pg_test]
+    fn pg_test_tenants_timeline() {
+        Spi::connect_mut(|client| {
+            client.update("SET spiral.kickoff_date = '2024-01-01';", None, &[])?;
+            let sql = include_str!("../tests/pg_regress/sql/tenants_timeline.sql");
+            for stmt in sql.split(";") {
+                let s = stmt.trim();
+                if !s.is_empty() {
+                    client.update(s, None, &[])?;
+                }
+            }
+            Ok::<(), spi::Error>(())
+        })
+        .unwrap();
+    }
 }

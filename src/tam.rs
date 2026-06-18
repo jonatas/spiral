@@ -168,19 +168,23 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
         if crate::storage::tam_slot_visible(&tam, snapshot) {
             let rel_name_ptr = pg_sys::get_rel_name((*rel).rd_id);
             let mut kickoff = crate::get_kickoff_epoch();
-            let mut tenant_scale = 1024;
+            let mut fallback_scale = 1024;
+            let mut epochs = Vec::new();
+
             if !rel_name_ptr.is_null() {
                 let rel_name = std::ffi::CStr::from_ptr(rel_name_ptr).to_string_lossy();
                 if let Some(m) = crate::catalog::get_metadata(&rel_name) {
-                    tenant_scale = crate::catalog::get_tenant_scale(&m);
+                    fallback_scale = crate::catalog::get_tenant_scale(&m);
                     kickoff = crate::catalog::get_kickoff(&m);
                 }
+                epochs = crate::catalog::get_timeline(&rel_name);
             }
 
             let idx =
                 (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
-            let t_rel = idx / tenant_scale;
-            let tenant_id = (idx % tenant_scale) as i32;
+            let (t_rel, computed_tid) =
+                crate::catalog::reverse_slot_index(idx, &epochs, fallback_scale);
+            let tenant_id = computed_tid as i32;
             let t_abs = decode_t_abs(t_rel, kickoff, (*rel).rd_att);
 
             pg_sys::ExecClearTuple(slot);
@@ -375,7 +379,14 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
 
         match name.as_str() {
             "t" => {
-                t_val = Some(i64::from_datum(datum, false).unwrap());
+                let attr = pg_sys::TupleDescAttr(tupdesc, i as i32);
+                let atttypid = (*attr).atttypid;
+                if atttypid == pg_sys::TIMESTAMPTZOID || atttypid == pg_sys::TIMESTAMPOID {
+                    let micros = i64::from_datum(datum, false).unwrap();
+                    t_val = Some((micros / 1_000_000) + crate::POSTGRES_EPOCH_JDATE);
+                } else {
+                    t_val = Some(i64::from_datum(datum, false).unwrap());
+                }
             }
             "tenant_id" | "sensor_id" | "symbol_id" => {
                 tenant_id = Some(i32::from_datum(datum, false).unwrap());
@@ -388,27 +399,48 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
     }
 
     if let (Some(t), Some(tid), Some(v)) = (t_val, tenant_id, value) {
-        let mut tenant_scale = 1024;
+        let mut fallback_scale = 1024;
+        let mut epochs = Vec::new();
         let rel_oid = (*rel).rd_id;
 
         unsafe {
             pg_sys::RelationGetSmgr(rel);
         }
 
+        pgrx::notice!("spiral_slot_insert 1");
+
         let relname_ptr = pg_sys::get_rel_name(rel_oid);
         if !relname_ptr.is_null() {
             let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
             if let Some(m) = crate::catalog::get_metadata(&name) {
-                tenant_scale = crate::catalog::get_tenant_scale(&m);
+                fallback_scale = crate::catalog::get_tenant_scale(&m);
             }
+            epochs = crate::catalog::get_timeline(&name);
         }
+
+        pgrx::notice!("spiral_slot_insert 2");
 
         let kickoff = crate::get_kickoff_epoch();
         let t_rel = t - kickoff;
 
+        let tenant_scale = crate::catalog::compute_tenant_scale(t_rel, &epochs, fallback_scale);
+
+        pgrx::notice!(
+            "spiral_slot_insert 3: t_rel={}, tenant_scale={}",
+            t_rel,
+            tenant_scale
+        );
+
         if t_rel >= 0 && (0..tenant_scale).contains(&(tid as i64)) {
-            let slot_index = t_rel * tenant_scale + tid as i64;
+            let slot_index =
+                crate::catalog::compute_slot_index(t_rel, tid as i64, &epochs, fallback_scale);
             let (blkno, page_offset) = crate::storage::tam_logical_to_physical_offset(slot_index);
+
+            pgrx::notice!(
+                "spiral_slot_insert 4: slot_index={}, blkno={}",
+                slot_index,
+                blkno
+            );
 
             let smgr = pg_sys::RelationGetSmgr(rel);
             let mut nblocks = pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
@@ -753,7 +785,9 @@ pub unsafe extern "C-unwind" fn spiral_relation_fetch_toast_slice(
 use std::ffi::CStr;
 
 struct SpiralScanState {
-    tenant_scale: i64,
+    tenant_scale: i64, // fallback scale
+    epochs_ptr: *mut crate::catalog::TimelineEpoch,
+    epochs_len: usize,
     kickoff: i64,
     current_blkno: pg_sys::BlockNumber,
     total_blks: pg_sys::BlockNumber,
@@ -814,19 +848,23 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     scan.rs_flags = flags;
 
     let oid = (*rel).rd_id;
-    let mut tenant_scale = 1024;
+    let mut fallback_scale = 1024;
     let relname_ptr = pg_sys::get_rel_name(oid);
     let mut kickoff = crate::get_kickoff_epoch();
     let mut total_blks = 0;
+
+    let mut epochs = Vec::new();
+
     let (scan_first_blk, scan_last_blk) = if !relname_ptr.is_null() {
         let name = CStr::from_ptr(relname_ptr).to_string_lossy().into_owned();
         let k = if let Some(m) = crate::catalog::get_metadata(&name) {
-            tenant_scale = crate::catalog::get_tenant_scale(&m);
+            fallback_scale = crate::catalog::get_tenant_scale(&m);
             crate::catalog::get_kickoff(&m)
         } else {
             crate::get_kickoff_epoch()
         };
         kickoff = k;
+        epochs = crate::catalog::get_timeline(&name);
 
         let smgr = unsafe { pg_sys::RelationGetSmgr(rel) };
         total_blks = unsafe { pg_sys::smgrnblocks(smgr, pg_sys::ForkNumber::MAIN_FORKNUM) };
@@ -839,10 +877,11 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
             let te_rel = te - k;
 
             // Calculate block bounds based on physical layou
-            let first = (ts_rel.saturating_mul(tenant_scale) / dpg).max(0) as u32;
-            let last = ((te_rel.saturating_mul(tenant_scale) / dpg) + 1)
-                .min(total_blks as i64)
-                .max(0) as u32;
+            let first_idx = crate::catalog::compute_slot_index(ts_rel, 0, &epochs, fallback_scale);
+            let last_idx = crate::catalog::compute_slot_index(te_rel, 0, &epochs, fallback_scale);
+
+            let first = (first_idx / dpg).max(0) as u32;
+            let last = ((last_idx / dpg) + 1).min(total_blks as i64).max(0) as u32;
             (first, last)
         } else {
             (0, total_blks)
@@ -852,7 +891,7 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     };
 
     let state = pg_sys::palloc0(std::mem::size_of::<SpiralScanState>()) as *mut SpiralScanState;
-    (*state).tenant_scale = tenant_scale;
+    (*state).tenant_scale = fallback_scale;
     (*state).kickoff = kickoff;
     (*state).current_blkno = scan_first_blk;
     (*state).total_blks = total_blks;
@@ -862,6 +901,17 @@ pub unsafe extern "C-unwind" fn spiral_scan_begin(
     (*state).curr_offset_idx = 0;
     (*state).noffsets = 0;
     (*state).read_stream = std::ptr::null_mut();
+
+    if !epochs.is_empty() {
+        let size = epochs.len() * std::mem::size_of::<crate::catalog::TimelineEpoch>();
+        let ptr = pg_sys::palloc(size) as *mut crate::catalog::TimelineEpoch;
+        std::ptr::copy_nonoverlapping(epochs.as_ptr(), ptr, epochs.len());
+        (*state).epochs_ptr = ptr;
+        (*state).epochs_len = epochs.len();
+    } else {
+        (*state).epochs_ptr = std::ptr::null_mut();
+        (*state).epochs_len = 0;
+    }
 
     warning!(
         "Spiral: scan_begin total_blks={} bounds=[{}, {})",
@@ -964,9 +1014,22 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                     * crate::storage::TAM_DATA_PER_PAGE as i64)
                     + items_before as i64;
 
-                let t_rel = idx / state.tenant_scale;
-                let tenant_id = (idx % state.tenant_scale) as i32;
-                let t_abs = decode_t_abs(t_rel, state.kickoff, (*scan).rs_rd.as_ref().map_or(std::ptr::null_mut(), |r| r.rd_att));
+                let epochs_slice = if !state.epochs_ptr.is_null() && state.epochs_len > 0 {
+                    std::slice::from_raw_parts(state.epochs_ptr, state.epochs_len)
+                } else {
+                    &[]
+                };
+                let (t_rel, tid) =
+                    crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
+                let tenant_id = tid as i32;
+                let t_abs = decode_t_abs(
+                    t_rel,
+                    state.kickoff,
+                    (*scan)
+                        .rs_rd
+                        .as_ref()
+                        .map_or(std::ptr::null_mut(), |r| r.rd_att),
+                );
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
@@ -1123,10 +1186,23 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 let idx = (state.current_blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64)
                     + items_before as i64;
 
-                let t_rel = idx / state.tenant_scale;
-                let tenant_id = (idx % state.tenant_scale) as i32;
+                let epochs_slice = if !state.epochs_ptr.is_null() && state.epochs_len > 0 {
+                    std::slice::from_raw_parts(state.epochs_ptr, state.epochs_len)
+                } else {
+                    &[]
+                };
+                let (t_rel, tid) =
+                    crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
+                let tenant_id = tid as i32;
                 let kickoff = crate::get_kickoff_epoch();
-                let t_abs = decode_t_abs(t_rel, kickoff, (*scan).rs_rd.as_ref().map_or(std::ptr::null_mut(), |r| r.rd_att));
+                let t_abs = decode_t_abs(
+                    t_rel,
+                    kickoff,
+                    (*scan)
+                        .rs_rd
+                        .as_ref()
+                        .map_or(std::ptr::null_mut(), |r| r.rd_att),
+                );
 
                 pg_sys::ExecClearTuple(slot);
                 let values = (*slot).tts_values;
@@ -1533,13 +1609,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(count, 0, "Initial count should be 0");
-            
+
             client.update(
                 "INSERT INTO tam_rollback_mvcc VALUES (1, 0, 42.0);",
                 None,
                 &[],
             )?;
-            
+
             let count2 = Spi::get_one::<i64>("SELECT count(*) FROM tam_rollback_mvcc")
                 .unwrap()
                 .unwrap();

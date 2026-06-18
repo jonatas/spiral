@@ -30,6 +30,18 @@ CREATE TABLE IF NOT EXISTS spiral.changelog (
     t_end BIGINT
 ) WITH (fillfactor = 50);
 
+CREATE TABLE IF NOT EXISTS spiral.tenants_timeline (
+    table_name TEXT NOT NULL,
+    epoch_id SERIAL,
+    start_t BIGINT NOT NULL,
+    end_t BIGINT,
+    tenant_scale INTEGER NOT NULL,
+    base_offset BIGINT NOT NULL,
+    PRIMARY KEY (table_name, epoch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_spiral_tenants_timeline_time ON spiral.tenants_timeline (table_name, start_t, end_t);
+
+
 -- Apply fillfactor to existing installations without a full VACUUM FULL.
 ALTER TABLE IF EXISTS spiral.changelog SET (fillfactor = 50);
 
