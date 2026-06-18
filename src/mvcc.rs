@@ -2,12 +2,14 @@ use pgrx::pg_sys;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+type MvccStateMap = HashMap<(u32, u32, u16), (u32, f64)>;
+
 // Per-backend pending writes: (rel_oid, blkno, posid) -> (writing_xid, old_value)
 // Populated on every write; cleaned up on commit (drop entries) or abort (restore + drop).
-static PENDING_WRITES: OnceLock<Mutex<HashMap<(u32, u32, u16), (u32, f64)>>> = OnceLock::new();
+static PENDING_WRITES: OnceLock<Mutex<MvccStateMap>> = OnceLock::new();
 static CALLBACK_REGISTERED: OnceLock<()> = OnceLock::new();
 
-fn pending_writes() -> &'static Mutex<HashMap<(u32, u32, u16), (u32, f64)>> {
+fn pending_writes() -> &'static Mutex<MvccStateMap> {
     PENDING_WRITES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -87,7 +89,8 @@ unsafe fn restore_slot(rel_oid: u32, blkno: u32, posid: u16, value: f64) {
 /// written multiple times within the same transaction.
 pub fn record_write(rel_oid: u32, blkno: u32, posid: u16, xid: u32, old_value: f64) {
     if let Ok(mut map) = pending_writes().lock() {
-        map.entry((rel_oid, blkno, posid)).or_insert((xid, old_value));
+        map.entry((rel_oid, blkno, posid))
+            .or_insert((xid, old_value));
     }
 }
 
@@ -119,8 +122,7 @@ pub unsafe fn check_visibility(
 
     let writing_xid = {
         let map = pending_writes().lock().ok()?;
-        map.get(&(rel_oid, blkno, posid))
-            .map(|(xid, _)| *xid)?
+        map.get(&(rel_oid, blkno, posid)).map(|(xid, _)| *xid)?
     };
 
     if pg_sys::XidInMVCCSnapshot(pg_sys::TransactionId::from(writing_xid), snapshot) {

@@ -164,7 +164,10 @@ fn spiral_stop_bg_workers() {
     if let Err(e) = pgrx::Spi::run(&format!("SELECT pg_advisory_lock({}, 0)", db_oid.to_u32())) {
         pgrx::warning!("Failed to acquire worker pause lock: {:?}", e);
     } else {
-        pgrx::info!("Spiral background workers paused for database OID {}", db_oid.to_u32());
+        pgrx::info!(
+            "Spiral background workers paused for database OID {}",
+            db_oid.to_u32()
+        );
     }
 }
 
@@ -172,10 +175,16 @@ fn spiral_stop_bg_workers() {
 #[pg_extern]
 fn spiral_start_bg_workers() {
     let db_oid = unsafe { pgrx::pg_sys::MyDatabaseId };
-    if let Err(e) = pgrx::Spi::run(&format!("SELECT pg_advisory_unlock({}, 0)", db_oid.to_u32())) {
+    if let Err(e) = pgrx::Spi::run(&format!(
+        "SELECT pg_advisory_unlock({}, 0)",
+        db_oid.to_u32()
+    )) {
         pgrx::warning!("Failed to release worker pause lock: {:?}", e);
     } else {
-        pgrx::info!("Spiral background workers resumed for database OID {}", db_oid.to_u32());
+        pgrx::info!(
+            "Spiral background workers resumed for database OID {}",
+            db_oid.to_u32()
+        );
     }
 }
 
@@ -2225,7 +2234,10 @@ mod tests {
         )
         .unwrap()
         .unwrap_or(-1);
-        assert_eq!(meta_gone, 0, "spiral.metadata must be cleaned up after DROP TABLE");
+        assert_eq!(
+            meta_gone, 0,
+            "spiral.metadata must be cleaned up after DROP TABLE"
+        );
     }
 }
 

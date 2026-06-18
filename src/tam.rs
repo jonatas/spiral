@@ -379,7 +379,7 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
 
         match name.as_str() {
             "t" => {
-                let attr = pg_sys::TupleDescAttr(tupdesc, i as i32);
+                let attr = pg_sys::TupleDescAttr(tupdesc, i);
                 let atttypid = (*attr).atttypid;
                 if atttypid == pg_sys::TIMESTAMPTZOID || atttypid == pg_sys::TIMESTAMPOID {
                     let micros = i64::from_datum(datum, false).unwrap();

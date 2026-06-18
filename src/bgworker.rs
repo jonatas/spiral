@@ -19,10 +19,13 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
     let my_slot_id: Option<i32> = BackgroundWorker::transaction(|| {
         let mut slot = None;
         for i in 1..=max_workers {
-            let got_lock: bool =
-                Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_lock({}, {})", db_oid_val.to_u32(), i))
-                    .unwrap_or(Some(false))
-                    .unwrap_or(false);
+            let got_lock: bool = Spi::get_one::<bool>(&format!(
+                "SELECT pg_try_advisory_lock({}, {})",
+                db_oid_val.to_u32(),
+                i
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
 
             if got_lock {
                 slot = Some(i);
@@ -119,7 +122,10 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     // 1. Check if jobs are paused for this DB (e.g. during DDL/testing)
                     let can_work: bool = client
                         .select(
-                            &format!("SELECT pg_try_advisory_xact_lock_shared({}, 0)", db_oid_val.to_u32()),
+                            &format!(
+                                "SELECT pg_try_advisory_xact_lock_shared({}, 0)",
+                                db_oid_val.to_u32()
+                            ),
                             Some(1),
                             &[],
                         )?

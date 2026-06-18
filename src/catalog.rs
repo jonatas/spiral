@@ -71,7 +71,7 @@ pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
                 for row in tuple_table {
                     results.push(TimelineEpoch {
                         start_t: row.get::<i64>(1)?.unwrap_or(0),
-                        end_t: row.get::<i64>(2)?.unwrap_or(std::i64::MAX),
+                        end_t: row.get::<i64>(2)?.unwrap_or(i64::MAX),
                         tenant_scale: row.get::<i32>(3)?.unwrap_or(1024) as i64,
                         base_offset: row.get::<i64>(4)?.unwrap_or(0),
                     });

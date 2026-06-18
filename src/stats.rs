@@ -341,14 +341,18 @@ pub fn spiral_stats_from_count(count: f64) -> Vec<u8> {
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_accum(state: Option<Vec<u8>>, val: f64) -> Vec<u8> {
-    let mut s = state.map(|b| from_binary::<StatsState>(&b)).unwrap_or_default();
+    let mut s = state
+        .map(|b| from_binary::<StatsState>(&b))
+        .unwrap_or_default();
     s.add(val);
     to_binary(&s)
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_stats_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) -> Vec<u8> {
-    let mut s1 = state.map(|b| from_binary::<StatsState>(&b)).unwrap_or_default();
+    let mut s1 = state
+        .map(|b| from_binary::<StatsState>(&b))
+        .unwrap_or_default();
     if let Some(b2) = other {
         let s2 = from_binary::<StatsState>(&b2);
         s1.merge(&s2);
@@ -404,14 +408,18 @@ pub fn spiral_stats_kurtosis(state: Vec<u8>) -> f64 {
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_sketch_accum(state: Option<Vec<u8>>, val: f64) -> Vec<u8> {
-    let mut s = state.map(|b| from_binary::<SketchState>(&b)).unwrap_or_default();
+    let mut s = state
+        .map(|b| from_binary::<SketchState>(&b))
+        .unwrap_or_default();
     s.add(val);
     to_binary(&s)
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_sketch_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) -> Vec<u8> {
-    let mut s1 = state.map(|b| from_binary::<SketchState>(&b)).unwrap_or_default();
+    let mut s1 = state
+        .map(|b| from_binary::<SketchState>(&b))
+        .unwrap_or_default();
     if let Some(b2) = other {
         let s2 = from_binary::<SketchState>(&b2);
         s1.merge(&s2);
@@ -436,14 +444,18 @@ pub fn spiral_tdigest_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) ->
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_accum(state: Option<Vec<u8>>, val: f64, t: i64) -> Vec<u8> {
-    let mut s = state.map(|b| from_binary::<OHLCVState>(&b)).unwrap_or_default();
+    let mut s = state
+        .map(|b| from_binary::<OHLCVState>(&b))
+        .unwrap_or_default();
     s.add(val, t);
     to_binary(&s)
 }
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn spiral_ohlcv_combine(state: Option<Vec<u8>>, other: Option<Vec<u8>>) -> Vec<u8> {
-    let mut s1 = state.map(|b| from_binary::<OHLCVState>(&b)).unwrap_or_default();
+    let mut s1 = state
+        .map(|b| from_binary::<OHLCVState>(&b))
+        .unwrap_or_default();
     if let Some(b2) = other {
         let s2 = from_binary::<OHLCVState>(&b2);
         s1.merge(&s2);

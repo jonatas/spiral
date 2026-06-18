@@ -73,10 +73,8 @@ pub unsafe fn tam_slot_visible(slot: &TamSlot, snapshot: pg_sys::Snapshot) -> bo
     // Is the inserting transaction visible?
     let xmin_ok = if is_current {
         true
-    } else if pg_sys::TransactionIdDidAbort(xmin) {
-        false
-    } else if !pg_sys::TransactionIdDidCommit(xmin) {
-        false // in-progress by another backend
+    } else if pg_sys::TransactionIdDidAbort(xmin) || !pg_sys::TransactionIdDidCommit(xmin) {
+        false // aborted or in-progress by another backend
     } else if snapshot.is_null() {
         true // committed; SnapshotNow semantics
     } else {
@@ -96,10 +94,8 @@ pub unsafe fn tam_slot_visible(slot: &TamSlot, snapshot: pg_sys::Snapshot) -> bo
     // Is the deleting transaction visible? (if so, tuple is dead)
     let xmax_visible = if pg_sys::TransactionIdIsCurrentTransactionId(xmax) {
         true
-    } else if pg_sys::TransactionIdDidAbort(xmax) {
-        false // delete was rolled back → tuple alive
-    } else if !pg_sys::TransactionIdDidCommit(xmax) {
-        false // delete in-progress by another backend → still visible to us
+    } else if pg_sys::TransactionIdDidAbort(xmax) || !pg_sys::TransactionIdDidCommit(xmax) {
+        false // delete was rolled back or in-progress by another backend → tuple alive
     } else if snapshot.is_null() {
         true
     } else {

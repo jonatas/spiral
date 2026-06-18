@@ -1288,7 +1288,9 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                 if c == "t" {
                                     continue;
                                 }
-                                let agg = if let Some(found) = query_cols.iter().find(|(name, _)| name == c) {
+                                let agg = if let Some(found) =
+                                    query_cols.iter().find(|(name, _)| name == c)
+                                {
                                     found.1.clone()
                                 } else if rollup_cols_with_formulas.contains(c) {
                                     // Potential type mismatch if included as simple ref in rollup branches
@@ -1398,12 +1400,18 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                     Ok::<(), spi::Error>(())
                                 }).unwrap_or(());
 
-                                let star_attno = if let Some(pos) = cols.iter().position(|(n, _)| n == "*") {
-                                    (pos + 2) as i32 // 1 for t, then 1-based index in cols
-                                } else {
-                                    0
-                                };
-                                rewrite_query_aggregates(query, &column_formulas, varno, star_attno);
+                                let star_attno =
+                                    if let Some(pos) = cols.iter().position(|(n, _)| n == "*") {
+                                        (pos + 2) as i32 // 1 for t, then 1-based index in cols
+                                    } else {
+                                        0
+                                    };
+                                rewrite_query_aggregates(
+                                    query,
+                                    &column_formulas,
+                                    varno,
+                                    star_attno,
+                                );
 
                                 if let Some(qc) = qc_opt {
                                     if let Some(node) = qc.start_node {
@@ -2423,8 +2431,14 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                     if (*agg).aggstar {
                         use std::os::raw::c_void;
                         (*agg).aggstar = false;
-                        let var =
-                            pg_sys::makeVar(varno, star_attno as i16, pg_sys::JSONBOID, -1, pg_sys::InvalidOid, 0);
+                        let var = pg_sys::makeVar(
+                            varno,
+                            star_attno as i16,
+                            pg_sys::JSONBOID,
+                            -1,
+                            pg_sys::InvalidOid,
+                            0,
+                        );
                         let tle = pg_sys::makeTargetEntry(
                             var as *mut pg_sys::Expr,
                             1,
