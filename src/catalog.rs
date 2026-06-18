@@ -11,6 +11,14 @@ pub struct Metadata {
     pub columns_metadata: serde_json::Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct TimelineEpoch {
+    pub start_t: i64,
+    pub end_t: i64,
+    pub tenant_scale: i64,
+    pub base_offset: i64,
+}
+
 thread_local! {
     /// Cached result of checking whether spiral.metadata exists.
     /// None = unchecked, Some(false) = absent, Some(true) = present.
@@ -21,6 +29,8 @@ thread_local! {
     static METADATA_CACHE: RefCell<HashMap<String, Option<Metadata>>> = RefCell::new(HashMap::new());
     /// view_name → offset columns.
     static OFFSET_COLS_CACHE: RefCell<HashMap<String, Vec<OffsetColumn>>> = RefCell::new(HashMap::new());
+    /// table_name -> timeline epochs
+    static TIMELINE_CACHE: RefCell<HashMap<String, Vec<TimelineEpoch>>> = RefCell::new(HashMap::new());
 }
 
 /// Invalidate all per-session catalog caches. Call after any DDL that touches
@@ -30,6 +40,118 @@ pub fn invalidate_catalog_cache() {
     HIERARCHY_CACHE.with(|c| c.borrow_mut().clear());
     METADATA_CACHE.with(|c| c.borrow_mut().clear());
     OFFSET_COLS_CACHE.with(|c| c.borrow_mut().clear());
+    TIMELINE_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
+    let cached = TIMELINE_CACHE.with(|c| c.borrow().get(table_name).cloned());
+    if let Some(v) = cached {
+        return v;
+    }
+
+    // Safety: we cannot safely execute SPI queries from within TAM hooks if we're mid-transaction block
+    // or if the SPI connection would cause a cycle. If we aren't already cached, and we shouldn't SPI,
+    // we return empty and rely on fallback scales. However, for a perfect fix we should preload the cache.
+    let is_safe = unsafe { !pgrx::pg_sys::IsTransactionBlock() };
+    if !is_safe {
+        return Vec::new();
+    }
+
+    let epochs = Spi::connect(|client| {
+        let sql = format!(
+            "SELECT start_t, COALESCE(end_t, 9223372036854775807), tenant_scale, base_offset 
+             FROM spiral.tenants_timeline 
+             WHERE table_name = '{}' 
+             ORDER BY start_t ASC",
+            table_name.replace("'", "''")
+        );
+        let mut results = Vec::new();
+        match client.select(&sql, None, &[]) {
+            Ok(tuple_table) => {
+                for row in tuple_table {
+                    results.push(TimelineEpoch {
+                        start_t: row.get::<i64>(1)?.unwrap_or(0),
+                        end_t: row.get::<i64>(2)?.unwrap_or(std::i64::MAX),
+                        tenant_scale: row.get::<i32>(3)?.unwrap_or(1024) as i64,
+                        base_offset: row.get::<i64>(4)?.unwrap_or(0),
+                    });
+                }
+            }
+            Err(_) => {
+                // Return silently on error, usually happens when mid-transaction in a hook
+            }
+        }
+        Ok::<Vec<TimelineEpoch>, spi::Error>(results)
+    })
+    .unwrap_or_default();
+
+    TIMELINE_CACHE.with(|c| {
+        c.borrow_mut()
+            .insert(table_name.to_string(), epochs.clone())
+    });
+    epochs
+}
+
+pub fn compute_slot_index(
+    t_rel: i64,
+    tenant_id: i64,
+    epochs: &[TimelineEpoch],
+    fallback_scale: i64,
+) -> i64 {
+    if epochs.is_empty() {
+        return (t_rel * fallback_scale) + tenant_id;
+    }
+    for epoch in epochs {
+        if t_rel >= epoch.start_t && t_rel < epoch.end_t {
+            let offset_in_epoch = t_rel - epoch.start_t;
+            return epoch.base_offset + (offset_in_epoch * epoch.tenant_scale) + tenant_id;
+        }
+    }
+    let first = &epochs[0];
+    if t_rel < first.start_t {
+        let offset = t_rel - first.start_t;
+        return first.base_offset + (offset * first.tenant_scale) + tenant_id;
+    }
+    let last = epochs.last().unwrap();
+    let offset = t_rel - last.start_t;
+    last.base_offset + (offset * last.tenant_scale) + tenant_id
+}
+
+pub fn reverse_slot_index(
+    slot_index: i64,
+    epochs: &[TimelineEpoch],
+    fallback_scale: i64,
+) -> (i64, i64) {
+    if epochs.is_empty() {
+        return (slot_index / fallback_scale, slot_index % fallback_scale);
+    }
+
+    // Since base_offset grows, we can find the epoch by finding the last one where slot_index >= base_offset
+    let mut target_epoch = &epochs[0];
+    for epoch in epochs.iter().rev() {
+        if slot_index >= epoch.base_offset {
+            target_epoch = epoch;
+            break;
+        }
+    }
+
+    let offset_in_epoch = slot_index - target_epoch.base_offset;
+    let t_rel = target_epoch.start_t + (offset_in_epoch / target_epoch.tenant_scale);
+    let tid = offset_in_epoch % target_epoch.tenant_scale;
+
+    (t_rel, tid)
+}
+
+pub fn compute_tenant_scale(t_rel: i64, epochs: &[TimelineEpoch], fallback_scale: i64) -> i64 {
+    if epochs.is_empty() {
+        return fallback_scale;
+    }
+    for epoch in epochs {
+        if t_rel >= epoch.start_t && t_rel < epoch.end_t {
+            return epoch.tenant_scale;
+        }
+    }
+    epochs.last().unwrap().tenant_scale
 }
 
 fn spiral_metadata_table_exists() -> bool {
@@ -97,6 +219,12 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     if let Some(entry) = cached {
         return entry;
     }
+
+    let is_safe = unsafe { !pgrx::pg_sys::IsTransactionBlock() };
+    if !is_safe {
+        return None;
+    }
+
     let result = Spi::connect(|client| {
         let table = client.select(
             &format!("SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata WHERE view_name = '{}'", view_name.replace("'", "''")),
@@ -331,17 +459,21 @@ pub fn get_tenant_scale(metadata: &Metadata) -> i64 {
     if let serde_json::Value::Object(map) = &metadata.columns_metadata {
         if let Some(val) = map.get("tenant_scale") {
             if let Some(n) = val.as_i64() {
-                return n;
+                return if n > 0 {
+                    (n as u64).next_power_of_two() as i64
+                } else {
+                    1
+                };
             }
         }
         if let Some(serde_json::Value::String(s)) = map.get("cardinality") {
             return match s.as_str() {
-                "d" => 10,
-                "h" => 100,
-                "k" => 1000,
-                "M" => 1000000,
-                "B" => 1000000000,
-                "T" => 1000000000000,
+                "d" => 16,
+                "h" => 128,
+                "k" => 1024,
+                "M" => 1048576,
+                "B" => 1073741824,
+                "T" => 1099511627776,
                 _ => 1024,
             };
         }
@@ -418,18 +550,20 @@ pub fn remove_table_from_spiral(table_name: &str) {
     // can DROP the actual PG tables. The hierarchy tables have no PG dependency
     // on the base table, so DROP TABLE base CASCADE won't reach them.
     let hierarchy_tables: Vec<String> = Spi::connect(|client| {
-        Ok::<Vec<String>, spi::Error>(client
-            .select(
-                &format!(
-                    "SELECT view_name FROM spiral.metadata \
+        Ok::<Vec<String>, spi::Error>(
+            client
+                .select(
+                    &format!(
+                        "SELECT view_name FROM spiral.metadata \
                      WHERE base_view = '{name}' AND view_name <> '{name}'"
-                ),
-                None,
-                &[],
-            )?
-            .map(|row| row.get::<String>(1).unwrap_or(None).unwrap_or_default())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>())
+                    ),
+                    None,
+                    &[],
+                )?
+                .map(|row| row.get::<String>(1).unwrap_or(None).unwrap_or_default())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>(),
+        )
     })
     .unwrap_or_default();
 
@@ -446,12 +580,11 @@ pub fn remove_table_from_spiral(table_name: &str) {
     ));
 
     // If no base tables remain, cancel all Spiral Workers — nothing left to process.
-    let remaining = Spi::get_one::<i64>(
-        "SELECT COUNT(*) FROM spiral.metadata WHERE parent_view = 'BASE'",
-    )
-    .ok()
-    .flatten()
-    .unwrap_or(1);
+    let remaining =
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM spiral.metadata WHERE parent_view = 'BASE'")
+            .ok()
+            .flatten()
+            .unwrap_or(1);
 
     if remaining == 0 {
         let _ = Spi::run(

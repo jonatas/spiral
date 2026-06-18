@@ -28,9 +28,8 @@ pub const TAM_DATA_PER_PAGE: usize = (BLCKSZ - HEADER_SIZE - SPECIAL_SIZE) / TAM
 //   data: [u8; 120] (60 × 2-byte XOR deltas)
 // Total: BLOCK_SIZE (128 bytes) for 61 values, occupying 16 Spiral 8-byte slots.
 const XOR_VALUES_PER_BLOCK: usize = 1 + (BLOCK_SIZE - 8) / 2; // 61
-const XOR_SLOTS_PER_BLOCK: usize = BLOCK_SIZE / 8;            // 16
-pub const XOR_ROWS_PER_PAGE: usize =
-    (DATA_PER_PAGE / XOR_SLOTS_PER_BLOCK) * XOR_VALUES_PER_BLOCK; // 63 × 61 = 3843
+const XOR_SLOTS_PER_BLOCK: usize = BLOCK_SIZE / 8; // 16
+pub const XOR_ROWS_PER_PAGE: usize = (DATA_PER_PAGE / XOR_SLOTS_PER_BLOCK) * XOR_VALUES_PER_BLOCK; // 63 × 61 = 3843
 
 /// A single tuple slot in a TAM-backed Spiral page.
 /// f64 value + inserting XID + deleting XID (0 = alive).
@@ -69,8 +68,10 @@ pub unsafe fn tam_slot_visible(slot: &TamSlot, snapshot: pg_sys::Snapshot) -> bo
 
     let xmin = pg_sys::TransactionId::from(slot.xmin);
 
+    let is_current = pg_sys::TransactionIdIsCurrentTransactionId(xmin);
+
     // Is the inserting transaction visible?
-    let xmin_ok = if pg_sys::TransactionIdIsCurrentTransactionId(xmin) {
+    let xmin_ok = if is_current {
         true
     } else if pg_sys::TransactionIdDidAbort(xmin) {
         false
@@ -188,7 +189,22 @@ fn get_tenant_scale_for_oid(rel_oid: i32) -> i64 {
 #[pg_extern]
 pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
     let kickoff = crate::get_kickoff_epoch();
-    let tenant_scale = get_tenant_scale_for_oid(main_rel_oid);
+
+    let mut fallback_scale = 1024;
+    let mut epochs = Vec::new();
+
+    unsafe {
+        let relname_ptr = pg_sys::get_rel_name((main_rel_oid as u32).into());
+        if !relname_ptr.is_null() {
+            let name = std::ffi::CStr::from_ptr(relname_ptr)
+                .to_string_lossy()
+                .into_owned();
+            if let Some(m) = crate::catalog::get_metadata(&name) {
+                fallback_scale = crate::catalog::get_tenant_scale(&m);
+            }
+            epochs = crate::catalog::get_timeline(&name);
+        }
+    }
 
     let rows: Vec<(i64, i64, f64)> = Spi::connect(|client| {
         let query = format!(
@@ -202,6 +218,7 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
             let t = row.get::<i64>(1)?.unwrap_or(-1);
             let tenant_id = row.get::<i64>(2)?.unwrap_or(-1);
             let price = row.get::<f64>(3)?.unwrap_or(0.0);
+            let tenant_scale = crate::catalog::compute_tenant_scale(t, &epochs, fallback_scale);
             if t >= 0 && (0..tenant_scale).contains(&tenant_id) {
                 results.push((t, tenant_id, price));
             }
@@ -228,7 +245,9 @@ pub fn spiral_pack_delta(delta_table_name: &str, main_rel_oid: i32) {
         let xmin = pg_sys::GetCurrentTransactionId().into_inner();
 
         for (t, tenant_id, price) in rows {
-            let slot_index = (t * tenant_scale) + tenant_id;
+            let tenant_scale = crate::catalog::compute_tenant_scale(t, &epochs, fallback_scale);
+            let slot_index =
+                crate::catalog::compute_slot_index(t, tenant_id, &epochs, fallback_scale);
             let (blkno, page_offset) = tam_logical_to_physical_offset(slot_index);
 
             let mut nblocks = get_block_count(rel);
@@ -631,7 +650,11 @@ fn compute_heap_tuple_size(rel_oid: i32) -> f64 {
                 "s" => 2, // short (2-byte)
                 _ => 1,   // char (1-byte / no padding)
             };
-            let col_size = if attlen > 0 { attlen as usize } else { col_width as usize };
+            let col_size = if attlen > 0 {
+                attlen as usize
+            } else {
+                col_width as usize
+            };
 
             // Advance offset to the required alignment boundary, then store the column.
             if align_bytes > 1 {
