@@ -323,7 +323,7 @@ CREATE TABLE ticks (
 
 - **[Examples](examples/)**: Hands-on walkthroughs from basic to advanced.
 - **[Benchmarks](benchmarks/)**: Comprehensive performance evaluations at different scales.
-- **[Documentation](docs/)**: Detailed architectural deep dives.
+- **[Documentation](docs/)**: Detailed architectural deep dives, including the new [Dynamic Tenant Timeline & Logarithmic Capacity Lanes](docs/DYNAMIC_TENANT_TIMELINE.md).
 
 ## ⚙️ Experimental Setup
 
