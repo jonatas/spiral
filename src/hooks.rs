@@ -1211,7 +1211,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
 
                         let dirty_ranges =
                             catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
-                        let max_frame_secs = extract_group_granularity_secs(query);
+                        let max_frame_secs = extract_group_granularity_secs(query, tz_offset);
                         let segments = resolve_segments(
                             &base_table,
                             ts,
@@ -2723,7 +2723,111 @@ pub(crate) unsafe fn extract_supported_query_columns(
     }
 }
 
-pub(crate) unsafe fn extract_group_granularity_secs(query: *mut pg_sys::Query) -> Option<i64> {
+/// Timezone context of a `date_trunc` GROUP BY expression.
+enum TzGrouping {
+    /// Truncation is timezone-independent (naive `timestamp` argument).
+    None,
+    /// Truncation happens in a zone with this UTC offset in seconds.
+    Offset(i64),
+    /// A timezone is involved but its offset cannot be resolved at plan time.
+    Unknown,
+}
+
+unsafe fn strip_relabel(mut node: *mut pg_sys::Node) -> *mut pg_sys::Node {
+    while !node.is_null() && (*node).type_ == pg_sys::NodeTag::T_RelabelType {
+        node = (*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node;
+    }
+    node
+}
+
+unsafe fn const_text(node: *mut pg_sys::Node) -> Option<String> {
+    let node = strip_relabel(node);
+    if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
+        return None;
+    }
+    let c = node as *mut pg_sys::Const;
+    String::from_datum((*c).constvalue, (*c).constisnull)
+}
+
+/// Current UTC offset in seconds for a timezone name or abbreviation,
+/// or None when the zone is unknown.
+fn timezone_name_offset_secs(tz: &str) -> Option<i64> {
+    let q = tz.replace('\'', "''");
+    Spi::get_one::<i64>(&format!(
+        "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint FROM (
+             SELECT utc_offset FROM pg_timezone_names WHERE lower(name) = lower('{q}')
+             UNION ALL
+             SELECT utc_offset FROM pg_timezone_abbrevs WHERE lower(abbrev) = lower('{q}')
+         ) o LIMIT 1"
+    ))
+    .ok()
+    .flatten()
+}
+
+/// Largest fixed-second bucket size whose buckets each map wholly into one
+/// local-time bucket for a zone with the given UTC offset. DST transitions
+/// shift by whole hours, so hourly buckets stay correct across them for
+/// whole-hour-offset zones; :30/:45 zones need 30m/15m tiers. Returns 0 when
+/// no fixed-second alignment exists.
+fn tz_alignment_cap_secs(offset: i64) -> i64 {
+    if offset % 3600 == 0 {
+        3600
+    } else if offset % 1800 == 0 {
+        1800
+    } else if offset % 900 == 0 {
+        900
+    } else {
+        0
+    }
+}
+
+/// Classifies the timezone behavior of a `date_trunc` call in a GROUP BY.
+/// Recognizes the 3-arg form `date_trunc(unit, t, tz)` and the rewritten
+/// `date_trunc(unit, t AT TIME ZONE tz)` / `date_trunc(unit, timezone(tz, t))`
+/// forms. A plain 2-arg call over `timestamptz` truncates in the session
+/// timezone, so the session offset applies.
+unsafe fn date_trunc_tz_grouping(fe: *mut pg_sys::FuncExpr, session_tz_offset: i64) -> TzGrouping {
+    let args = (*fe).args;
+    if (*args).length >= 3 {
+        let tz_arg = pg_sys::list_nth(args, 2) as *mut pg_sys::Node;
+        return match const_text(tz_arg).and_then(|tz| timezone_name_offset_secs(&tz)) {
+            Some(off) => TzGrouping::Offset(off),
+            None => TzGrouping::Unknown,
+        };
+    }
+    if (*args).length < 2 {
+        return TzGrouping::Unknown;
+    }
+    let ts_arg = strip_relabel(pg_sys::list_nth(args, 1) as *mut pg_sys::Node);
+    if ts_arg.is_null() {
+        return TzGrouping::Unknown;
+    }
+    if (*ts_arg).type_ == pg_sys::NodeTag::T_FuncExpr {
+        let inner = ts_arg as *mut pg_sys::FuncExpr;
+        let inner_name = pg_sys::get_func_name((*inner).funcid);
+        if !inner_name.is_null()
+            && CStr::from_ptr(inner_name).to_string_lossy() == "timezone"
+            && !(*inner).args.is_null()
+            && (*(*inner).args).length == 2
+        {
+            let zone_arg = pg_sys::list_nth((*inner).args, 0) as *mut pg_sys::Node;
+            return match const_text(zone_arg).and_then(|tz| timezone_name_offset_secs(&tz)) {
+                Some(off) => TzGrouping::Offset(off),
+                None => TzGrouping::Unknown,
+            };
+        }
+    }
+    if pg_sys::exprType(ts_arg) == pg_sys::TIMESTAMPTZOID {
+        TzGrouping::Offset(session_tz_offset)
+    } else {
+        TzGrouping::None
+    }
+}
+
+pub(crate) unsafe fn extract_group_granularity_secs(
+    query: *mut pg_sys::Query,
+    session_tz_offset: i64,
+) -> Option<i64> {
     let group_clause = (*query).groupClause;
     if group_clause.is_null() {
         return None;
@@ -2809,7 +2913,35 @@ pub(crate) unsafe fn extract_group_granularity_secs(query: *mut pg_sys::Query) -
             Some("year") | Some("years") => i64::MAX / 2,
             _ => continue,
         };
-        return Some(secs);
+        // Local-time truncation doesn't align with the UTC-aligned rollup
+        // buckets: routing a tz-localized day to the 1d tier would merge rows
+        // across local-day boundaries. Cap the tier size so each rollup
+        // bucket falls wholly inside one local bucket and let the outer
+        // GROUP BY regroup; PostgreSQL evaluates the date_trunc with real tz
+        // rules, so this stays correct across DST transitions.
+        return match date_trunc_tz_grouping(fe, session_tz_offset) {
+            TzGrouping::None | TzGrouping::Offset(0) => Some(secs),
+            TzGrouping::Offset(off) => {
+                let cap = tz_alignment_cap_secs(off);
+                if cap == 0 {
+                    notice!(
+                        "Spiral: timezone offset {}s in GROUP BY date_trunc has no \
+                         compatible rollup tier alignment, falling back to RAW scan.",
+                        off
+                    );
+                    Some(0)
+                } else {
+                    Some(secs.min(cap))
+                }
+            }
+            TzGrouping::Unknown => {
+                notice!(
+                    "Spiral: unresolvable timezone in GROUP BY date_trunc, \
+                     falling back to RAW scan."
+                );
+                Some(0)
+            }
+        };
     }
     None
 }
@@ -2942,7 +3074,28 @@ fn construct_union_sql_hierarchical(
                         Ok((String::new(), col.clone()))
                     }).unwrap_or_else(|_| (String::new(), col.clone()))
                 } else {
-                    (String::new(), col.clone())
+                    // Raw branch: whether the aggregate needs a JSONB
+                    // accumulator (stats/ohlcv/...) depends on the column's
+                    // rollup formula. Without this lookup plain-sum columns
+                    // were cast to jsonb, breaking mixed raw+tier plans.
+                    let f = Spi::connect(|client| -> Result<String, spi::Error> {
+                        let sql = format!(
+                            "SELECT formula FROM spiral.sources \
+                             WHERE view_name = (SELECT view_name FROM spiral.metadata \
+                                                WHERE base_view = '{}' AND frame_seconds > 0 \
+                                                LIMIT 1) \
+                               AND base_column = '{}' LIMIT 1",
+                            base_table.replace('\'', "''"),
+                            col.replace('\'', "''")
+                        );
+                        let mut rows = client.select(&sql, Some(1), &[])?;
+                        if let Some(row) = rows.next() {
+                            return Ok(row.get::<String>(1)?.unwrap_or_default());
+                        }
+                        Ok(String::new())
+                    })
+                    .unwrap_or_default();
+                    (f, col.clone())
                 };
                 if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) {
                     inner_select.push(if orig_type.is_empty() {
@@ -2977,10 +3130,19 @@ fn construct_union_sql_hierarchical(
                             | "spiral_sketch_merge"
                             | "spiral_ohlcv_merge"
                     ) || (matches!(agg_fn.to_lowercase().as_str(), "sum" | "count" | "avg")
-                        && (formula_for_col == "stats"
-                            || formula_for_col == "ohlcv"
-                            || (formula_for_col == "count" && is_rollup)
-                            || !is_rollup));
+                        && if is_rollup {
+                            formula_for_col == "stats"
+                                || formula_for_col == "ohlcv"
+                                || formula_for_col == "count"
+                        } else {
+                            // jsonb only when map_agg_inner wraps an
+                            // accumulator; plain-formula columns stay native.
+                            col == "*"
+                                || matches!(
+                                    formula_for_col.as_str(),
+                                    "stats" | "ohlcv" | "tdigest" | "sketch"
+                                )
+                        });
                 inner_select.push(if !orig_type.is_empty() && !is_json_target {
                     format!("({})::{} AS \"{}\"", col_expr, orig_type, col)
                 } else {
