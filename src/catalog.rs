@@ -49,13 +49,7 @@ pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
         return v;
     }
 
-    // Safety: we cannot safely execute SPI queries from within TAM hooks if we're mid-transaction block
-    // or if the SPI connection would cause a cycle. If we aren't already cached, and we shouldn't SPI,
-    // we return empty and rely on fallback scales. However, for a perfect fix we should preload the cache.
-    let is_safe = unsafe { !pgrx::pg_sys::IsTransactionBlock() };
-    if !is_safe {
-        return Vec::new();
-    }
+
 
     let epochs = Spi::connect(|client| {
         let sql = format!(
@@ -220,10 +214,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
         return entry;
     }
 
-    let is_safe = unsafe { !pgrx::pg_sys::IsTransactionBlock() };
-    if !is_safe {
-        return None;
-    }
+
 
     let result = Spi::connect(|client| {
         let table = client.select(
@@ -378,13 +369,13 @@ pub fn unify_changelog_scope(base_view: &str, scope_json: &str) {
 
 pub fn unify_changelog(base_view: &str) {
     // Snapshot existing rows with their ctids first.
-    let _ = Spi::run(&format!(
+    Spi::run(&format!(
         "CREATE TEMP TABLE changelog_snapshot AS SELECT ctid AS old_ctid, * FROM spiral.changelog WHERE base_view = '{}'",
         base_view.replace("'", "''")
-    ));
+    )).unwrap();
 
     // Unify logic using sentinels for NULLs (unbounded ranges)
-    let _ = Spi::run("CREATE TEMP TABLE temp_unified AS
+    Spi::run("CREATE TEMP TABLE temp_unified AS
          SELECT base_view, scope_values, 
                 NULLIF(MIN(ts_safe), -9223372036854775808) as ts,
                 NULLIF(MAX(te_safe), 9223372036854775807) as te
@@ -399,14 +390,14 @@ pub fn unify_changelog(base_view: &str) {
                 FROM changelog_snapshot
             ) s1
          ) s2
-         GROUP BY base_view, scope_values, grp");
+         GROUP BY base_view, scope_values, grp").unwrap();
 
-    let _ = Spi::run(
+    Spi::run(
         "DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM changelog_snapshot)",
-    );
-    let _ = Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified");
-    let _ = Spi::run("DROP TABLE changelog_snapshot");
-    let _ = Spi::run("DROP TABLE temp_unified");
+    ).unwrap();
+    Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified").unwrap();
+    Spi::run("DROP TABLE changelog_snapshot").unwrap();
+    Spi::run("DROP TABLE temp_unified").unwrap();
 }
 
 pub fn get_dirty_ranges(

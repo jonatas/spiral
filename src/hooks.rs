@@ -1238,6 +1238,20 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                 continue;
                             };
 
+                            let mut supported = true;
+                            for seg in &segments {
+                                if seg.source != base_table {
+                                    if !rollup_supports_query_cols(&seg.source, &query_cols) {
+                                        supported = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !supported {
+                                notice!("Spiral: Rollup views do not support all query columns/aggregates for '{}', falling back to RAW scan.", base_table);
+                                continue;
+                            }
+
                             let mut cols = Vec::new();
                             let base_cols_query = format!(
                                 "SELECT attname::text, atttypid::regtype::text \
@@ -1373,6 +1387,8 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                 &in_vals,
                                 qc_opt.and_then(|qc| qc.z_box.map(|(b, _)| b)),
                             );
+
+                            notice!("Spiral: union_sql = {}", union_sql);
 
                             let new_query = parse_sql_to_query(&union_sql);
                             if !new_query.is_null() {
@@ -1810,7 +1826,7 @@ pub fn accelerate(
 
     if initial_load {
         let bootstrap_sql = format!(
-            "INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)",
+            "INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647) ON CONFLICT DO NOTHING",
             relation.replace("'", "''")
         );
         let _ = Spi::run(&bootstrap_sql);
@@ -2381,7 +2397,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                                 pg_sys::pfree(varname_ptr as *mut std::ffi::c_void);
                             }
                         }
-                        if (*var).vartype == pg_sys::JSONBOID {
+                        if (*var).vartype == pg_sys::BYTEAOID {
                             is_json_target = true;
                         }
                     }
@@ -2427,14 +2443,14 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                     // That causes the JSONB varlena pointer to be stored without copying, so
                     // when the COMBINEFUNC merges partial states from UNION ALL arms the second
                     // arm's state pointer is dangling → "unboxing other_ argument failed".
-                    (*agg).aggtranstype = pg_sys::JSONBOID;
+                    (*agg).aggtranstype = pg_sys::BYTEAOID;
                     if (*agg).aggstar {
                         use std::os::raw::c_void;
                         (*agg).aggstar = false;
                         let var = pg_sys::makeVar(
                             varno,
                             star_attno as i16,
-                            pg_sys::JSONBOID,
+                            pg_sys::BYTEAOID,
                             -1,
                             pg_sys::InvalidOid,
                             0,
@@ -2446,6 +2462,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                             false,
                         );
                         (*agg).args = pg_sys::lappend(std::ptr::null_mut(), tle as *mut c_void);
+                        (*agg).aggargtypes = pg_sys::lappend_oid(std::ptr::null_mut(), pg_sys::BYTEAOID);
                     } else if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
                         let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
                         let mut expr = (*arg).expr as *mut pg_sys::Node;
@@ -2480,7 +2497,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                             ) || (formula == "ohlcv"
                                 && matches!(agg_fn.as_ref(), "first" | "last"));
                             if is_json_target_rewrite {
-                                (*var).vartype = pg_sys::JSONBOID;
+                                (*var).vartype = pg_sys::BYTEAOID;
                                 (*var).vartypmod = -1;
                             }
                         }
@@ -2532,6 +2549,72 @@ pub(crate) unsafe fn rewrite_query_aggregates(
             star_attno,
         );
     }
+}
+
+pub(crate) fn rollup_supports_query_cols(view_name: &str, query_cols: &[(String, Option<String>)]) -> bool {
+    Spi::connect(|client| -> Result<bool, spi::Error> {
+        for (col, agg) in query_cols {
+            if let Some(agg_fn) = agg {
+                let agg_lower = agg_fn.to_lowercase();
+                if col == "*" && agg_lower == "count" {
+                    let sql = format!(
+                        "SELECT 1 FROM spiral.sources \
+                         WHERE view_name = '{}' AND (formula = 'stats' OR formula = 'count') \
+                         LIMIT 1",
+                        view_name.replace("'", "''")
+                    );
+                    let ok = client.select(&sql, Some(1), &[])?.len() > 0;
+                    if !ok {
+                        return Ok(false);
+                    }
+                } else {
+                    let formula_filter = match agg_lower.as_str() {
+                        "spiral_stats" | "spiral_stats_merge" | "avg" => "stats",
+                        "spiral_tdigest" | "spiral_tdigest_merge" => "tdigest",
+                        "spiral_sketch" | "spiral_sketch_merge" => "sketch",
+                        "first" | "last" => "ohlcv",
+                        "sum" | "min" | "max" => "sum",
+                        "count" => "stats",
+                        _ => "",
+                    };
+                    let sql = if formula_filter.is_empty() {
+                        format!(
+                            "SELECT 1 FROM spiral.sources \
+                             WHERE view_name = '{}' AND base_column = '{}' \
+                             LIMIT 1",
+                            view_name.replace("'", "''"),
+                            col.replace("'", "''")
+                        )
+                    } else {
+                        format!(
+                            "SELECT 1 FROM spiral.sources \
+                             WHERE view_name = '{}' AND base_column = '{}' \
+                               AND (formula = '{}' OR formula = 'ohlcv' OR formula = 'count') \
+                             LIMIT 1",
+                            view_name.replace("'", "''"),
+                            col.replace("'", "''"),
+                            formula_filter
+                        )
+                    };
+                    let ok = client.select(&sql, Some(1), &[])?.len() > 0;
+                    if !ok {
+                        let sql_fallback = format!(
+                            "SELECT 1 FROM spiral.sources \
+                             WHERE view_name = '{}' AND base_column = '{}' \
+                             LIMIT 1",
+                            view_name.replace("'", "''"),
+                            col.replace("'", "''")
+                        );
+                        let ok_fallback = client.select(&sql_fallback, Some(1), &[])?.len() > 0;
+                        if !ok_fallback {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }).unwrap_or(false)
 }
 
 pub(crate) unsafe fn extract_supported_query_columns(
@@ -2946,7 +3029,7 @@ fn construct_union_sql_hierarchical(
                 };
                 if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) {
                     inner_select.push(if orig_type.is_empty() {
-                        format!("NULL::jsonb AS \"{}\"", col)
+                        format!("NULL::bytea AS \"{}\"", col)
                     } else {
                         format!("NULL::{} AS \"{}\"", orig_type, col)
                     });
@@ -2984,7 +3067,7 @@ fn construct_union_sql_hierarchical(
                 inner_select.push(if !orig_type.is_empty() && !is_json_target {
                     format!("({})::{} AS \"{}\"", col_expr, orig_type, col)
                 } else {
-                    format!("({})::jsonb AS \"{}\"", col_expr, col)
+                    format!("({})::bytea AS \"{}\"", col_expr, col)
                 });
             } else {
                 if col == "t" {
@@ -3186,7 +3269,7 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
                     })
                     .unwrap_or(true)
                 {
-                    Spi::run(&format!("INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647)", real_base.replace("'", "''"))).unwrap();
+                    Spi::run(&format!("INSERT INTO spiral.changelog (base_view, t_start, t_end) VALUES ('{}', 0, 2147483647) ON CONFLICT DO NOTHING", real_base.replace("'", "''"))).unwrap();
                 } else {
                     return true;
                 }

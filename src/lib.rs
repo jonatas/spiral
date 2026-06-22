@@ -455,6 +455,34 @@ fn refresh_incremental(
             .collect::<Vec<_>>()
             .join(" ");
 
+        let calendar_field = rollup::calendar_field_for_seconds(frame_seconds);
+        let (delete_exists_cond, delete_not_exists_cond) = if let Some(field) = calendar_field {
+            (
+                format!(
+                    "target.t >= date_trunc('{}', to_timestamp(c.t_start::double precision)) \
+                     AND target.t < to_timestamp(c.t_end::double precision)",
+                    field
+                ),
+                format!(
+                    "date_trunc('{}', s.\"{}\") = target.t",
+                    field, source_time_col
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds} \
+                     AND spiral(target.t) < c.t_end",
+                    frame_seconds = frame_seconds
+                ),
+                format!(
+                    "(spiral(s.\"{}\") / {frame_seconds}) * {frame_seconds} = spiral(target.t)",
+                    source_time_col,
+                    frame_seconds = frame_seconds
+                ),
+            )
+        };
+
         let sparse_delete_sql = format!(
             "DELETE FROM \"{view_name}\" AS target
              WHERE {target_scope_where}
@@ -462,21 +490,20 @@ fn refresh_incremental(
                  SELECT 1 FROM spiral.changelog c
                  WHERE c.base_view = '{safe_key}'
                    AND {changelog_scope_match}
-                   AND spiral(target.t) >= (c.t_start/{frame_seconds})*{frame_seconds}
-                   AND spiral(target.t) < c.t_end
+                   AND {delete_exists_cond}
                )
                AND NOT EXISTS (
                  SELECT 1 FROM \"{source_table}\" AS s
-                 WHERE (spiral(s.\"{source_time_col}\") / {frame_seconds}) * {frame_seconds} = spiral(target.t)
+                 WHERE {delete_not_exists_cond}
                  {source_scope_match}
                )",
             view_name = view_name,
             target_scope_where = target_scope_where,
             safe_key = safe_key,
             changelog_scope_match = changelog_scope_match,
-            frame_seconds = frame_seconds,
+            delete_exists_cond = delete_exists_cond,
             source_table = source_table,
-            source_time_col = source_time_col,
+            delete_not_exists_cond = delete_not_exists_cond,
             source_scope_match = source_scope_match,
         );
 
@@ -2198,7 +2225,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE count_test (
                 t   timestamptz NOT NULL,
-                val double precision  -- Spiral: sum
+                val double precision  -- Spiral: stats
             ) WITH (spiral.frames = '1h')",
         )
         .unwrap();
