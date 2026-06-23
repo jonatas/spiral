@@ -2673,7 +2673,7 @@ pub(crate) fn rollup_supports_query_cols(
                             formula_filter
                         )
                     };
-                    let ok = client.select(&sql, Some(1), &[])?.len() > 0;
+                    let ok = !client.select(&sql, Some(1), &[])?.is_empty();
                     if !ok {
                         let sql_fallback = format!(
                             "SELECT 1 FROM spiral.sources \
@@ -2682,7 +2682,7 @@ pub(crate) fn rollup_supports_query_cols(
                             view_name.replace("'", "''"),
                             col.replace("'", "''")
                         );
-                        let ok_fallback = client.select(&sql_fallback, Some(1), &[])?.len() > 0;
+                        let ok_fallback = !client.select(&sql_fallback, Some(1), &[])?.is_empty();
                         if !ok_fallback {
                             return Ok(false);
                         }
