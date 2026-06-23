@@ -2018,10 +2018,10 @@ mod tests {
         // The cost model should skip sparse_1h because 2 >= 2 * 0.9.
         let explain = Spi::get_one::<String>("SELECT spiral_explain('SELECT sum(val) FROM sparse WHERE t >= ''2026-05-25 10:00:00Z'' AND t < ''2026-05-25 12:00:00Z''')").unwrap().unwrap();
 
-        // It should NOT contain sparse_1h
+        // It should NOT accelerate using sparse_1h, but it WILL report it as skipped
         assert!(
-            !explain.contains("sparse_1h"),
-            "Should not use rollup if it doesn't reduce rows significantly"
+            explain.contains("tier sparse_1h skipped"),
+            "Should explicitly report that sparse_1h was skipped"
         );
         assert!(
             explain.contains("no rollups available"),

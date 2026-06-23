@@ -1209,18 +1209,36 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                             })
                         });
 
-                        let dirty_ranges =
-                            catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
                         let max_frame_secs = extract_group_granularity_secs(query);
-                        let segments = resolve_segments(
+                        let actual_range = get_actual_data_range(&base_table, &hierarchy);
+                        let sorted_hierarchy = filter_hierarchy(
                             &base_table,
+                            &hierarchy,
                             ts,
                             te,
-                            &hierarchy,
-                            &dirty_ranges,
-                            tz_offset,
                             max_frame_secs,
+                            actual_range,
+                            None,
                         );
+
+                        let segments = if sorted_hierarchy.is_empty() {
+                            vec![Segment {
+                                source: base_table.clone(),
+                                _t_start: ts,
+                                _t_end: te,
+                            }]
+                        } else {
+                            let dirty_ranges =
+                                catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
+                            resolve_segments_from_sorted(
+                                &base_table,
+                                ts,
+                                te,
+                                &sorted_hierarchy,
+                                &dirty_ranges,
+                                tz_offset,
+                            )
+                        };
 
                         if !segments.is_empty()
                             && (segments.len() > 1 || segments[0].source != base_table)
@@ -1506,37 +1524,92 @@ struct Segment {
     _t_end: i64,
 }
 
-fn resolve_segments(
+fn filter_hierarchy(
+    base_table: &str,
+    hierarchy: &[String],
+    ts: i64,
+    te: i64,
+    max_frame_secs: Option<i64>,
+    actual_data_range: Option<(i64, i64)>,
+    mut explain_msgs: Option<&mut Vec<String>>,
+) -> Vec<(String, i32, f64)> {
+    let (raw_rows, _) = catalog::get_table_stats(base_table);
+    let metadata_obj = catalog::get_metadata(base_table);
+    let num_scopes = metadata_obj
+        .map(|m| catalog::get_tenant_scale(&m) as f64)
+        .unwrap_or(1.0);
+
+    let mut sorted_hierarchy = Vec::new();
+
+    let range_fraction = if let Some((act_s, act_e)) = actual_data_range {
+        let dur = act_e - act_s;
+        if dur > 0 {
+            ((te - ts) as f64 / dur as f64).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    } else {
+        1.0
+    };
+    let estimated_raw_rows = raw_rows * range_fraction;
+
+    let threshold = if let Some(m) = max_frame_secs {
+        let query_secs = (te - ts).max(1) as f64;
+        let out_card = num_scopes * (query_secs / m as f64).ceil();
+        out_card.max(estimated_raw_rows * 0.9)
+    } else {
+        estimated_raw_rows * 0.9
+    };
+
+    for h in hierarchy {
+        if let Some(m) = catalog::get_metadata(h) {
+            let frame_secs = m.frame_seconds;
+            if frame_secs <= 0 {
+                continue;
+            }
+            if let Some(max) = max_frame_secs {
+                if frame_secs as i64 > max {
+                    continue;
+                }
+            }
+
+            let (rows, _) = catalog::get_table_stats(h);
+
+            if raw_rows <= 0.0 || rows <= 0.0 {
+                sorted_hierarchy.push((h.clone(), frame_secs, rows));
+                continue;
+            }
+
+            let estimated_tier_rows = rows * range_fraction;
+            if estimated_tier_rows <= threshold {
+                sorted_hierarchy.push((h.clone(), frame_secs, rows));
+            } else {
+                let msg = format!(
+                    "tier {} skipped: {} rows vs raw {} (needs <90% or <= output {})",
+                    h, rows as i64, raw_rows as i64, threshold as i64
+                );
+                if let Some(msgs) = explain_msgs.as_mut() {
+                    msgs.push(msg);
+                } else {
+                    notice!("Spiral: {}", msg);
+                }
+            }
+        }
+    }
+
+    sorted_hierarchy.sort_by_key(|h| -h.1);
+    sorted_hierarchy
+}
+
+fn resolve_segments_from_sorted(
     base_table: &str,
     ts: i64,
     te: i64,
-    hierarchy: &[String],
+    sorted_hierarchy: &[(String, i32, f64)],
     dirty: &[(i64, i64)],
     offset_seconds: i64,
-    max_frame_secs: Option<i64>,
 ) -> Vec<Segment> {
     let mut segments = Vec::new();
-    let (raw_rows, _) = catalog::get_table_stats(base_table);
-
-    let mut sorted_hierarchy: Vec<(String, i32, f64)> = hierarchy
-        .iter()
-        .filter_map(|h| catalog::get_metadata(h).map(|m| (h.clone(), m.frame_seconds)))
-        .filter(|h| h.1 > 0)
-        .filter(|h| max_frame_secs.is_none_or(|max| h.1 as i64 <= max))
-        .map(|(name, secs)| {
-            let (rows, _) = catalog::get_table_stats(&name);
-            (name, secs, rows)
-        })
-        // Only keep rollups that offer significant row reduction.
-        .filter(|(_, _, rows)| {
-            if raw_rows <= 0.0 || *rows <= 0.0 {
-                return true;
-            }
-            *rows < raw_rows * 0.9
-        })
-        .collect();
-
-    sorted_hierarchy.sort_by_key(|h| -h.1);
 
     let mut pool = vec![(ts, te)];
     for (d_s, d_e) in dirty {
@@ -1564,7 +1637,7 @@ fn resolve_segments(
         let mut curr = clean_s;
         while curr < clean_e {
             let mut found_tier = false;
-            for (h_name, frame_secs, _) in &sorted_hierarchy {
+            for (h_name, frame_secs, _) in sorted_hierarchy {
                 let f_s = *frame_secs as i64;
                 if f_s <= 0 {
                     continue;
@@ -3427,16 +3500,40 @@ unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String
                     }
                 });
 
-                let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
-                let segments = resolve_segments(
+                let max_frame_secs = extract_group_granularity_secs(query);
+                let actual_range = get_actual_data_range(&base_table, &hierarchy);
+                let mut explain_msgs = Vec::new();
+                let sorted_hierarchy = filter_hierarchy(
                     &base_table,
+                    &hierarchy,
                     ts,
                     te,
-                    &hierarchy,
-                    &dirty_ranges,
-                    tz_offset,
-                    None,
+                    max_frame_secs,
+                    actual_range,
+                    Some(&mut explain_msgs),
                 );
+
+                for msg in explain_msgs {
+                    report.push_str(&format!("{}\n", msg));
+                }
+
+                let segments = if sorted_hierarchy.is_empty() {
+                    vec![Segment {
+                        source: base_table.clone(),
+                        _t_start: ts,
+                        _t_end: te,
+                    }]
+                } else {
+                    let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
+                    resolve_segments_from_sorted(
+                        &base_table,
+                        ts,
+                        te,
+                        &sorted_hierarchy,
+                        &dirty_ranges,
+                        tz_offset,
+                    )
+                };
 
                 if !segments.is_empty() && (segments.len() > 1 || segments[0].source != base_table)
                 {
