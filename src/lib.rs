@@ -813,6 +813,26 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_issue_95_fewer_columns() {
+        Spi::run("CREATE TABLE acts3 (
+            t timestamptz NOT NULL,
+            user_id bigint NOT NULL,
+            unrelated integer,
+            tracked integer DEFAULT 0
+        ) WITH (spiral.frames = '1h,1d', spiral.tenant = 'user_id');");
+        
+        Spi::run("COMMENT ON COLUMN acts3.tracked IS 'sum, stats as tracked_stats';");
+        
+        Spi::run("INSERT INTO acts3 SELECT '2024-01-01'::timestamptz + interval '10 min' * g, (g % 5) + 1, 0, 60 FROM generate_series(0, 100) g;");
+        Spi::run("SELECT spiral_refresh('acts3');");
+        
+        Spi::run("INSERT INTO acts3 VALUES ('2024-05-01 00:05:00+00', 1, 0, 60);");
+
+        let res = Spi::run("SELECT date_trunc('day', t), user_id, sum(tracked) FROM acts3 WHERE t >= '2024-02-01' AND t < '2024-06-01' GROUP BY 1,2;");
+        assert!(res.is_ok());
+    }
+
+    #[pg_test]
     fn test_catalog_is_spiral_relation() {
         // Initially should be false for a random table
         assert!(!catalog::is_spiral_relation("non_existent_table"));

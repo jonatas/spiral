@@ -1315,7 +1315,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                     )
                                 }).unwrap_or_default();
 
-                            // Include ALL columns in their original order to preserve attnos.
+                            // Only include columns referenced in the query to avoid positional mismatch
                             for (c, _typ) in &base_table_columns {
                                 if c == "t" {
                                     continue;
@@ -1324,23 +1324,15 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                                     query_cols.iter().find(|(name, _)| name == c)
                                 {
                                     found.1.clone()
-                                } else if rollup_cols_with_formulas.contains(c) {
-                                    // Potential type mismatch if included as simple ref in rollup branches
-                                    Some("__UNUSED__".to_string())
                                 } else {
-                                    // Safe to include as simple reference (e.g. scope columns missed by detector)
                                     None
                                 };
-
-                                if let Some(ref a) = agg {
-                                    if a == "__UNUSED__" {
-                                        // notice!("Spiral: column '{}' marked as UNUSED", c);
-                                    } else {
-                                        // notice!("Spiral: column '{}' has aggregate '{}'", c, a);
-                                    }
-                                } else {
-                                    // notice!("Spiral: column '{}' used as simple reference", c);
+                                
+                                // Omit columns that are not in the query if they are rollup cols
+                                if agg.is_none() && rollup_cols_with_formulas.contains(c) {
+                                    continue;
                                 }
+                                
                                 cols.push((c.clone(), agg));
                             }
 
