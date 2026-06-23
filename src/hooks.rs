@@ -1258,11 +1258,9 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
 
                             let mut supported = true;
                             for seg in &segments {
-                                if seg.source != base_table {
-                                    if !rollup_supports_query_cols(&seg.source, &query_cols) {
-                                        supported = false;
-                                        break;
-                                    }
+                                if seg.source != base_table && !rollup_supports_query_cols(&seg.source, &query_cols) {
+                                    supported = false;
+                                    break;
                                 }
                             }
                             if !supported {
@@ -2640,7 +2638,7 @@ pub(crate) fn rollup_supports_query_cols(
                          LIMIT 1",
                         view_name.replace("'", "''")
                     );
-                    let ok = client.select(&sql, Some(1), &[])?.len() > 0;
+                    let ok = !client.select(&sql, Some(1), &[])?.is_empty();
                     if !ok {
                         return Ok(false);
                     }
