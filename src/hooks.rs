@@ -2462,7 +2462,8 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                             false,
                         );
                         (*agg).args = pg_sys::lappend(std::ptr::null_mut(), tle as *mut c_void);
-                        (*agg).aggargtypes = pg_sys::lappend_oid(std::ptr::null_mut(), pg_sys::BYTEAOID);
+                        (*agg).aggargtypes =
+                            pg_sys::lappend_oid(std::ptr::null_mut(), pg_sys::BYTEAOID);
                     } else if !(*agg).args.is_null() && (*(*agg).args).length >= 1 {
                         let arg = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
                         let mut expr = (*arg).expr as *mut pg_sys::Node;
@@ -2551,7 +2552,10 @@ pub(crate) unsafe fn rewrite_query_aggregates(
     }
 }
 
-pub(crate) fn rollup_supports_query_cols(view_name: &str, query_cols: &[(String, Option<String>)]) -> bool {
+pub(crate) fn rollup_supports_query_cols(
+    view_name: &str,
+    query_cols: &[(String, Option<String>)],
+) -> bool {
     Spi::connect(|client| -> Result<bool, spi::Error> {
         for (col, agg) in query_cols {
             if let Some(agg_fn) = agg {
@@ -2614,7 +2618,8 @@ pub(crate) fn rollup_supports_query_cols(view_name: &str, query_cols: &[(String,
             }
         }
         Ok(true)
-    }).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 pub(crate) unsafe fn extract_supported_query_columns(

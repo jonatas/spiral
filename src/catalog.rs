@@ -49,8 +49,6 @@ pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
         return v;
     }
 
-
-
     let epochs = Spi::connect(|client| {
         let sql = format!(
             "SELECT start_t, COALESCE(end_t, 9223372036854775807), tenant_scale, base_offset 
@@ -213,8 +211,6 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
     if let Some(entry) = cached {
         return entry;
     }
-
-
 
     let result = Spi::connect(|client| {
         let table = client.select(
@@ -394,7 +390,8 @@ pub fn unify_changelog(base_view: &str) {
 
     Spi::run(
         "DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM changelog_snapshot)",
-    ).unwrap();
+    )
+    .unwrap();
     Spi::run("INSERT INTO spiral.changelog (base_view, scope_values, t_start, t_end) SELECT base_view, scope_values, ts, te FROM temp_unified").unwrap();
     Spi::run("DROP TABLE changelog_snapshot").unwrap();
     Spi::run("DROP TABLE temp_unified").unwrap();
