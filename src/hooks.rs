@@ -1258,7 +1258,9 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
 
                             let mut supported = true;
                             for seg in &segments {
-                                if seg.source != base_table && !rollup_supports_query_cols(&seg.source, &query_cols) {
+                                if seg.source != base_table
+                                    && !rollup_supports_query_cols(&seg.source, &query_cols)
+                                {
                                     supported = false;
                                     break;
                                 }
