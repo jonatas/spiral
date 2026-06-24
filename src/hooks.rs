@@ -1088,21 +1088,9 @@ impl AstVisitor {
 unsafe fn build_time_constraints(
     jointree: *mut pg_sys::Node,
     rtable: *mut pg_sys::List,
-) -> (std::collections::HashMap<i32, QueryConstraints>, i64) {
+) -> std::collections::HashMap<i32, QueryConstraints> {
     let visitor = AstVisitor::new(rtable);
-    let constraints = visitor.run(jointree);
-
-    // Use pg_timezone_names to get the UTC offset for the current session timezone.
-    // The AT TIME ZONE + now() formula returns 0 inside the planner hook context;
-    // pg_timezone_names gives the correct signed offset in seconds for the current date.
-    let tz_offset = Spi::get_one::<i64>(
-        "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint \
-         FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1",
-    )
-    .unwrap_or(Some(0))
-    .unwrap_or(0);
-
-    (constraints, tz_offset)
+    visitor.run(jointree)
 }
 
 #[pg_guard]
@@ -1129,14 +1117,8 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
         // Ensure background worker is running for this database.
         crate::bgworker::maybe_start_worker();
 
-        let tz_offset = Spi::get_one::<i64>(
-            "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint \
-             FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1",
-        )
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-
-        process_query_recursive(parse, tz_offset);
+        let mut tz_offset_cache = None;
+        process_query_recursive(parse, &mut tz_offset_cache);
 
         if let Some(prev_hook) = PREV_PLANNER_HOOK {
             prev_hook(parse, query_string, cursor_options, bound_params)
@@ -1148,7 +1130,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
     .execute()
 }
 
-unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
+unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &mut Option<i64>) {
     if query.is_null() || (*query).commandType != pg_sys::CmdType::CMD_SELECT {
         return;
     }
@@ -1158,7 +1140,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
         return;
     }
 
-    let (constraint_map, _) =
+    let constraint_map =
         build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
 
     for i in 0..(*rtable).length {
@@ -1169,7 +1151,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
         }
 
         if (*rte).rtekind == pg_sys::RTEKind::RTE_SUBQUERY {
-            process_query_recursive((*rte).subquery, tz_offset);
+            process_query_recursive((*rte).subquery, tz_offset_cache);
             continue;
         }
 
@@ -1220,6 +1202,19 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                             actual_range,
                             None,
                         );
+                        
+                        let tz_offset = if let Some(off) = *tz_offset_cache {
+                            off
+                        } else {
+                            let off = Spi::get_one::<i64>(
+                                "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint \
+                                 FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1",
+                            )
+                            .unwrap_or(Some(0))
+                            .unwrap_or(0);
+                            *tz_offset_cache = Some(off);
+                            off
+                        };
 
                         let segments = if sorted_hierarchy.is_empty() {
                             vec![Segment {
@@ -1230,6 +1225,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset: i64) {
                         } else {
                             let dirty_ranges =
                                 catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
+                            
                             resolve_segments_from_sorted(
                                 &base_table,
                                 ts,
@@ -3423,12 +3419,13 @@ pub fn spiral_explain(query_sql: &str) -> String {
         let query = pg_sys::list_nth(query_list, 0) as *mut pg_sys::Query;
 
         let mut report = String::new();
-        explain_query_recursive(query, &mut report);
+        let mut tz_offset_cache = None;
+        explain_query_recursive(query, &mut tz_offset_cache, &mut report);
         report
     }
 }
 
-unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String) {
+pub(crate) unsafe fn explain_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &mut Option<i64>, report: &mut String) {
     if query.is_null() {
         return;
     }
@@ -3440,7 +3437,7 @@ unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String
         return;
     }
 
-    let (constraint_map, tz_offset) =
+    let constraint_map =
         build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
     report.push_str(&format!(
         "Analyzing Query with {} relations in rtable.\n",
@@ -3453,7 +3450,7 @@ unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String
 
         if (*rte).rtekind == pg_sys::RTEKind::RTE_SUBQUERY {
             report.push_str(&format!("Entering Subquery at RTE #{}.\n", varno));
-            explain_query_recursive((*rte).subquery, report);
+            explain_query_recursive((*rte).subquery, tz_offset_cache, report);
             continue;
         }
 
@@ -3508,6 +3505,19 @@ unsafe fn explain_query_recursive(query: *mut pg_sys::Query, report: &mut String
                 for msg in explain_msgs {
                     report.push_str(&format!("{}\n", msg));
                 }
+
+                let tz_offset = if let Some(off) = *tz_offset_cache {
+                    off
+                } else {
+                    let off = Spi::get_one::<i64>(
+                        "SELECT EXTRACT(EPOCH FROM utc_offset)::bigint \
+                         FROM pg_timezone_names WHERE name = current_setting('TimeZone') LIMIT 1",
+                    )
+                    .unwrap_or(Some(0))
+                    .unwrap_or(0);
+                    *tz_offset_cache = Some(off);
+                    off
+                };
 
                 let segments = if sorted_hierarchy.is_empty() {
                     vec![Segment {
