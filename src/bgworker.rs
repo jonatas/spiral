@@ -108,16 +108,18 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
         .unwrap_or(None)
         .unwrap_or((vec![], false, 10));
 
+        let mut scopes_by_base: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (bv, sv) in scopes {
+            scopes_by_base.entry(bv).or_default().push(sv);
+        }
+
         let mut processed = 0i32;
-        for (base_view, scope_json) in scopes {
+        for (base_view, base_scopes) in scopes_by_base {
             if processed >= batch_size {
                 break;
             }
 
-            let lock_key = format!("{}:{}", base_view, scope_json);
-            let lock_hash = crate::zorder::fnv1a_64(lock_key.as_bytes()) as i32;
-
-            let success = BackgroundWorker::transaction(|| {
+            let num_processed = BackgroundWorker::transaction(|| {
                 Spi::connect(|client| {
                     // 1. Check if jobs are paused for this DB (e.g. during DDL/testing)
                     let can_work: bool = client
@@ -135,51 +137,64 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                         .unwrap_or(false);
 
                     if !can_work {
-                        return Ok::<bool, spi::Error>(false);
+                        return Ok::<i32, spi::Error>(0);
                     }
 
-                    // 2. Try to get the scope lock
-                    let got_lock: bool = client
-                        .select(
-                            &format!(
-                                "SELECT pg_try_advisory_xact_lock({}, {})",
-                                SCOPE_LOCK_NS, lock_hash
-                            ),
-                            Some(1),
-                            &[],
-                        )?
-                        .first()
-                        .get_one::<bool>()
-                        .unwrap_or(Some(false))
-                        .unwrap_or(false);
+                    // 2. Try to get the scope locks
+                    let mut locked_scopes = Vec::new();
+                    for scope_json in &base_scopes {
+                        if processed + (locked_scopes.len() as i32) >= batch_size {
+                            break;
+                        }
 
-                    if !got_lock {
-                        return Ok::<bool, spi::Error>(false);
+                        let lock_key = format!("{}:{}", base_view, scope_json);
+                        let lock_hash = crate::zorder::fnv1a_64(lock_key.as_bytes()) as i32;
+
+                        let got_lock: bool = client
+                            .select(
+                                &format!(
+                                    "SELECT pg_try_advisory_xact_lock({}, {})",
+                                    SCOPE_LOCK_NS, lock_hash
+                                ),
+                                Some(1),
+                                &[],
+                            )?
+                            .first()
+                            .get_one::<bool>()
+                            .unwrap_or(Some(false))
+                            .unwrap_or(false);
+
+                        if got_lock {
+                            locked_scopes.push(scope_json.clone());
+                        }
+                    }
+
+                    if locked_scopes.is_empty() {
+                        return Ok::<i32, spi::Error>(0);
                     }
 
                     if debug_logging {
                         debug2!(
-                            "Spiral Worker (Slot {}): refreshing scope '{}' for '{}'",
+                            "Spiral Worker (Slot {}): refreshing {} scopes for '{}'",
                             slot,
-                            scope_json,
+                            locked_scopes.len(),
                             base_view
                         );
                     }
 
                     let safe_bv = base_view.replace('\'', "''");
-                    let safe_sv = scope_json.replace('\'', "''");
+                    let json_array = serde_json::to_string(&locked_scopes).unwrap_or_else(|_| "[]".to_string());
+                    let safe_json = json_array.replace('\'', "''");
                     let _ = Spi::run(&format!(
-                        "SELECT spiral_refresh_scope('{}', '{}')",
-                        safe_bv, safe_sv
+                        "SELECT spiral_refresh_scopes('{}', '{}'::jsonb)",
+                        safe_bv, safe_json
                     ));
-                    Ok::<bool, spi::Error>(true)
+                    Ok::<i32, spi::Error>(locked_scopes.len() as i32)
                 })
             })
-            .unwrap_or(false);
+            .unwrap_or(0);
 
-            if success {
-                processed += 1;
-            }
+            processed += num_processed;
         }
 
         if processed > 0 && !debug_logging {

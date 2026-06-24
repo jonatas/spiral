@@ -3346,18 +3346,7 @@ pub fn reactive_refresh(base_name: &str, where_clause: Option<String>) -> bool {
     }
 
     let success = if is_root && scope_filter.is_none() {
-        let scopes: Vec<String> = Spi::connect(|client| Ok::<Vec<String>, spi::Error>(client.select(&format!("SELECT DISTINCT scope_values::text FROM spiral.changelog WHERE base_view = '{}'", real_base.replace('\'', "''")), None, &[])?.map(|r| r.get::<String>(1).unwrap().unwrap_or_else(|| "{}".to_string())).collect())).unwrap_or_default();
-        if scopes.is_empty() {
-            crate::refresh_incremental(base_name, None, 0, None)
-        } else {
-            let mut all_ok = true;
-            for s in scopes {
-                if !crate::refresh_incremental(base_name, None, 0, Some(s)) {
-                    all_ok = false;
-                }
-            }
-            all_ok
-        }
+        crate::refresh_incremental(base_name, None, 0, None)
     } else {
         crate::refresh_incremental(base_name, where_clause.clone(), 0, None)
     };
@@ -3382,13 +3371,54 @@ pub fn reactive_refresh_by_scope(base_name: &str, scope_json: String) {
         .map(|m| m.base_view.clone())
         .unwrap_or_else(|| base_name.to_string());
     if !is_root {
-        let _ = crate::refresh_incremental(base_name, None, 0, Some(scope_json));
+        let _ = crate::refresh_incremental(base_name, None, 0, Some(vec![scope_json]));
         return;
     }
     catalog::unify_changelog_scope(&real_base, &scope_json);
     let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
     let _ = Spi::run(&format!("CREATE TEMP TABLE refreshing_changelog AS SELECT ctid as old_ctid FROM spiral.changelog WHERE base_view = '{}' AND scope_values = '{}'::jsonb", real_base.replace('\'', "''"), scope_json.replace('\'', "''")));
-    if crate::refresh_incremental(base_name, None, 0, Some(scope_json)) {
+    if crate::refresh_incremental(base_name, None, 0, Some(vec![scope_json])) {
+        let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
+    }
+    let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
+}
+
+pub fn reactive_refresh_by_scopes(base_name: &str, scopes_json: Vec<String>) {
+    if scopes_json.is_empty() {
+        return;
+    }
+    
+    let metadata = catalog::get_metadata(base_name);
+    let is_root = metadata
+        .as_ref()
+        .map(|m| m.parent_view == m.base_view || m.parent_view == "BASE")
+        .unwrap_or(false);
+    let real_base = metadata
+        .as_ref()
+        .map(|m| m.base_view.clone())
+        .unwrap_or_else(|| base_name.to_string());
+        
+    if !is_root {
+        let _ = crate::refresh_incremental(base_name, None, 0, Some(scopes_json));
+        return;
+    }
+    
+    for scope_json in &scopes_json {
+        catalog::unify_changelog_scope(&real_base, scope_json);
+    }
+    
+    let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
+    let safe_base = real_base.replace('\'', "''");
+    let values = scopes_json.iter().map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+    let scope_condition = if scopes_json.len() == 1 {
+        format!("scope_values = {}", values)
+    } else {
+        format!("scope_values IN ({})", values)
+    };
+    
+    let _ = Spi::run(&format!("CREATE TEMP TABLE refreshing_changelog AS SELECT ctid as old_ctid FROM spiral.changelog WHERE base_view = '{}' AND {}", safe_base, scope_condition));
+    
+    if crate::refresh_incremental(base_name, None, 0, Some(scopes_json)) {
         let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
     }
     let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");

@@ -249,7 +249,7 @@ fn refresh_incremental(
     view_name: &str,
     extra_where: Option<String>,
     depth: i32,
-    scope_json: Option<String>,
+    scopes_json: Option<Vec<String>>,
 ) -> bool {
     if depth > 5 {
         notice!(
@@ -325,10 +325,25 @@ fn refresh_incremental(
             .trim();
 
         let safe_key = changelog_key.replace('\'', "''");
-        let (changelog_scope_match, target_scope_where) = if let Some(ref sj) = scope_json {
-            let safe_sj = sj.replace('\'', "''");
-            let tsw = scope_json_to_where(sj).unwrap_or_else(|| "1=1".to_string());
-            (format!("c.scope_values = '{}'::jsonb", safe_sj), tsw)
+        let (changelog_scope_match, target_scope_where) = if let Some(ref scopes) = scopes_json {
+            let values = scopes.iter().map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+            let changelog_match = if scopes.len() == 1 {
+                format!("c.scope_values = {}", values)
+            } else {
+                format!("c.scope_values IN ({})", values)
+            };
+            
+            let tsw = if scopes.is_empty() {
+                "1=1".to_string()
+            } else {
+                let or_clauses: Vec<String> = scopes.iter().filter_map(|sj| scope_json_to_where(sj)).collect();
+                if or_clauses.is_empty() {
+                    "1=1".to_string()
+                } else {
+                    format!("({})", or_clauses.join(" OR "))
+                }
+            };
+            (changelog_match, tsw)
         } else if scope_cols_raw.is_empty() {
             (
                 "c.scope_values = '{}'::jsonb".to_string(),
@@ -355,10 +370,20 @@ fn refresh_incremental(
             format!("1, {}", scope_cols.join(", "))
         };
 
-        let base_where = scope_json
-            .as_deref()
-            .and_then(scope_json_to_where)
-            .or_else(|| extra_where.clone());
+        let base_where = if let Some(ref scopes) = scopes_json {
+            if scopes.is_empty() {
+                extra_where.clone()
+            } else {
+                let or_clauses: Vec<String> = scopes.iter().filter_map(|sj| scope_json_to_where(sj)).collect();
+                if or_clauses.is_empty() {
+                    extra_where.clone()
+                } else {
+                    Some(format!("({})", or_clauses.join(" OR ")))
+                }
+            }
+        } else {
+            extra_where.clone()
+        };
 
         let base_metadata_owned = catalog::get_metadata(&metadata.base_view);
         let source_time_col = if parent_view == "BASE" {
@@ -374,9 +399,13 @@ fn refresh_incremental(
             "t"
         };
 
-        let source_changelog_scope_match = if let Some(ref sj) = scope_json {
-            let safe_sj = sj.replace('\'', "''");
-            format!("c.scope_values = '{}'::jsonb", safe_sj)
+        let source_changelog_scope_match = if let Some(ref scopes) = scopes_json {
+            let values = scopes.iter().map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+            if scopes.len() == 1 {
+                format!("c.scope_values = {}", values)
+            } else {
+                format!("c.scope_values IN ({})", values)
+            }
         } else if scope_cols_raw.is_empty() {
             "c.scope_values = '{}'::jsonb".to_string()
         } else {
@@ -508,9 +537,17 @@ fn refresh_incremental(
         );
 
         SKIP_ACCELERATION.with(|s| s.set(true));
+        let target_empty = Spi::get_one::<i32>(&format!("SELECT 1 FROM \"{}\" LIMIT 1", view_name))
+            .unwrap_or(None)
+            .is_none();
+
         let run_upsert = Spi::run(&upsert_sql);
         let run_result = if run_upsert.is_ok() {
-            Spi::run(&sparse_delete_sql)
+            if target_empty {
+                Ok(())
+            } else {
+                Spi::run(&sparse_delete_sql)
+            }
         } else {
             run_upsert
         };
@@ -531,7 +568,7 @@ fn refresh_incremental(
     let mut all_ok = true;
     for child in children {
         if child != view_name
-            && !refresh_incremental(&child, extra_where.clone(), depth + 1, scope_json.clone())
+            && !refresh_incremental(&child, extra_where.clone(), depth + 1, scopes_json.clone())
         {
             all_ok = false;
         }
@@ -612,6 +649,14 @@ fn spiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL"))
 #[pg_extern(name = "spiral_refresh_scope")]
 fn spiral_refresh_scope(view_name: &str, scope_json: &str) {
     hooks::reactive_refresh_by_scope(view_name, scope_json.to_string());
+}
+
+#[pg_extern(name = "spiral_refresh_scopes")]
+fn spiral_refresh_scopes(view_name: &str, scopes_json: pgrx::JsonB) {
+    if let serde_json::Value::Array(arr) = scopes_json.0 {
+        let scopes: Vec<String> = arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        hooks::reactive_refresh_by_scopes(view_name, scopes);
+    }
 }
 
 #[pg_extern(name = "spiral_register_view_rust")]
@@ -814,19 +859,19 @@ mod tests {
 
     #[pg_test]
     fn test_issue_95_fewer_columns() {
-        Spi::run("CREATE TABLE acts3 (
+        let _ = Spi::run("CREATE TABLE acts3 (
             t timestamptz NOT NULL,
             user_id bigint NOT NULL,
             unrelated integer,
             tracked integer DEFAULT 0
         ) WITH (spiral.frames = '1h,1d', spiral.tenant = 'user_id');");
         
-        Spi::run("COMMENT ON COLUMN acts3.tracked IS 'sum, stats as tracked_stats';");
+        let _ = Spi::run("COMMENT ON COLUMN acts3.tracked IS 'sum, stats as tracked_stats';");
         
-        Spi::run("INSERT INTO acts3 SELECT '2024-01-01'::timestamptz + interval '10 min' * g, (g % 5) + 1, 0, 60 FROM generate_series(0, 100) g;");
-        Spi::run("SELECT spiral_refresh('acts3');");
+        let _ = Spi::run("INSERT INTO acts3 SELECT '2024-01-01'::timestamptz + interval '10 min' * g, (g % 5) + 1, 0, 60 FROM generate_series(0, 100) g;");
+        let _ = Spi::run("SELECT spiral_refresh('acts3');");
         
-        Spi::run("INSERT INTO acts3 VALUES ('2024-05-01 00:05:00+00', 1, 0, 60);");
+        let _ = Spi::run("INSERT INTO acts3 VALUES ('2024-05-01 00:05:00+00', 1, 0, 60);");
 
         let res = Spi::run("SELECT date_trunc('day', t), user_id, sum(tracked) FROM acts3 WHERE t >= '2024-02-01' AND t < '2024-06-01' GROUP BY 1,2;");
         assert!(res.is_ok());
