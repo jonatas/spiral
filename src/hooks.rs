@@ -1232,7 +1232,6 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                 te,
                                 &sorted_hierarchy,
                                 &dirty_ranges,
-                                tz_offset,
                             )
                         };
 
@@ -1324,11 +1323,16 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                     None
                                 };
                                 
-                                // Omit columns that are not in the query if they are rollup cols
+                                // Unreferenced rollup-formula columns can't be emitted as
+                                // plain refs (tier arms materialize them as accumulators —
+                                // Issue 95), but they must still occupy their attno slot so
+                                // the query's Vars stay aligned with the union targetlist.
+                                // __UNUSED__ renders as NULL::<original type> in every arm.
                                 if agg.is_none() && rollup_cols_with_formulas.contains(c) {
+                                    cols.push((c.clone(), Some("__UNUSED__".to_string())));
                                     continue;
                                 }
-                                
+
                                 cols.push((c.clone(), agg));
                             }
 
@@ -1403,7 +1407,10 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                 (*rte).relid = pg_sys::InvalidOid;
                                 (*rte).perminfoindex = 0;
 
-                                let mut column_formulas = std::collections::HashMap::new();
+                                let mut column_formulas: std::collections::HashMap<
+                                    String,
+                                    Vec<String>,
+                                > = std::collections::HashMap::new();
                                 Spi::connect(|client| {
                                     let q = format!(
                                         "SELECT base_column, formula FROM spiral.sources \
@@ -1415,7 +1422,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                     if let Ok(res) = client.select(&q, None, &[]) {
                                         for row in res {
                                             if let (Ok(Some(bc)), Ok(Some(f))) = (row.get::<String>(1), row.get::<String>(2)) {
-                                                column_formulas.insert(bc, f);
+                                                column_formulas.entry(bc).or_default().push(f);
                                             }
                                         }
                                     }
@@ -1424,7 +1431,14 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
 
                                 let star_attno =
                                     if let Some(pos) = cols.iter().position(|(n, _)| n == "*") {
-                                        (pos + 2) as i32 // 1 for t, then 1-based index in cols
+                                        // 1-based attno in the union subquery: leading t,
+                                        // then every cols entry before "*" except plain `t`
+                                        // references, which the union builder skips.
+                                        let emitted_before = cols[..pos]
+                                            .iter()
+                                            .filter(|(n, agg)| !(n == "t" && agg.is_none()))
+                                            .count();
+                                        (emitted_before + 2) as i32
                                     } else {
                                         0
                                     };
@@ -1595,7 +1609,6 @@ fn resolve_segments_from_sorted(
     te: i64,
     sorted_hierarchy: &[(String, i32, f64)],
     dirty: &[(i64, i64)],
-    offset_seconds: i64,
 ) -> Vec<Segment> {
     let mut segments = Vec::new();
 
@@ -1630,7 +1643,13 @@ fn resolve_segments_from_sorted(
                 if f_s <= 0 {
                     continue;
                 }
-                let bucket_start = ((curr + offset_seconds) / f_s) * f_s - offset_seconds;
+                // Rollup buckets are epoch-aligned ((spiral(t)/frame)*frame in
+                // rollup.rs) regardless of the session timezone, so segment
+                // boundaries must align to the same grid. Shifting by the tz
+                // offset drops the boundary bucket whose key falls outside the
+                // shifted window; local-time grouping correctness is handled by
+                // capping the tier granularity, not by moving bucket edges.
+                let bucket_start = (curr / f_s) * f_s;
                 let bucket_end = bucket_start + f_s;
                 if curr == bucket_start && bucket_end <= clean_e {
                     segments.push(Segment {
@@ -1654,7 +1673,7 @@ fn resolve_segments_from_sorted(
                     });
                     break;
                 }
-                let next_boundary = ((curr + offset_seconds + f_s) / f_s) * f_s - offset_seconds;
+                let next_boundary = ((curr + f_s) / f_s) * f_s;
                 let segment_end = clean_e.min(next_boundary);
                 segments.push(Segment {
                     source: base_table.to_string(),
@@ -2333,9 +2352,32 @@ fn is_supported_rollup_aggregate(agg_fn: &str) -> bool {
     )
 }
 
+/// Pick the rollup formula a rewritten aggregate should read, mirroring the
+/// per-aggregate formula selection in `construct_union_sql_hierarchical`.
+/// Columns can register several formulas (e.g. `sum` + `stats`); the union
+/// arms and the rewritten aggregate must agree on which materialized column
+/// (native vs binary accumulator) flows through the plan.
+fn pick_formula_for_agg(agg_fn: &str, formulas: &[String]) -> Option<String> {
+    let has = |f: &str| formulas.iter().any(|x| x == f);
+    let preferred: &[&str] = match agg_fn {
+        "sum" | "min" | "max" => &["sum", "ohlcv", "stats"],
+        "avg" | "count" => &["stats"],
+        "spiral_stats" | "spiral_stats_merge" => &["stats"],
+        "spiral_ohlcv" | "spiral_ohlcv_merge" | "first" | "last" => &["ohlcv"],
+        "spiral_tdigest" | "spiral_tdigest_merge" => &["tdigest"],
+        "spiral_sketch" | "spiral_sketch_merge" => &["sketch"],
+        _ => &[],
+    };
+    preferred
+        .iter()
+        .find(|f| has(f))
+        .map(|f| f.to_string())
+        .or_else(|| formulas.first().cloned())
+}
+
 pub(crate) unsafe fn rewrite_query_aggregates(
     query: *mut pg_sys::Query,
-    column_formulas: &std::collections::HashMap<String, String>,
+    column_formulas: &std::collections::HashMap<String, Vec<String>>,
     varno: i32,
     star_attno: i32,
 ) {
@@ -2408,7 +2450,7 @@ pub(crate) unsafe fn rewrite_query_aggregates(
 
     unsafe fn walk_and_rewrite(
         node: *mut pg_sys::Node,
-        column_formulas: &std::collections::HashMap<String, String>,
+        column_formulas: &std::collections::HashMap<String, Vec<String>>,
         rtable: *mut pg_sys::List,
         oids: &[Option<pg_sys::Oid>],
         varno: i32,
@@ -2452,8 +2494,10 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                             let varname_ptr = pg_sys::get_rte_attribute_name(rte, (*var).varattno);
                             if !varname_ptr.is_null() {
                                 let name = CStr::from_ptr(varname_ptr).to_string_lossy();
-                                if let Some(f) = column_formulas.get(name.as_ref()) {
-                                    formula = f.clone();
+                                if let Some(fs) = column_formulas.get(name.as_ref()) {
+                                    if let Some(f) = pick_formula_for_agg(&agg_fn, fs) {
+                                        formula = f;
+                                    }
                                 }
                                 pg_sys::pfree(varname_ptr as *mut std::ffi::c_void);
                             }
@@ -3223,27 +3267,32 @@ fn construct_union_sql_hierarchical(
                         Ok((String::new(), col.clone()))
                     }).unwrap_or_else(|_| (String::new(), col.clone()))
                 } else {
-                    // Raw branch: whether the aggregate needs a JSONB
+                    // Raw branch: whether the aggregate needs a binary
                     // accumulator (stats/ohlcv/...) depends on the column's
                     // rollup formula. Without this lookup plain-sum columns
                     // were cast to jsonb, breaking mixed raw+tier plans.
-                    let f = Spi::connect(|client| -> Result<String, spi::Error> {
+                    // Columns may register several formulas; pick the same one
+                    // the aggregate rewriter picks so both plan arms agree.
+                    let fs = Spi::connect(|client| -> Result<Vec<String>, spi::Error> {
                         let sql = format!(
                             "SELECT formula FROM spiral.sources \
                              WHERE view_name = (SELECT view_name FROM spiral.metadata \
                                                 WHERE base_view = '{}' AND frame_seconds > 0 \
                                                 LIMIT 1) \
-                               AND base_column = '{}' LIMIT 1",
+                               AND base_column = '{}'",
                             base_table.replace('\'', "''"),
                             col.replace('\'', "''")
                         );
-                        let mut rows = client.select(&sql, Some(1), &[])?;
-                        if let Some(row) = rows.next() {
-                            return Ok(row.get::<String>(1)?.unwrap_or_default());
-                        }
-                        Ok(String::new())
+                        Ok(client
+                            .select(&sql, None, &[])?
+                            .map(|row| {
+                                row.get::<String>(1).unwrap_or(None).unwrap_or_default()
+                            })
+                            .filter(|s| !s.is_empty())
+                            .collect())
                     })
                     .unwrap_or_default();
+                    let f = pick_formula_for_agg(&agg_fn.to_lowercase(), &fs).unwrap_or_default();
                     (f, col.clone())
                 };
                 if is_rollup && formula_for_col.is_empty() && !rollup_cols.contains(col.as_str()) {
@@ -3725,7 +3774,6 @@ pub(crate) unsafe fn explain_query_recursive(query: *mut pg_sys::Query, tz_offse
                         te,
                         &sorted_hierarchy,
                         &dirty_ranges,
-                        tz_offset,
                     )
                 };
 
