@@ -1721,8 +1721,12 @@ fn get_actual_data_range(base_table: &str, hierarchy: &[String]) -> Option<(i64,
                             .unwrap_or(Some(false))
                             .unwrap_or(false)
                     {
+                        // spiral() is monotonic in t, so spiral(MIN(t)) equals
+                        // MIN(spiral(t)) — but the bare column lets the planner
+                        // satisfy MIN/MAX from the tier's t index instead of
+                        // seq-scanning every tier on each query plan.
                         let sql = format!(
-                            "SELECT MIN(spiral(t))::bigint, MAX(spiral(t))::bigint FROM \"{}\"",
+                            "SELECT spiral(MIN(t))::bigint, spiral(MAX(t))::bigint FROM \"{}\"",
                             tier.replace('"', "\"\"")
                         );
                         if let Ok(result) = client.select(&sql, Some(1), &[]) {
