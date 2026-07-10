@@ -343,17 +343,24 @@ fn refresh_incremental(
 
         let safe_key = changelog_key.replace('\'', "''");
         let (changelog_scope_match, target_scope_where) = if let Some(ref scopes) = scopes_json {
-            let values = scopes.iter().map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+            let values = scopes
+                .iter()
+                .map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
             let changelog_match = if scopes.len() == 1 {
                 format!("c.scope_values = {}", values)
             } else {
                 format!("c.scope_values IN ({})", values)
             };
-            
+
             let tsw = if scopes.is_empty() {
                 "1=1".to_string()
             } else {
-                let or_clauses: Vec<String> = scopes.iter().filter_map(|sj| scope_json_to_where(sj)).collect();
+                let or_clauses: Vec<String> = scopes
+                    .iter()
+                    .filter_map(|sj| scope_json_to_where(sj))
+                    .collect();
                 if or_clauses.is_empty() {
                     "1=1".to_string()
                 } else {
@@ -391,7 +398,10 @@ fn refresh_incremental(
             if scopes.is_empty() {
                 extra_where.clone()
             } else {
-                let or_clauses: Vec<String> = scopes.iter().filter_map(|sj| scope_json_to_where(sj)).collect();
+                let or_clauses: Vec<String> = scopes
+                    .iter()
+                    .filter_map(|sj| scope_json_to_where(sj))
+                    .collect();
                 if or_clauses.is_empty() {
                     extra_where.clone()
                 } else {
@@ -417,7 +427,11 @@ fn refresh_incremental(
         };
 
         let source_changelog_scope_match = if let Some(ref scopes) = scopes_json {
-            let values = scopes.iter().map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+            let values = scopes
+                .iter()
+                .map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
             if scopes.len() == 1 {
                 format!("c.scope_values = {}", values)
             } else {
@@ -671,7 +685,10 @@ fn spiral_refresh_scope(view_name: &str, scope_json: &str) {
 #[pg_extern(name = "spiral_refresh_scopes")]
 fn spiral_refresh_scopes(view_name: &str, scopes_json: pgrx::JsonB) {
     if let serde_json::Value::Array(arr) = scopes_json.0 {
-        let scopes: Vec<String> = arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        let scopes: Vec<String> = arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
         hooks::reactive_refresh_by_scopes(view_name, scopes);
     }
 }
@@ -876,18 +893,20 @@ mod tests {
 
     #[pg_test]
     fn test_issue_95_fewer_columns() {
-        let _ = Spi::run("CREATE TABLE acts3 (
+        let _ = Spi::run(
+            "CREATE TABLE acts3 (
             t timestamptz NOT NULL,
             user_id bigint NOT NULL,
             unrelated integer,
             tracked integer DEFAULT 0
-        ) WITH (spiral.frames = '1h,1d', spiral.tenant = 'user_id');");
-        
+        ) WITH (spiral.frames = '1h,1d', spiral.tenant = 'user_id');",
+        );
+
         let _ = Spi::run("COMMENT ON COLUMN acts3.tracked IS 'sum, stats as tracked_stats';");
-        
+
         let _ = Spi::run("INSERT INTO acts3 SELECT '2024-01-01'::timestamptz + interval '10 min' * g, (g % 5) + 1, 0, 60 FROM generate_series(0, 100) g;");
         let _ = Spi::run("SELECT spiral_refresh('acts3');");
-        
+
         let _ = Spi::run("INSERT INTO acts3 VALUES ('2024-05-01 00:05:00+00', 1, 0, 60);");
 
         let res = Spi::run("SELECT date_trunc('day', t), user_id, sum(tracked) FROM acts3 WHERE t >= '2024-02-01' AND t < '2024-06-01' GROUP BY 1,2;");

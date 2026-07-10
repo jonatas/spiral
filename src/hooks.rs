@@ -1140,8 +1140,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
         return;
     }
 
-    let constraint_map =
-        build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
+    let constraint_map = build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
 
     for i in 0..(*rtable).length {
         let varno = i + 1;
@@ -1225,7 +1224,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                         } else {
                             let dirty_ranges =
                                 catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
-                            
+
                             resolve_segments_from_sorted(
                                 &base_table,
                                 ts,
@@ -1322,7 +1321,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                 } else {
                                     None
                                 };
-                                
+
                                 // Unreferenced rollup-formula columns can't be emitted as
                                 // plain refs (tier arms materialize them as accumulators —
                                 // Issue 95), but they must still occupy their attno slot so
@@ -3289,9 +3288,7 @@ fn construct_union_sql_hierarchical(
                         );
                         Ok(client
                             .select(&sql, None, &[])?
-                            .map(|row| {
-                                row.get::<String>(1).unwrap_or(None).unwrap_or_default()
-                            })
+                            .map(|row| row.get::<String>(1).unwrap_or(None).unwrap_or_default())
                             .filter(|s| !s.is_empty())
                             .collect())
                     })
@@ -3602,7 +3599,7 @@ pub fn reactive_refresh_by_scopes(base_name: &str, scopes_json: Vec<String>) {
     if scopes_json.is_empty() {
         return;
     }
-    
+
     let metadata = catalog::get_metadata(base_name);
     let is_root = metadata
         .as_ref()
@@ -3612,27 +3609,31 @@ pub fn reactive_refresh_by_scopes(base_name: &str, scopes_json: Vec<String>) {
         .as_ref()
         .map(|m| m.base_view.clone())
         .unwrap_or_else(|| base_name.to_string());
-        
+
     if !is_root {
         let _ = crate::refresh_incremental(base_name, None, 0, Some(scopes_json));
         return;
     }
-    
+
     for scope_json in &scopes_json {
         catalog::unify_changelog_scope(&real_base, scope_json);
     }
-    
+
     let _ = Spi::run("DROP TABLE IF EXISTS refreshing_changelog");
     let safe_base = real_base.replace('\'', "''");
-    let values = scopes_json.iter().map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+    let values = scopes_json
+        .iter()
+        .map(|sj| format!("'{}'::jsonb", sj.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
     let scope_condition = if scopes_json.len() == 1 {
         format!("scope_values = {}", values)
     } else {
         format!("scope_values IN ({})", values)
     };
-    
+
     let _ = Spi::run(&format!("CREATE TEMP TABLE refreshing_changelog AS SELECT ctid as old_ctid FROM spiral.changelog WHERE base_view = '{}' AND {}", safe_base, scope_condition));
-    
+
     if crate::refresh_incremental(base_name, None, 0, Some(scopes_json)) {
         let _ = Spi::run("DELETE FROM spiral.changelog WHERE ctid IN (SELECT old_ctid FROM refreshing_changelog)");
     }
@@ -3670,7 +3671,11 @@ pub fn spiral_explain(query_sql: &str) -> String {
     }
 }
 
-pub(crate) unsafe fn explain_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &mut Option<i64>, report: &mut String) {
+pub(crate) unsafe fn explain_query_recursive(
+    query: *mut pg_sys::Query,
+    tz_offset_cache: &mut Option<i64>,
+    report: &mut String,
+) {
     if query.is_null() {
         return;
     }
@@ -3682,8 +3687,7 @@ pub(crate) unsafe fn explain_query_recursive(query: *mut pg_sys::Query, tz_offse
         return;
     }
 
-    let constraint_map =
-        build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
+    let constraint_map = build_time_constraints((*query).jointree as *mut pg_sys::Node, rtable);
     report.push_str(&format!(
         "Analyzing Query with {} relations in rtable.\n",
         (*rtable).length

@@ -108,7 +108,8 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
         .unwrap_or(None)
         .unwrap_or((vec![], false, 10));
 
-        let mut scopes_by_base: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut scopes_by_base: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for (bv, sv) in scopes {
             scopes_by_base.entry(bv).or_default().push(sv);
         }
@@ -183,7 +184,8 @@ pub unsafe extern "C-unwind" fn spiral_worker_main(arg: pg_sys::Datum) {
                     }
 
                     let safe_bv = base_view.replace('\'', "''");
-                    let json_array = serde_json::to_string(&locked_scopes).unwrap_or_else(|_| "[]".to_string());
+                    let json_array =
+                        serde_json::to_string(&locked_scopes).unwrap_or_else(|_| "[]".to_string());
                     let safe_json = json_array.replace('\'', "''");
                     let _ = Spi::run(&format!(
                         "SELECT spiral_refresh_scopes('{}', '{}'::jsonb)",
