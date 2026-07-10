@@ -1919,6 +1919,11 @@ pub fn accelerate(
     notice!("Spiral: Successfully accelerated relation '{}'", relation);
 }
 
+/// Above this many distinct dirty scopes sharing a range, refresh in capped
+/// batches instead of one pass touching every scope at once — bounds the
+/// size of the `scope_values IN (...)` clause `refresh_incremental` builds.
+const MAX_SCOPES_PER_REFRESH_BATCH: i64 = 500;
+
 #[pg_extern]
 pub fn refresh(relation: &str) {
     catalog::unify_changelog(relation);
@@ -1928,9 +1933,20 @@ pub fn refresh(relation: &str) {
         return;
     }
 
-    // Manual refresh: process all tiers in order
+    let batches = catalog::coalesce_changelog_batches(relation, MAX_SCOPES_PER_REFRESH_BATCH);
+    if batches.is_empty() {
+        // No changelog rows (e.g. table has no scope columns): fall back to
+        // the whole-table pass.
+        for tier in hierarchy {
+            reactive_refresh(&tier, None);
+        }
+        return;
+    }
+
     for tier in hierarchy {
-        reactive_refresh(&tier, None);
+        for batch in &batches {
+            reactive_refresh_by_scopes(&tier, batch.clone());
+        }
     }
 }
 
