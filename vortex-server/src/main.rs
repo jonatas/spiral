@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use axum::{
     Json, Router,
     extract::{
@@ -611,7 +612,7 @@ async fn get_block_info(
     // time_col comes from our own metadata — safe to interpolate after identifier check
     if valid_identifier(&time_col) {
         let time_sql = format!(
-            "SELECT 
+            "SELECT
                 (SELECT extract(epoch from \"{tc}\")::bigint FROM \"{view}\" WHERE ctid >= '({blkno},0)'::tid AND ctid < '({next_blkno},0)'::tid ORDER BY \"{tc}\" ASC LIMIT 1),
                 (SELECT extract(epoch from \"{tc}\")::bigint FROM \"{view}\" WHERE ctid >= '({blkno},0)'::tid AND ctid < '({next_blkno},0)'::tid ORDER BY \"{tc}\" DESC LIMIT 1)",
             tc = time_col,

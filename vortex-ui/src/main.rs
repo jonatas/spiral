@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use futures_util::StreamExt;
 use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
@@ -1169,45 +1170,45 @@ fn SvgCandlestickChart(
     let candles_view = by_tenant.into_iter().enumerate().map(|(ti, (tenant_id, candles))| {
         let color = get_color_for_tenant(ti as i32, n);
         tenants_legend.push((tenant_id, color.clone()));
-        
+
         let candle_w = (plot_w / (rows.len() as f64 / n as f64).max(1.0) * 0.8).clamp(1.0, 8.0);
 
         candles.into_iter().map(|candle| {
             let x = MX + (candle.t - t_min) / t_range * plot_w;
-            
+
             let y_h = MY + (1.0 - (candle.h - v_min) / v_range) * main_h;
             let y_l = MY + (1.0 - (candle.l - v_min) / v_range) * main_h;
             let y_o = MY + (1.0 - (candle.o - v_min) / v_range) * main_h;
             let y_c = MY + (1.0 - (candle.c - v_min) / v_range) * main_h;
-            
+
             let rect_y = y_o.min(y_c);
             let rect_h = (y_o - y_c).abs().max(1.0);
             let is_up = candle.c >= candle.o;
-            
+
             let v_bar_h = (candle.vol / vol_max) * vol_h;
             let v_bar_y = MY + plot_h - v_bar_h;
 
             view! {
                 <g>
                     <line x1={x} y1={y_h} x2={x} y2={y_l} stroke={color.clone()} stroke-width="1" opacity="0.6" />
-                    <rect 
-                        x={x - candle_w/2.0} 
-                        y={rect_y} 
-                        width={candle_w} 
-                        height={rect_h} 
-                        fill={if is_up { color.clone() } else { "none".to_string() }} 
-                        stroke={color.clone()} 
-                        stroke-width="1" 
-                        opacity="0.9" 
+                    <rect
+                        x={x - candle_w/2.0}
+                        y={rect_y}
+                        width={candle_w}
+                        height={rect_h}
+                        fill={if is_up { color.clone() } else { "none".to_string() }}
+                        stroke={color.clone()}
+                        stroke-width="1"
+                        opacity="0.9"
                     />
                     {(volume_col.is_some()).then(|| view! {
-                        <rect 
-                            x={x - candle_w/2.0} 
-                            y={v_bar_y} 
-                            width={candle_w} 
-                            height={v_bar_h} 
-                            fill={color.clone()} 
-                            opacity="0.3" 
+                        <rect
+                            x={x - candle_w/2.0}
+                            y={v_bar_y}
+                            width={candle_w}
+                            height={v_bar_h}
+                            fill={color.clone()}
+                            opacity="0.3"
                         />
                     })}
                 </g>
