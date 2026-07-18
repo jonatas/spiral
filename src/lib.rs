@@ -14,6 +14,7 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 use std::cell::Cell;
 
+pub mod backfill;
 pub mod bgworker;
 pub mod catalog;
 pub mod hooks;
@@ -2602,6 +2603,63 @@ mod tests {
         assert_eq!(
             meta_gone, 0,
             "spiral.metadata must be cleaned up after DROP TABLE"
+        );
+    }
+
+    #[pg_test]
+    fn test_bulk_backfill_stats_matches_raw_aggregate() {
+        // spiral_bulk_backfill_stats must produce the same per-scope,
+        // per-bucket Welford state as accumulating row-by-row through
+        // spiral_stats_accum would — it's a different code path (native
+        // HashMap accumulation instead of one bincode round-trip per row),
+        // not a different result.
+        Spi::run("CREATE TABLE bulk_ticks (t timestamptz NOT NULL, val numeric, tenant_id int4)")
+            .unwrap();
+        Spi::run(
+            "INSERT INTO bulk_ticks (t, val, tenant_id)
+             SELECT timestamptz '2026-01-01 00:00:00' + (i * interval '5 minutes'),
+                    (i % 7) * 3.5,
+                    (i % 2) + 1
+             FROM generate_series(0, 199) i",
+        )
+        .unwrap();
+        Spi::run(
+            "CREATE TABLE bulk_ticks_1h (tenant_id int4, bucket bigint, val_stats bytea)",
+        )
+        .unwrap();
+
+        let rows_out: i64 = Spi::get_one(
+            "SELECT spiral_bulk_backfill_stats('bulk_ticks', 'bulk_ticks_1h', 3600,
+                ARRAY['tenant_id'], 'val', 'val_stats')",
+        )
+        .unwrap()
+        .unwrap_or(-1);
+        assert!(rows_out > 0, "backfill must produce at least one group");
+
+        let out_rows: i64 = Spi::get_one("SELECT COUNT(*)::bigint FROM bulk_ticks_1h")
+            .unwrap()
+            .unwrap_or(-1);
+        assert_eq!(out_rows, rows_out, "row count returned must match rows written");
+
+        // Compare one (tenant, bucket) group's mean against a plain raw aggregate.
+        let (raw_mean, raw_n): (Option<f64>, Option<i64>) = Spi::get_two(
+            "SELECT avg(val)::float8, count(*)::bigint FROM bulk_ticks
+             WHERE tenant_id = 1
+               AND extract(epoch from t)::bigint / 3600 =
+                   (SELECT bucket FROM bulk_ticks_1h WHERE tenant_id = 1 LIMIT 1)",
+        )
+        .unwrap();
+        let backfill_mean: Option<f64> = Spi::get_one(
+            "SELECT spiral_stats_mean(val_stats) FROM bulk_ticks_1h WHERE tenant_id = 1 LIMIT 1",
+        )
+        .unwrap();
+
+        assert!(raw_n.unwrap_or(0) > 0, "sanity: raw comparison group must be non-empty");
+        assert!(
+            (backfill_mean.unwrap() - raw_mean.unwrap()).abs() < 1e-9,
+            "backfill mean {:?} must match raw aggregate mean {:?}",
+            backfill_mean,
+            raw_mean
         );
     }
 }

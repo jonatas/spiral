@@ -324,7 +324,7 @@ impl OHLCVState {
 
 // BINARY HELPERS
 
-fn to_binary<T: Serialize>(val: &T) -> Vec<u8> {
+pub(crate) fn to_binary<T: Serialize>(val: &T) -> Vec<u8> {
     bincode::serialize(val).unwrap()
 }
 
