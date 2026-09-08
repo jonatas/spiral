@@ -758,12 +758,60 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
         );
     }
 
+    let rel_name = unsafe { std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*rel).rd_id)).to_string_lossy().into_owned() };
+
     info!(
         "Spiral: VACUUM finished for '{}'. Pages: {}, Tuples: {}",
-        unsafe { std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*rel).rd_id)).to_string_lossy() },
+        rel_name,
         n_pages,
         n_tuples
     );
+
+    let _ = pgrx::Spi::connect(|client| {
+        let safe_bv = rel_name.replace('\'', "''");
+        
+        let table_exists = !client
+            .select(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'changelog' LIMIT 1",
+                Some(1),
+                &[],
+            )?
+            .is_empty();
+
+        if !table_exists {
+            return Ok(());
+        }
+
+        let mut scopes = Vec::new();
+        let query = format!(
+            "SELECT scope_values::text FROM spiral.changelog WHERE base_view = '{}' GROUP BY scope_values",
+            safe_bv
+        );
+        
+        if let Ok(results) = client.select(&query, None, &[]) {
+            for row in results {
+                if let Ok(Some(sv)) = row.get::<String>(1) {
+                    scopes.push(sv);
+                }
+            }
+        }
+
+        if scopes.is_empty() {
+            return Ok(());
+        }
+
+        info!("Spiral: VACUUM refreshing {} scopes for '{}'", scopes.len(), rel_name);
+
+        let json_array = serde_json::to_string(&scopes).unwrap_or_else(|_| "[]".to_string());
+        let safe_json = json_array.replace('\'', "''");
+
+        let _ = pgrx::Spi::run(&format!(
+            "SELECT spiral_refresh_scopes('{}', '{}'::jsonb)", 
+            safe_bv, safe_json
+        ));
+
+        Ok::<(), pgrx::spi::Error>(())
+    });
 }
 
 #[pg_guard]

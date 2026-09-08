@@ -26,7 +26,7 @@
 --   SELECT spiral.tick(10);  -- 10 rows per tenant per call
 --   SELECT spiral.enable_heartbeat(1, 5);  -- 5 samples/s at 1-second interval
 --
--- Background scheduling (future: Rust BG worker reads spiral.heartbeat_config):
+-- Background scheduling (future: external scheduler reads spiral.heartbeat_config):
 --   while true; do psql -c "SELECT spiral.tick();"; sleep 1; done
 -- ==============================================================================
 LOAD 'spiral';
@@ -290,7 +290,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ── spiral.enable_heartbeat(interval_s, samples_per_tick) ────────────────────
--- Stores config; returns shell command to drive ticks until a Rust BG worker
+-- Stores config; returns shell command to drive ticks until an external scheduler
 -- reads spiral.heartbeat_config and runs spiral.tick() automatically.
 CREATE OR REPLACE FUNCTION spiral.enable_heartbeat(
     p_interval_s       int DEFAULT 1,

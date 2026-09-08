@@ -442,10 +442,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
 
                 notice!("Spiral: Successfully registered hierarchy for '{}'", name);
 
-                // 6. Ensure background worker is running for this database
-                unsafe {
-                    crate::bgworker::maybe_start_worker();
-                }
+
 
                 return;
             } else {
@@ -1114,8 +1111,7 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
     // Clear any stale time range from a previous query so non-spiral scans see None.
     crate::SCAN_TIME_RANGE.with(|r| r.set(None));
     PgTryBuilder::new(AssertUnwindSafe(|| {
-        // Ensure background worker is running for this database.
-        crate::bgworker::maybe_start_worker();
+
 
         let mut tz_offset_cache = None;
         process_query_recursive(parse, &mut tz_offset_cache);
@@ -1903,9 +1899,7 @@ pub fn accelerate(
         offset_cols,
     );
 
-    unsafe {
-        crate::bgworker::maybe_start_worker();
-    }
+
 
     if initial_load {
         let bootstrap_sql = format!(

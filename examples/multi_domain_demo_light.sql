@@ -29,20 +29,20 @@ UNION
 SELECT DISTINCT base_view  FROM spiral.metadata;
 
 -- Drain changelog for those tables.
--- DELETE is row-level (MVCC): no conflict with the worker's concurrent SELECT.
+-- DELETE is row-level (MVCC): no conflict with autovacuum's concurrent SELECT.
 DELETE FROM spiral.changelog
 WHERE base_view IN (SELECT tablename FROM _spiral_teardown);
 
-SELECT pg_sleep(1.5); -- one full worker tick so in-flight locks release
+SELECT pg_sleep(1.5); -- wait for autovacuum so in-flight locks release
 
--- Cancel any still-running worker queries (catches the in-flight tick).
+-- Cancel any still-running autovacuum queries (catches the in-flight tick).
 SELECT pg_cancel_backend(pid)
 FROM   pg_stat_activity
-WHERE  backend_type LIKE 'Spiral Worker%';
+WHERE  backend_type LIKE 'autovacuum worker%';
 
 -- Drop all collected Spiral tables (base + hierarchy).
 -- The DROP TABLE hook (remove_table_from_spiral) now also drops hierarchy tables
--- and cancels worker queries per-table, so this is clean even without retries.
+-- and cancels autovacuum queries per-table, so this is clean even without retries.
 DO $$
 DECLARE t text;
 BEGIN

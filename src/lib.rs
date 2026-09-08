@@ -15,7 +15,6 @@ use pgrx::prelude::*;
 use std::cell::Cell;
 
 pub mod backfill;
-pub mod bgworker;
 pub mod catalog;
 pub mod hooks;
 pub mod logical;
@@ -31,14 +30,6 @@ pgrx::pg_module_magic!();
 
 extension_sql_file!("../sql/spiral.sql", name = "spiral_setup");
 
-#[cfg(not(any(test, feature = "pg_test")))]
-pub static WORKER_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
-#[cfg(any(test, feature = "pg_test"))]
-pub static WORKER_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
-
-pub static WORKER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
-pub static WORKER_MAX: GucSetting<i32> = GucSetting::<i32>::new(1);
-pub static WORKER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100);
 pub static ENABLE_PLANNER_HOOK: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static PLANNER_MAX_SEGMENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
 pub static KICKOFF_DATE: GucSetting<Option<std::ffi::CString>> =
@@ -65,46 +56,6 @@ thread_local! {
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
     hooks::init_hooks();
-
-    GucRegistry::define_bool_guc(
-        c"spiral.worker_enabled",
-        c"Enable or disable the autonomous background worker",
-        c"When true, the background worker will periodically refresh dirty segments.",
-        &WORKER_ENABLED,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_bool_guc(
-        c"spiral.worker_debug",
-        c"Enable debug logging for the autonomous background worker",
-        c"When true, the background worker will emit debug2 logs.",
-        &WORKER_DEBUG,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_int_guc(
-        c"spiral.max_workers",
-        c"Maximum number of parallel background workers",
-        c"Caps the number of workers that can refresh materialized views concurrently.",
-        &WORKER_MAX,
-        1,
-        100,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_int_guc(
-        c"spiral.worker_batch_size",
-        c"Max scopes refreshed per worker tick",
-        c"Each worker processes at most this many (base_view, scope) pairs per 1-second tick.",
-        &WORKER_BATCH_SIZE,
-        1,
-        1000,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
 
     GucRegistry::define_bool_guc(
         c"spiral.enable_planner_hook",
@@ -175,37 +126,6 @@ fn spiral_is_loaded() -> bool {
     true
 }
 
-/// Pauses Spiral background workers for the current database until resumed or the session ends.
-/// This is particularly useful for test isolation or when performing manual DDL/maintenance.
-#[pg_extern]
-fn spiral_stop_bg_workers() {
-    let db_oid = unsafe { pgrx::pg_sys::MyDatabaseId };
-    if let Err(e) = pgrx::Spi::run(&format!("SELECT pg_advisory_lock({}, 0)", db_oid.to_u32())) {
-        pgrx::warning!("Failed to acquire worker pause lock: {:?}", e);
-    } else {
-        pgrx::info!(
-            "Spiral background workers paused for database OID {}",
-            db_oid.to_u32()
-        );
-    }
-}
-
-/// Resumes Spiral background workers for the current database.
-#[pg_extern]
-fn spiral_start_bg_workers() {
-    let db_oid = unsafe { pgrx::pg_sys::MyDatabaseId };
-    if let Err(e) = pgrx::Spi::run(&format!(
-        "SELECT pg_advisory_unlock({}, 0)",
-        db_oid.to_u32()
-    )) {
-        pgrx::warning!("Failed to release worker pause lock: {:?}", e);
-    } else {
-        pgrx::info!(
-            "Spiral background workers resumed for database OID {}",
-            db_oid.to_u32()
-        );
-    }
-}
 
 pub const POSTGRES_EPOCH_JDATE: i64 = 946684800; // seconds between 1970-01-01 and 2000-01-01
 

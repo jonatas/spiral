@@ -17,7 +17,7 @@ INSERT INTO ohlcv_source (t, price) VALUES
 -- Trigger rollup creation
 SELECT spiral_register_view_rust('ohlcv_1h', 'ohlcv_source', 3600, 'ohlcv_source', ARRAY[]::text[]);
 
--- Manually populate the rollup (simulating bgworker)
+-- Manually populate the rollup (simulating vacuum)
 -- Note: Column name is now just 'price', same as base
 INSERT INTO ohlcv_1h (t, price)
 SELECT 
