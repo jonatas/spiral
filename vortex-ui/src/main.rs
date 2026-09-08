@@ -180,7 +180,14 @@ fn format_epoch_seconds(epoch: i64) -> String {
     if epoch <= 0 {
         return "—".to_string();
     }
-    let date = js_sys::Date::new(&JsValue::from_f64(epoch as f64 * 1000.0));
+    format_epoch_seconds_f64(epoch as f64)
+}
+
+fn format_epoch_seconds_f64(epoch: f64) -> String {
+    if epoch <= 0.0 {
+        return "—".to_string();
+    }
+    let date = js_sys::Date::new(&JsValue::from_f64(epoch * 1000.0));
     let iso = date.to_iso_string().as_string().unwrap_or_default();
     iso.trim_end_matches('Z')
         .trim_end_matches(".000")
@@ -406,8 +413,8 @@ struct BlockInfo {
     t_range: [i64; 2],
     tenant_range: [i32; 2],
     is_boundary: bool,
-    t_actual_start: i64,
-    t_actual_end: i64,
+    t_actual_start: f64,
+    t_actual_end: f64,
     #[serde(default)]
     kickoff_epoch: i64,
     #[serde(default)]
@@ -629,25 +636,25 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
     } else {
         kickoff
     };
-    let start_t = if block.t_actual_start > 0 {
+    let start_t = if block.t_actual_start > 0.0 {
         block.t_actual_start
     } else {
-        kb + block.t_range[0]
+        (kickoff + block.t_range[0]) as f64
     };
-    let end_t = if block.t_actual_end > 0 {
+    let end_t = if block.t_actual_end > 0.0 {
         block.t_actual_end
     } else {
-        kb + block.t_range[1]
+        (kickoff + block.t_range[1]) as f64
     };
     let duration_sec = (end_t - start_t).abs();
-    let duration_fmt = if duration_sec < 60 {
-        format!("{}s", duration_sec)
-    } else if duration_sec < 3600 {
-        format!("{:.1}m", duration_sec as f64 / 60.0)
-    } else if duration_sec < 86400 {
-        format!("{:.1}h", duration_sec as f64 / 3600.0)
+    let duration_fmt = if duration_sec < 60.0 {
+        format!("{:.1}s", duration_sec)
+    } else if duration_sec < 3600.0 {
+        format!("{:.1}m", duration_sec / 60.0)
+    } else if duration_sec < 86400.0 {
+        format!("{:.1}h", duration_sec / 3600.0)
     } else {
-        format!("{:.1}d", duration_sec as f64 / 86400.0)
+        format!("{:.1}d", duration_sec / 86400.0)
     };
 
     let align_class = if block.alignment_pct > 99.0 {
@@ -752,22 +759,22 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
             </div>
             <div class="irow-full">
                 <span class="ilabel">"start"</span>
-                <div class="ivalue ivalue-ts">{format_epoch_seconds(start_t)}</div>
+                <div class="ivalue ivalue-ts">{format_epoch_seconds_f64(start_t)}</div>
             </div>
             <div class="irow-full">
                 <span class="ilabel">"end"</span>
-                <div class="ivalue ivalue-ts">{format_epoch_seconds(end_t)}</div>
+                <div class="ivalue ivalue-ts">{format_epoch_seconds_f64(end_t)}</div>
             </div>
 
             // Raw SpiralPageOpaque section (#61)
             {(block.opaque_window_start_t != 0 || block.opaque_window_end_t != 0 || block.magic_valid).then(|| {
                 let computed_start = start_t;
                 let computed_end = end_t;
-                let actual_start = block.opaque_window_start_t;
-                let actual_end = block.opaque_window_end_t;
+                let actual_start = block.opaque_window_start_t as f64;
+                let actual_end = block.opaque_window_end_t as f64;
                 let start_drift = (actual_start - computed_start).abs();
                 let end_drift = (actual_end - computed_end).abs();
-                let has_drift = start_drift > 1 || end_drift > 1;
+                let has_drift = start_drift > 1.0 || end_drift > 1.0;
                 let scale_mismatch = block.opaque_tenant_scale > 0
                     && block.opaque_tenant_scale != block.tenant_range[1] - block.tenant_range[0] + 1;
 
@@ -790,16 +797,16 @@ fn BlockInspector(block: BlockInfo, kickoff: i64) -> impl IntoView {
                         </div>
                         <div class="irow-full">
                             <span class="ilabel">"stored start"</span>
-                            <div class={if start_drift > 1 { "ivalue ivalue-ts ivalue-drift" } else { "ivalue ivalue-ts" }}>
-                                {format_epoch_seconds(actual_start)}
-                                {(start_drift > 1).then(|| format!(" (Δ{}s)", start_drift))}
+                            <div class={if start_drift > 1.0 { "ivalue ivalue-ts ivalue-drift" } else { "ivalue ivalue-ts" }}>
+                                {format_epoch_seconds_f64(actual_start)}
+                                {(start_drift > 1.0).then(|| format!(" (Δ{:.1}s)", start_drift))}
                             </div>
                         </div>
                         <div class="irow-full">
                             <span class="ilabel">"stored end"</span>
-                            <div class={if end_drift > 1 { "ivalue ivalue-ts ivalue-drift" } else { "ivalue ivalue-ts" }}>
-                                {format_epoch_seconds(actual_end)}
-                                {(end_drift > 1).then(|| format!(" (Δ{}s)", end_drift))}
+                            <div class={if end_drift > 1.0 { "ivalue ivalue-ts ivalue-drift" } else { "ivalue ivalue-ts" }}>
+                                {format_epoch_seconds_f64(actual_end)}
+                                {(end_drift > 1.0).then(|| format!(" (Δ{:.1}s)", end_drift))}
                             </div>
                         </div>
                         {scale_mismatch.then(|| view! {
@@ -3042,8 +3049,8 @@ fn App() -> impl IntoView {
             if b.kickoff_epoch > 0 && b.kickoff_epoch != PG_EPOCH {
                 return b.kickoff_epoch;
             }
-            if b.t_actual_start > 0 {
-                let inferred = b.t_actual_start - b.t_range[0];
+            if b.t_actual_start > 0.0 {
+                let inferred = b.t_actual_start as i64 - b.t_range[0];
                 if inferred > 0 {
                     return inferred;
                 }
@@ -3104,15 +3111,15 @@ fn App() -> impl IntoView {
             k
         };
 
-        let (t_start, t_end) = if b.t_actual_start > 0 {
-            (b.t_actual_start as f64, (b.t_actual_end + 120) as f64)
+        let (t_start, t_end) = if b.t_actual_start > 0.0 {
+            (b.t_actual_start, b.t_actual_end + 120.0)
         } else {
             ((kb + b.t_range[0]) as f64, (kb + b.t_range[1] + 120) as f64)
         };
 
         let new_query = format!(
             "SELECT * FROM {} WHERE t >= to_timestamp({}) AND t < to_timestamp({})",
-            view_name, t_start as i64, t_end as i64
+            view_name, t_start, t_end
         );
         let block_changed = explain_last_block.get_untracked().as_ref() != Some(&b);
         explain_last_block.set(Some(b));
@@ -3349,13 +3356,13 @@ fn App() -> impl IntoView {
 
                             if let Some(b) = selected_block.get() {
                                 let kb = if b.kickoff_epoch > 0 { b.kickoff_epoch } else { k };
-                                let start_t = if b.t_actual_start > 0 { b.t_actual_start } else { kb + b.t_range[0] };
-                                let end_t = if b.t_actual_end > 0 { b.t_actual_end } else { kb + b.t_range[1] };
-                                let span = (end_t - start_t).abs() as i32;
-                                if start_t > 0 || end_t > 0 {
+                                let start_t = if b.t_actual_start > 0.0 { b.t_actual_start } else { (kb + b.t_range[0]) as f64 };
+                                let end_t = if b.t_actual_end > 0.0 { b.t_actual_end } else { (kb + b.t_range[1]) as f64 };
+                                let span = (end_t - start_t).abs();
+                                if start_t > 0.0 || end_t > 0.0 {
                                     view! {
                                         <span class="page-meta" style="margin-left:auto; color:var(--blue); font-weight:700;">
-                                            {format!("{} → {} ({})", format_epoch_seconds(start_t), format_epoch_seconds(end_t), format_timespan(span))}
+                                            {format!("{} → {} ({})", format_epoch_seconds_f64(start_t), format_epoch_seconds_f64(end_t), format_timespan(span as i32))}
                                         </span>
                                     }.into_any()
                                 } else {

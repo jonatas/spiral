@@ -254,10 +254,10 @@ pub fn derive_child_sql(
         } else {
             (
                 format!(
-                    "to_timestamp(((spiral(\"{0}\") / {1}) * {1})::double precision) as t",
+                    "to_timestamp(FLOOR(spiral(\"{0}\")::double precision / {1}) * {1}) as t",
                     anchor_col, frame_seconds
                 ),
-                format!("(spiral(\"{}\") / {1}) * {1}", anchor_col, frame_seconds),
+                format!("FLOOR(spiral(\"{0}\")::double precision / {1}) * {1}", anchor_col, frame_seconds),
             )
         };
         let mut select_cols = vec![time_select];

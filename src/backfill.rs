@@ -80,7 +80,12 @@ pub fn spiral_bulk_backfill_stats(
     rows_out
 }
 
-fn build_scan_sql(base_view: &str, frame_seconds: i64, scope_cols: &[String], value_col: &str) -> String {
+fn build_scan_sql(
+    base_view: &str,
+    frame_seconds: i64,
+    scope_cols: &[String],
+    value_col: &str,
+) -> String {
     let scope_select = scope_cols
         .iter()
         .map(|c| format!("\"{}\"::text", c.replace('"', "\"\"")))
@@ -121,7 +126,11 @@ fn write_groups(
     let col_list = if scope_cols.is_empty() {
         format!("bucket, \"{}\"", stats_col.replace('"', "\"\""))
     } else {
-        format!("{}, bucket, \"{}\"", scope_cols_quoted, stats_col.replace('"', "\"\""))
+        format!(
+            "{}, bucket, \"{}\"",
+            scope_cols_quoted,
+            stats_col.replace('"', "\"\"")
+        )
     };
 
     let values_sql: Vec<String> = acc

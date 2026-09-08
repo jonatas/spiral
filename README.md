@@ -287,10 +287,10 @@ In multi-table queries, Spiral performs a recursive walk of the **JoinTree**. If
 
 ## 📖 Quick Start
 
-The fastest way to learn Spiral is through the [Short Walkthrough](examples/short_walkthrough.sql).
+The fastest way to learn Spiral is through the [Short Walkthrough](examples/walkthrough.sql).
 
 ```bash
-cargo pgrx run pg18 < examples/short_walkthrough.sql
+cargo pgrx run pg18 < examples/walkthrough.sql
 ```
 
 ### Basic Usage

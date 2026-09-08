@@ -1648,7 +1648,7 @@ fn resolve_segments_from_sorted(
                 // offset drops the boundary bucket whose key falls outside the
                 // shifted window; local-time grouping correctness is handled by
                 // capping the tier granularity, not by moving bucket edges.
-                let bucket_start = (curr / f_s) * f_s;
+                let bucket_start = curr.div_euclid(f_s) * f_s;
                 let bucket_end = bucket_start + f_s;
                 if curr == bucket_start && bucket_end <= clean_e {
                     segments.push(Segment {
@@ -1672,7 +1672,7 @@ fn resolve_segments_from_sorted(
                     });
                     break;
                 }
-                let next_boundary = ((curr + f_s) / f_s) * f_s;
+                let next_boundary = (curr.div_euclid(f_s) + 1) * f_s;
                 let segment_end = clean_e.min(next_boundary);
                 segments.push(Segment {
                     source: base_table.to_string(),
@@ -3195,19 +3195,24 @@ pub fn map_agg_inner(agg_fn: &str, mapped_col: &str, is_rollup: bool, formula: &
         return format!("\"{}\"", mapped_col);
     }
     match (agg_lower.as_str(), formula) {
-        ("sum", "ohlcv") => format!("(\"{}\"->>'v')::float8", mapped_col),
-        ("max", "ohlcv") => format!("(\"{}\"->>'h')::float8", mapped_col),
-        ("min", "ohlcv") => format!("(\"{}\"->>'l')::float8", mapped_col),
-        ("first", "ohlcv") => format!("(\"{}\"->>'o')::float8", mapped_col),
-        ("last", "ohlcv") => format!("(\"{}\"->>'c')::float8", mapped_col),
-        ("count", "stats") | ("sum", "stats") | ("avg", "stats") | ("spiral_stats", "stats") => {
+        ("sum", "ohlcv")
+        | ("max", "ohlcv")
+        | ("min", "ohlcv")
+        | ("first", "ohlcv")
+        | ("last", "ohlcv") => {
+            format!("\"{}\"", mapped_col)
+        }
+        ("count", "stats")
+        | ("sum", "stats")
+        | ("avg", "stats")
+        | ("min", "stats")
+        | ("max", "stats")
+        | ("spiral_stats", "stats") => {
             format!("\"{}\"", mapped_col)
         }
         ("count", "count") if is_rollup => {
             format!("spiral_stats_from_count(\"{}\"::float8)", mapped_col)
         }
-        ("min", "stats") => format!("(\"{}\"->>'min')::numeric", mapped_col),
-        ("max", "stats") => format!("(\"{}\"->>'max')::numeric", mapped_col),
         _ => format!("\"{}\"", mapped_col),
     }
 }
@@ -3333,31 +3338,32 @@ fn construct_union_sql_hierarchical(
                 } else {
                     map_agg_inner(agg_fn, &mapped, is_rollup, &formula_for_col)
                 };
-                let is_json_target =
-                    matches!(
-                        agg_fn.to_lowercase().as_str(),
-                        "spiral_stats"
-                            | "spiral_tdigest"
-                            | "spiral_sketch"
-                            | "spiral_ohlcv"
-                            | "spiral_stats_merge"
-                            | "spiral_tdigest_merge"
-                            | "spiral_sketch_merge"
-                            | "spiral_ohlcv_merge"
-                    ) || (matches!(agg_fn.to_lowercase().as_str(), "sum" | "count" | "avg")
-                        && if is_rollup {
-                            formula_for_col == "stats"
-                                || formula_for_col == "ohlcv"
-                                || formula_for_col == "count"
-                        } else {
-                            // jsonb only when map_agg_inner wraps an
-                            // accumulator; plain-formula columns stay native.
-                            col == "*"
-                                || matches!(
-                                    formula_for_col.as_str(),
-                                    "stats" | "ohlcv" | "tdigest" | "sketch"
-                                )
-                        });
+                let is_json_target = matches!(
+                    agg_fn.to_lowercase().as_str(),
+                    "spiral_stats"
+                        | "spiral_tdigest"
+                        | "spiral_sketch"
+                        | "spiral_ohlcv"
+                        | "spiral_stats_merge"
+                        | "spiral_tdigest_merge"
+                        | "spiral_sketch_merge"
+                        | "spiral_ohlcv_merge"
+                ) || (matches!(
+                    agg_fn.to_lowercase().as_str(),
+                    "sum" | "count" | "avg" | "min" | "max" | "first" | "last"
+                ) && if is_rollup {
+                    formula_for_col == "stats"
+                        || formula_for_col == "ohlcv"
+                        || formula_for_col == "count"
+                } else {
+                    // jsonb only when map_agg_inner wraps an
+                    // accumulator; plain-formula columns stay native.
+                    col == "*"
+                        || matches!(
+                            formula_for_col.as_str(),
+                            "stats" | "ohlcv" | "tdigest" | "sketch"
+                        )
+                });
                 inner_select.push(if !orig_type.is_empty() && !is_json_target {
                     format!("({})::{} AS \"{}\"", col_expr, orig_type, col)
                 } else {

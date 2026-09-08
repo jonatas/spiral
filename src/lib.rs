@@ -876,10 +876,7 @@ pub mod pg_test {
     pub fn setup(_options: Vec<&str>) {}
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec![
-            "shared_preload_libraries = 'spiral'",
-            "wal_level = logical"
-        ]
+        vec!["shared_preload_libraries = 'spiral'", "wal_level = logical"]
     }
 }
 
@@ -2627,10 +2624,8 @@ mod tests {
              FROM generate_series(0, 199) i",
         )
         .unwrap();
-        Spi::run(
-            "CREATE TABLE bulk_ticks_1h (tenant_id int4, bucket bigint, val_stats bytea)",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE bulk_ticks_1h (tenant_id int4, bucket bigint, val_stats bytea)")
+            .unwrap();
 
         let rows_out: i64 = Spi::get_one(
             "SELECT spiral_bulk_backfill_stats('bulk_ticks', 'bulk_ticks_1h', 3600,
@@ -2643,7 +2638,10 @@ mod tests {
         let out_rows: i64 = Spi::get_one("SELECT COUNT(*)::bigint FROM bulk_ticks_1h")
             .unwrap()
             .unwrap_or(-1);
-        assert_eq!(out_rows, rows_out, "row count returned must match rows written");
+        assert_eq!(
+            out_rows, rows_out,
+            "row count returned must match rows written"
+        );
 
         // Compare one (tenant, bucket) group's mean against a plain raw aggregate.
         let (raw_mean, raw_n): (Option<f64>, Option<i64>) = Spi::get_two(
@@ -2658,7 +2656,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(raw_n.unwrap_or(0) > 0, "sanity: raw comparison group must be non-empty");
+        assert!(
+            raw_n.unwrap_or(0) > 0,
+            "sanity: raw comparison group must be non-empty"
+        );
         assert!(
             (backfill_mean.unwrap() - raw_mean.unwrap()).abs() < 1e-9,
             "backfill mean {:?} must match raw aggregate mean {:?}",

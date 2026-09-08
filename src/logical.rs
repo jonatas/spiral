@@ -1,6 +1,7 @@
 use pgrx::prelude::*;
 
 #[pg_extern]
+#[allow(clippy::type_complexity)]
 pub fn spiral_consume_changelog() -> TableIterator<
     'static,
     (
@@ -100,7 +101,7 @@ mod tests {
         // spiral.changelog is typically created by extension scripts, but for test:
         let _ = Spi::run(
             "INSERT INTO spiral.changelog (event_id, base_view, scope_values, t_start, t_end)
-             VALUES (1234567, 'test_view', '{\"test\": 123}', 100, 200);"
+             VALUES (1234567, 'test_view', '{\"test\": 123}', 100, 200);",
         );
 
         // Call our logical decoding function
@@ -119,11 +120,11 @@ mod tests {
             }
             Ok::<(), spi::Error>(())
         }).unwrap();
-        
+
         // Note: In `cargo pgrx test`, the entire test runs inside a single transaction that is eventually rolled back.
-        // `pg_logical_slot_get_changes` only returns rows for *committed* transactions. 
+        // `pg_logical_slot_get_changes` only returns rows for *committed* transactions.
         // Therefore, it will never see the INSERT we just made in the same transaction.
-        // This test serves as a smoke-test to ensure the function executes without errors 
+        // This test serves as a smoke-test to ensure the function executes without errors
         // and successfully manages the logical replication slot.
     }
 }
