@@ -397,6 +397,33 @@ pub fn unify_changelog(base_view: &str) {
     Spi::run("DROP TABLE temp_unified").unwrap();
 }
 
+/// Groups dirty changelog scopes sharing an identical (t_start, t_end) range
+/// into batches capped at `max_scopes_per_batch`, so a single wide bulk-load
+/// range touching thousands of scopes doesn't produce either a giant
+/// `scope_values IN (...)` clause or a one-scope-at-a-time refresh loop.
+/// Call after `unify_changelog` so ranges are already merged per scope.
+pub fn coalesce_changelog_batches(base_view: &str, max_scopes_per_batch: i64) -> Vec<Vec<String>> {
+    let safe_bv = base_view.replace('\'', "''");
+    Spi::connect(|client| {
+        let sql = format!(
+            "SELECT array_agg(scope_values::text) FROM (
+                SELECT scope_values,
+                       (row_number() OVER (PARTITION BY t_start, t_end ORDER BY scope_values) - 1)
+                         / {} AS batch_id
+                FROM spiral.changelog WHERE base_view = '{}'
+             ) s GROUP BY t_start, t_end, batch_id",
+            max_scopes_per_batch, safe_bv
+        );
+        Ok::<Vec<Vec<String>>, spi::Error>(
+            client
+                .select(&sql, None, &[])?
+                .map(|r| r.get::<Vec<String>>(1).unwrap().unwrap_or_default())
+                .collect(),
+        )
+    })
+    .unwrap_or_default()
+}
+
 pub fn get_dirty_ranges(
     base_view: &str,
     ts: i64,
