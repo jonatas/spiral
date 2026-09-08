@@ -17,6 +17,7 @@ use std::cell::Cell;
 pub mod bgworker;
 pub mod catalog;
 pub mod hooks;
+pub mod logical;
 pub mod mvcc;
 pub mod rollup;
 pub mod stats;
@@ -874,7 +875,10 @@ pub mod pg_test {
     pub fn setup(_options: Vec<&str>) {}
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec!["shared_preload_libraries = 'spiral'"]
+        vec![
+            "shared_preload_libraries = 'spiral'",
+            "wal_level = logical"
+        ]
     }
 }
 
