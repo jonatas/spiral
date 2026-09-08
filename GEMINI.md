@@ -24,3 +24,14 @@ Always verify the following when making changes:
 ## Workflow
 - **Precision First**: Use `epsilon` (typically `1e-9`) for all floating-point assertions.
 - **Regression Testing**: NEVER commit a change to statistical logic without a corresponding golden test.
+
+## Architectural Constraints
+- **Event Streaming (No pg_notify)**: NEVER use `pg_notify` for high-throughput tracking (e.g., changelogs). It causes exclusive SLRU locks on the global queue, degrading performance at scale. Always use **Logical Decoding** (via `pg_logical_slot_get_changes` or similar plugins) managed natively within the `pgrx` extension.
+
+## pgrx Testing Caveats
+- **Transaction Wrappers**: `cargo pgrx test` executes each `#[pg_test]` inside a single transaction that is eventually rolled back. 
+- **Logical Decoding Tests**: Because logical decoding only reads *committed* WAL changes, `pg_logical_slot_get_changes()` will not see `INSERT`s performed within the same `#[pg_test]`. Tests involving decoding should serve as smoke-tests (e.g., verifying slot creation and query execution) unless using separate connections.
+
+## AI Assistant Guidelines
+- **Autonomy**: Do not ask for permission to run terminal commands (like `cargo`, `ps`, `ls`) or to edit files. Execute tasks directly and proactively.
+- **File Editing**: NEVER use `cat << EOF` or bash redirection to create or modify files. ALWAYS use the specialized `write_to_file` and `replace_file_content` tools to avoid terminal hangs.

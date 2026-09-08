@@ -10,7 +10,7 @@ use axum::{
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::{PgListener, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, FromRow, Pool, Postgres, Row};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -417,101 +417,40 @@ async fn main() {
     // Real-time changelog notifications via pg_notify (#63)
     let notify_state = Arc::clone(&state);
     tokio::spawn(async move {
-        // Create the trigger function and trigger so INSERTs notify us immediately
-        let create_function = sqlx::query(
-            "CREATE OR REPLACE FUNCTION spiral.spiral_changelog_notify()
-             RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN
-               PERFORM pg_notify('spiral_changelog', json_build_object(
-                 'event_id',    NEW.event_id,
-                 'base_view',   NEW.base_view,
-                 'scope_values', NEW.scope_values,
-                 't_start',     NEW.t_start,
-                 't_end',       NEW.t_end
-               )::text);
-               RETURN NEW;
-             END;
-             $$;",
-        )
-        .execute(&notify_state.pool)
-        .await;
+        // Drop the legacy trigger if it still exists
+        let _ = sqlx::query("DROP TRIGGER IF EXISTS changelog_notify_trigger ON spiral.changelog")
+            .execute(&notify_state.pool)
+            .await;
+        let _ = sqlx::query("DROP FUNCTION IF EXISTS spiral.spiral_changelog_notify()")
+            .execute(&notify_state.pool)
+            .await;
 
-        if let Err(e) = create_function {
-            tracing::warn!(
-                "pg_notify trigger function setup failed (falling back to polling): {}",
-                e
-            );
-            return;
-        }
-
-        if let Err(e) =
-            sqlx::query("DROP TRIGGER IF EXISTS changelog_notify_trigger ON spiral.changelog")
-                .execute(&notify_state.pool)
-                .await
-        {
-            tracing::warn!(
-                "pg_notify trigger cleanup failed (falling back to polling): {}",
-                e
-            );
-            return;
-        }
-
-        if let Err(e) = sqlx::query(
-            "CREATE TRIGGER changelog_notify_trigger
-             AFTER INSERT ON spiral.changelog
-             FOR EACH ROW EXECUTE FUNCTION spiral.spiral_changelog_notify()",
-        )
-        .execute(&notify_state.pool)
-        .await
-        {
-            tracing::warn!(
-                "pg_notify trigger setup failed (falling back to polling): {}",
-                e
-            );
-            return;
-        }
-
-        tracing::info!("pg_notify trigger installed on spiral.changelog");
-
-        let mut listener = match PgListener::connect_with(&notify_state.pool).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!("PgListener connect failed: {}", e);
-                return;
-            }
-        };
-
-        if let Err(e) = listener.listen("spiral_changelog").await {
-            tracing::warn!("PgListener listen failed: {}", e);
-            return;
-        }
-        tracing::info!("PgListener ready on spiral_changelog channel");
+        tracing::info!("Real-time changelog consumer ready (polling via logical decoding extension)");
 
         loop {
-            match listener.recv().await {
-                Ok(notification) => {
-                    match serde_json::from_str::<ChangelogEntry>(notification.payload()) {
-                        Ok(entry) => {
-                            if let Ok(mut buf) = notify_state.recent_changelog.lock() {
-                                if !buf.iter().any(|e| e.event_id == entry.event_id) {
-                                    buf.push_front(entry.clone());
-                                    buf.truncate(500);
-                                }
+            match sqlx::query_as::<_, ChangelogEntry>(
+                "SELECT event_id, base_view, scope_values, t_start, t_end FROM spiral.spiral_consume_changelog()"
+            )
+            .fetch_all(&notify_state.pool)
+            .await
+            {
+                Ok(entries) => {
+                    for entry in entries {
+                        if let Ok(mut buf) = notify_state.recent_changelog.lock() {
+                            if !buf.iter().any(|e| e.event_id == entry.event_id) {
+                                buf.push_front(entry.clone());
+                                buf.truncate(500);
                             }
-                            let _ = notify_state.tx.send(VortexEvent::ChangelogUpdate(entry));
                         }
-                        Err(e) => tracing::warn!("pg_notify parse error: {}", e),
+                        let _ = notify_state.tx.send(VortexEvent::ChangelogUpdate(entry));
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("PgListener recv error: {} — reconnecting", e);
+                    tracing::warn!("Logical decoding fetch error: {} — reconnecting", e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    if let Err(e) = listener.listen("spiral_changelog").await {
-                        tracing::warn!("PgListener re-listen failed: {}", e);
-                        break;
-                    }
                 }
             }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     });
 
