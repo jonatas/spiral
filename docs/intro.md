@@ -589,14 +589,14 @@ Standard materialized views require a full rebuild. Spiral explores **Incrementa
 graph LR
     A[INSERT/UPDATE] --> B[Trigger]
     B --> C[(spiral.changelog)]
-    C --> D[Background Worker]
+    C --> D[Autovacuum]
     D --> E[Surgical Patch]
 {% endmermaid %}
 
-A background worker written in Rust monitors this log and performs surgical updates—healing the "orbits" of the spiral without rebuilding the world.
+The custom table access method hooks into PostgreSQL's native Autovacuum to monitor this log and perform surgical updates—healing the "orbits" of the spiral without rebuilding the world.
 
 ```rust
-// In src/worker.rs - The Healing Loop
+// In src/tam.rs - The Healing Loop inside spiral_relation_vacuum
 pub fn perform_healing() -> Result<(), pgrx::spi::Error> {
     let dirty_buckets = Spi::connect(|client| {
         client.select(
@@ -625,7 +625,7 @@ pub fn perform_healing() -> Result<(), pgrx::spi::Error> {
 
 One of the most complex parts of this research was exploring the **PostgreSQL Planner Hook**. The idea is to query the raw table and have the system automatically "slice" the query between different storage tiers based on data freshness and availability.
 
-Select a time range on the timeline below, showing the last 3 days from past to present. Watch how Spiral would theoretically "slice" your query across storage tiers: **Daily**, **Hourly**, and **Minutely** rollups, with an automatic fallback to **Raw Data** for segments marked as "dirty" in the changelog. You can also simulate real-time traffic and see the background worker 'healing' the orbits.
+Select a time range on the timeline below, showing the last 3 days from past to present. Watch how Spiral would theoretically "slice" your query across storage tiers: **Daily**, **Hourly**, and **Minutely** rollups, with an automatic fallback to **Raw Data** for segments marked as "dirty" in the changelog. You can also simulate real-time traffic and see the autovacuum 'healing' the orbits.
 
 <div id="query-slicer-root" class="interactive-widget" style="margin: 2rem 0; background: #0f172a; padding: 2rem; border-radius: 12px; border: 1px solid #1e293b; min-height: 500px;">
   <div style="margin-bottom: 2rem;">
@@ -643,7 +643,7 @@ Select a time range on the timeline below, showing the last 3 days from past to 
 
   <div style="display: flex; gap: 10px; margin-bottom: 2rem; flex-wrap: wrap;">
     <button id="btn-realtime" style="background: #1e293b; color: #fff; border: 1px solid #334155; padding: 5px 12px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; font-family: monospace;">+ INCOMING DATA</button>
-    <button id="btn-backfill" style="background: #1e293b; color: #fff; border: 1px solid #334155; padding: 5px 12px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; font-family: monospace;">⚡ RUN WORKER (BACKFILL)</button>
+    <button id="btn-backfill" style="background: #1e293b; color: #fff; border: 1px solid #334155; padding: 5px 12px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; font-family: monospace;">⚡ RUN AUTOVACUUM (BACKFILL)</button>
     <div id="sim-status" style="font-size: 0.6rem; color: #64748b; align-self: center; font-family: monospace;">STATUS: IDLE</div>
   </div>
 
@@ -877,7 +877,7 @@ Select a time range on the timeline below, showing the last 3 days from past to 
 
     btnBackfill.addEventListener('click', () => {
       if (dirtyRanges.length === 0) return;
-      simStatus.textContent = 'STATUS: WORKER PROCESSING...';
+      simStatus.textContent = 'STATUS: AUTOVACUUM PROCESSING...';
       
       const interval = setInterval(() => {
         let changed = false;

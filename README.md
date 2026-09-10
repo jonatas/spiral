@@ -28,7 +28,7 @@ CREATE TABLE sensor_readings (
 - **Intelligent Naming & Aliasing**: 
     - Single-formula columns keep their original name.
     - Use `as alias` in comments for custom column names.
-- **Background Worker**: A built-in worker periodically refreshes root views, ensuring your rollups stay up-to-date automatically.
+- **Autovacuum Integration**: Natively hooks into PostgreSQL's autovacuum to periodically refresh root views, ensuring your rollups stay up-to-date automatically without dedicated background processes.
 
 ---
 
@@ -177,7 +177,7 @@ Spiral tracks "dirty buckets" in a transactional changelog to provide **Incremen
 
   **Mechanism & Example:**
   ```sql
-  -- A manual or worker-triggered refresh on the lowest granularity:
+  -- A manual or vacuum-triggered refresh on the lowest granularity:
   SELECT spiral_refresh('sensor_readings_1m');
   ```
   Internally, the engine tracks which `1m` buckets were recalculated. It then dynamically generates and executes the next tier's refresh by querying the newly generated `1m` data:
@@ -194,7 +194,7 @@ Spiral tracks "dirty buckets" in a transactional changelog to provide **Incremen
   </details>
 - <details><summary><b>Self-Healing Dashboards</b></summary>
   
-  Historical data corrections automatically flag those specific buckets/tenants for re-aggregation in the next refresh cycle. When a downstream application sends a late-arriving correction, the background worker automatically identifies the affected historical interval and re-aggregates just that segment, ensuring dashboards reflect accurate data seamlessly on their next reload.
+  Historical data corrections automatically flag those specific buckets/tenants for re-aggregation in the next refresh cycle. When a downstream application sends a late-arriving correction, autovacuum automatically identifies the affected historical interval and re-aggregates just that segment, ensuring dashboards reflect accurate data seamlessly on their next reload.
 
   **Mechanism & Example:**
   Imagine an anomaly detected from last month:
@@ -204,10 +204,9 @@ Spiral tracks "dirty buckets" in a transactional changelog to provide **Incremen
   SET voltage = 220.0 
   WHERE sensor_id = 42 AND t = '2026-03-01 12:00:00';
   ```
-  The update trigger fires and logs the `2026-03-01 12:00:00` bucket to the changelog. The background worker picks this up:
+  The update trigger fires and logs the `2026-03-01 12:00:00` bucket to the changelog. The autovacuum daemon picks this up:
   ```text
-  LOG: spiral_worker: found 1 dirty segments for sensor_readings
-  LOG: spiral_worker: refreshing sensor_readings_1m (interval: 2026-03-01 12:00:00 to 2026-03-01 12:01:00)
+  LOG: spiral: VACUUM refreshing 1 scopes for 'sensor_readings'
   ```
   The next time the dashboard queries `sensor_readings_1d`, the planner incorporates the healed data without any manual view rebuilds.
   </details>
@@ -312,8 +311,8 @@ CREATE TABLE ticks (
     spiral.tenant = 'symbol_id'
 );
 
--- The autonomous background worker automatically detects new inserts and
--- refreshes 'ticks_1m' in the background!
+-- Autovacuum automatically detects new inserts and
+-- refreshes 'ticks_1m' in the background during maintenance!
 --
 -- You can still trigger manual refreshes if desired:
 -- SELECT spiral_refresh('ticks');
@@ -344,30 +343,14 @@ shared_preload_libraries = 'spiral'
 
 ### Configuration (GUCs)
 
-Spiral provides several standard PostgreSQL custom variables (GUCs) to tune the background worker and the query planner. These can be set in `postgresql.conf` or dynamically via `ALTER SYSTEM` (or `SET` for session-local overrides where applicable).
+Spiral provides several standard PostgreSQL custom variables (GUCs) to tune the query planner. These can be set in `postgresql.conf` or dynamically via `ALTER SYSTEM` (or `SET` for session-local overrides where applicable).
 
-#### Background Worker Settings
+#### Autovacuum Integration
 
-Spiral's background worker is fully autonomous. It automatically starts for any database where a table is created using `WITH (spiral.frames = ...)`. No manual database name configuration is required. The worker polls `spiral.changelog` every 1 second and seamlessly triggers cascading incremental view maintenance across all registered hierarchies.
+Spiral utilizes PostgreSQL's native Autovacuum daemon for Incremental View Maintenance (IVM). When autovacuum runs on a table using the `spiral` TAM, it automatically detects any modified time ranges in `spiral.changelog` and seamlessly triggers cascading incremental view maintenance across all registered hierarchies.
 
-- **`spiral.worker_enabled` (boolean, default `true`)**: Allows you to pause the autonomous worker. This is particularly useful during massive data migrations, schema refactorings, or special maintenance windows where you prefer to delay view refreshes until all transactions are completely finalized.
-- **`spiral.worker_debug` (boolean, default `false`)**: By default, the worker logs standard `INFO` messages to the PostgreSQL log when refreshing views. Setting this to `true` switches the output to `DEBUG2` level, silencing the standard logs unless your `log_min_messages` is configured to capture deep debug traces.
-- **`spiral.max_workers` (int, default `1`)**: Caps the number of background workers that can refresh materialized views concurrently. Increase this value (e.g., to 2-4) if you have many active tables or high write throughput, provided you have sufficient CPU cores.
-- **`spiral.worker_batch_size` (int, default `10`)**: The maximum number of `(base_view, scope)` pairs a worker will process per 1-second tick. Increase this if you have many partitioned tenants/scopes receiving updates simultaneously and want the worker to catch up faster.
+To ensure timely dashboard updates, you can tune PostgreSQL's autovacuum thresholds for your Spiral tables (e.g. lowering `autovacuum_vacuum_scale_factor` or `autovacuum_vacuum_threshold`).
 
-##### Testing and Isolation
-
-For testing scenarios or safe manual DDL operations, you can temporarily pause workers for the *current database* using advisory locks, guaranteeing no worker process interferes with your transactions:
-
-```sql
--- Pauses background workers until resumed or the session ends
-SELECT spiral.stop_bg_workers();
-
--- Safe to perform DDLs or isolated testing here
--- ...
-
--- Resumes background workers
-SELECT spiral.start_bg_workers();
 ```
 
 #### Query Planner Settings
@@ -378,15 +361,13 @@ SELECT spiral.start_bg_workers();
 
 **Example Configuration:**
 ```sql
--- Pause the worker globally to perform heavy batch ingestion
-ALTER SYSTEM SET spiral.worker_enabled = false;
-SELECT pg_reload_conf();
+-- Disable autovacuum globally to perform heavy batch ingestion
+ALTER TABLE my_table SET (autovacuum_enabled = false);
 
 -- ... perform massive ingestion ...
 
--- Re-enable the worker and let it catch up autonomously
-ALTER SYSTEM SET spiral.worker_enabled = true;
-SELECT pg_reload_conf();
+-- Re-enable autovacuum and let it catch up autonomously
+ALTER TABLE my_table SET (autovacuum_enabled = true);
 
 -- Temporarily bypass the planner in the current session for debugging
 SET spiral.enable_planner_hook = false;

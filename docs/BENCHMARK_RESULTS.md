@@ -82,5 +82,5 @@ This test evaluated Spiral's new binary state aggregations (`bytea` + `bincode`)
 ### 3. Key Findings
 - **Zero-Copy Aggregations:** Moving transition states from `jsonb` to `bytea` enabled extremely fast state merging. Scanning and merging nearly 8 million state rows now executes in under 800ms.
 - **Spiral > Columnar for Ad-Hoc:** Spiral's pre-aggregated hierarchical rollups are now natively faster than heavily optimized columnar engines like Deltax, even for complex, high-cardinality grouped queries that don't hit the `O(1)` sweet spot.
-- **PostgreSQL Parallelism:** Spiral's scan performance scales near-linearly with PostgreSQL's background workers. (0 workers = 3.7s, 4 workers = 0.86s, 5 workers = 0.77s).
+- **PostgreSQL Parallelism:** Spiral's scan performance scales near-linearly with PostgreSQL's parallel query workers. (0 workers = 3.7s, 4 workers = 0.86s, 5 workers = 0.77s).
 

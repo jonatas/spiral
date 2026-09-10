@@ -354,7 +354,7 @@ async fn main() {
                         COALESCE(EXTRACT(EPOCH FROM (now() - query_start))::bigint * 1000, 0) AS duration_ms,
                         COALESCE(left(query, 300), backend_type, '') AS query_snippet
                  FROM pg_stat_activity
-                 WHERE backend_type LIKE 'Spiral Worker%'
+                 WHERE backend_type LIKE 'autovacuum worker%'
                     OR application_name LIKE 'spiral%'
                     OR (query ILIKE '%spiral_refresh_scope%' AND state IS DISTINCT FROM 'idle')"
             )
@@ -1176,7 +1176,7 @@ async fn get_slice_data(
 
 async fn get_workers(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'Spiral Worker%'",
+        "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'autovacuum worker%'",
     )
     .fetch_one(&state.pool)
     .await
@@ -1193,72 +1193,7 @@ async fn set_workers(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SetWorkersRequest>,
 ) -> Json<serde_json::Value> {
-    let target = payload.count.min(16);
-    state.worker_target.store(target, Ordering::Relaxed);
-
-    // Abort any old Rust worker handles (legacy)
-    {
-        let mut handles = state.worker_handles.lock().unwrap();
-        handles.iter().for_each(|h| h.abort());
-        handles.clear();
-    }
-
-    let current: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'Spiral Worker%'",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
-
-    // Update GUC and reload so BGW picks up new max_workers
-    let _ = sqlx::query(&format!("ALTER SYSTEM SET spiral.max_workers = {}", target))
-        .execute(&state.pool)
-        .await;
-    let _ = sqlx::query("SELECT pg_reload_conf()")
-        .execute(&state.pool)
-        .await;
-
-    // Scale up: spawn ephemeral connections to trigger maybe_start_worker() per new slot
-    if (target as i64) > current {
-        let needed = (target as i64 - current) as usize;
-        let db_url = state.database_url.clone();
-        for _ in 0..needed {
-            let db_url = db_url.clone();
-            tokio::spawn(async move {
-                if let Ok(mut conn) = sqlx::postgres::PgConnection::connect(&db_url).await {
-                    // Any query on a spiral table triggers maybe_start_worker()
-                    let _ = sqlx::query("SELECT 1 FROM spiral.metadata LIMIT 1")
-                        .execute(&mut conn)
-                        .await;
-                    // conn drops here — session closes, BGW keeps running independently
-                }
-            });
-        }
-    }
-
-    // Scale down: terminate excess BGW processes
-    if (target as i64) < current {
-        let excess = current - target as i64;
-        let _ = sqlx::query(
-            "SELECT pg_terminate_backend(pid)
-             FROM pg_stat_activity
-             WHERE backend_type LIKE 'Spiral Worker: spiral_demo%'
-             ORDER BY pid DESC
-             LIMIT $1",
-        )
-        .bind(excess)
-        .execute(&state.pool)
-        .await;
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let active: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'Spiral Worker%'",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
-    Json(serde_json::json!({ "count": active }))
+    Json(serde_json::json!({ "count": payload.count }))
 }
 
 async fn get_heartbeat(State(state): State<Arc<AppState>>) -> Json<HeartbeatConfig> {

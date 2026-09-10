@@ -15,17 +15,17 @@ Spiral tests ideas for transparent hierarchical query acceleration. It is curren
 
 ### Testing and Isolation
 
-For testing scenarios or safe manual DDL operations, the autonomous background worker can be paused using specific isolation functions. These functions utilize database-scoped advisory locks to ensure that no background processes interfere with your transactions.
+For testing scenarios or safe manual DDL operations, you can temporarily disable autovacuum for the specific tables you are modifying to ensure that no background IVM processes interfere with your transactions.
 
 ```sql
--- Pauses background workers until resumed or the session ends
-SELECT spiral.stop_bg_workers();
+-- Pauses autovacuum for the table
+ALTER TABLE my_table SET (autovacuum_enabled = false);
 
 -- Safe to perform DDLs or isolated testing here
 -- ...
 
--- Resumes background workers
-SELECT spiral.start_bg_workers();
+-- Resumes autovacuum for the table
+ALTER TABLE my_table SET (autovacuum_enabled = true);
 ```
 
 ## Consolidated Aggregation States
