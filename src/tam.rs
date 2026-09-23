@@ -1224,9 +1224,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                 } else {
                     &[]
                 };
-                let (t_rel, tid) =
+                let (t_rel, lane_id) =
                     crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
-                let tenant_id = tid as i32;
+                let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
                 let t_abs = decode_t_abs(
                     t_rel,
                     state.kickoff,
@@ -1396,9 +1396,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 } else {
                     &[]
                 };
-                let (t_rel, tid) =
+                let (t_rel, lane_id) =
                     crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
-                let tenant_id = tid as i32;
+                let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
                 let kickoff = crate::get_kickoff_epoch();
                 let t_abs = decode_t_abs(
                     t_rel,

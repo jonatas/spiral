@@ -619,12 +619,13 @@ pub fn remove_table_from_spiral(table_name: &str) {
 }
 
 pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
+    
     let cached = LANE_MAPPING_CACHE.with(|c| c.borrow().get(&(table_oid, tenant_id)).cloned());
     if let Some(lane_id) = cached {
         return lane_id;
     }
 
-    let lane_id = Spi::connect_mut(|mut client| {
+    let lane_id = Spi::connect_mut(|client| {
         let sql = format!("SELECT lane_id FROM spiral.lane_mapping WHERE table_oid = {} AND tenant_id = {}", table_oid, tenant_id);
         let table = client.select(&sql, None, &[])?;
         if !table.is_empty() {
@@ -661,6 +662,7 @@ pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
 }
 
 pub fn get_tenant_id_for_lane(table_oid: u32, lane_id: i32) -> Option<i32> {
+    
     let cached = LANE_REVERSE_CACHE.with(|c| c.borrow().get(&(table_oid, lane_id)).cloned());
     if cached.is_some() {
         return cached;
@@ -675,7 +677,7 @@ pub fn get_tenant_id_for_lane(table_oid: u32, lane_id: i32) -> Option<i32> {
             }
         }
         Ok::<Option<i32>, spi::Error>(None)
-    }).unwrap_or(None);
+    }).unwrap_or_else(|e| { pgrx::notice!("SPI ERROR in get_tenant_id_for_lane: {:?}", e); None });
 
     if let Some(tid) = tenant_id {
         LANE_REVERSE_CACHE.with(|c| c.borrow_mut().insert((table_oid, lane_id), tid));
@@ -708,7 +710,7 @@ pub fn bulk_update_lane_mappings(table_oid: u32, updates: &[(i32, i32)]) {
     LANE_MAPPING_CACHE.with(|c| c.borrow_mut().retain(|&(oid, _), _| oid != table_oid));
     LANE_REVERSE_CACHE.with(|c| c.borrow_mut().retain(|&(oid, _), _| oid != table_oid));
 
-    Spi::connect_mut(|mut client| {
+    Spi::connect_mut(|client| {
         for &(tenant_id, new_lane_id) in updates {
             let _ = client.update(
                 &format!("UPDATE spiral.lane_mapping SET lane_id = {} WHERE table_oid = {} AND tenant_id = {}", 
@@ -723,7 +725,7 @@ pub fn bulk_update_lane_mappings(table_oid: u32, updates: &[(i32, i32)]) {
 
 pub fn replace_timeline_epochs(table_name: &str, new_epoch: TimelineEpoch) {
     let safe_name = table_name.replace('\'', "''");
-    Spi::connect_mut(|mut client| {
+    Spi::connect_mut(|client| {
         let _ = client.update(
             &format!("DELETE FROM spiral.tenants_timeline WHERE table_name = '{}'", safe_name),
             None,
