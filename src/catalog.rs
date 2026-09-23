@@ -62,9 +62,9 @@ pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
 
     let epochs = Spi::connect_mut(|client| {
         let sql = format!(
-            "SELECT start_t, COALESCE(end_t, 9223372036854775807), tenant_scale, base_offset 
-             FROM spiral.tenants_timeline 
-             WHERE table_name = '{}' 
+            "SELECT start_t, COALESCE(end_t, 9223372036854775807), tenant_scale, base_offse
+             FROM spiral.tenants_timeline
+             WHERE table_name = '{}'
              ORDER BY start_t ASC",
             table_name.replace("'", "''")
         );
@@ -129,7 +129,7 @@ pub fn reverse_slot_index(
         return (slot_index / fallback_scale, slot_index % fallback_scale);
     }
 
-    // Since base_offset grows, we can find the epoch by finding the last one where slot_index >= base_offset
+    // Since base_offset grows, we can find the epoch by finding the last one where slot_index >= base_offse
     let mut target_epoch = &epochs[0];
     for epoch in epochs.iter().rev() {
         if slot_index >= epoch.base_offset {
@@ -163,9 +163,9 @@ fn spiral_metadata_table_exists() -> bool {
     }
     let exists = Spi::connect_mut(|client| {
         Ok::<bool, spi::Error>(
-            !client
+            !clien
                 .select(
-                    "SELECT 1 FROM information_schema.tables \
+                    "SELECT 1 FROM information_schema.tables
                  WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1",
                     Some(1),
                     &[],
@@ -242,7 +242,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
         }))
     }).unwrap_or_default();
     METADATA_CACHE.with(|c| c.borrow_mut().insert(view_name.to_string(), result.clone()));
-    result
+    resul
 }
 
 pub fn get_children(view_name: &str) -> Vec<String> {
@@ -298,7 +298,7 @@ pub fn insert_metadata(
         parent_view.replace("'", "''"),
         frame_seconds,
         base_view.replace("'", "''"),
-        scope_cols_json.replace("[", "{").replace("]", "}"), // Simple array format
+        scope_cols_json.replace("[", "{").replace("]", "}"), // Simple array forma
         metadata_json.replace("'", "''")
     );
     let _ = Spi::run(&sql);
@@ -345,8 +345,8 @@ pub fn unify_changelog_scope(base_view: &str, scope_json: &str) {
     let safe_bv = base_view.replace("'", "''");
     let safe_sv = scope_json.replace("'", "''");
     let _ = Spi::run(&format!(
-        "CREATE TEMP TABLE scope_cl_snapshot AS \
-         SELECT ctid AS old_ctid, * FROM spiral.changelog \
+        "CREATE TEMP TABLE scope_cl_snapshot AS
+         SELECT ctid AS old_ctid, * FROM spiral.changelog
          WHERE base_view = '{}' AND scope_values = '{}'::jsonb",
         safe_bv, safe_sv
     ));
@@ -362,7 +362,7 @@ pub fn unify_changelog_scope(base_view: &str, scope_json: &str) {
                     COALESCE(t_start, -9223372036854775808) as ts_safe,
                     COALESCE(t_end, 9223372036854775807) as te_safe,
                     MAX(COALESCE(t_end, 9223372036854775807)) OVER (PARTITION BY base_view, scope_values ORDER BY COALESCE(t_start, -9223372036854775808) ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
-                FROM scope_cl_snapshot
+                FROM scope_cl_snapsho
             ) s1
          ) s2
          GROUP BY base_view, scope_values, grp");
@@ -383,7 +383,7 @@ pub fn unify_changelog(base_view: &str) {
 
     // Unify logic using sentinels for NULLs (unbounded ranges)
     Spi::run("CREATE TEMP TABLE temp_unified AS
-         SELECT base_view, scope_values, 
+         SELECT base_view, scope_values,
                 NULLIF(MIN(ts_safe), -9223372036854775808) as ts,
                 NULLIF(MAX(te_safe), 9223372036854775807) as te
          FROM (
@@ -394,7 +394,7 @@ pub fn unify_changelog(base_view: &str) {
                     COALESCE(t_start, -9223372036854775808) as ts_safe,
                     COALESCE(t_end, 9223372036854775807) as te_safe,
                     MAX(COALESCE(t_end, 9223372036854775807)) OVER (PARTITION BY base_view, scope_values ORDER BY COALESCE(t_start, -9223372036854775808) ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
-                FROM changelog_snapshot
+                FROM changelog_snapsho
             ) s1
          ) s2
          GROUP BY base_view, scope_values, grp").unwrap();
@@ -410,7 +410,7 @@ pub fn unify_changelog(base_view: &str) {
 
 /// Groups dirty changelog scopes sharing an identical (t_start, t_end) range
 /// into batches capped at `max_scopes_per_batch`, so a single wide bulk-load
-/// range touching thousands of scopes doesn't produce either a giant
+/// range touching thousands of scopes doesn't produce either a gian
 /// `scope_values IN (...)` clause or a one-scope-at-a-time refresh loop.
 /// Call after `unify_changelog` so ranges are already merged per scope.
 pub fn coalesce_changelog_batches(base_view: &str, max_scopes_per_batch: i64) -> Vec<Vec<String>> {
@@ -426,7 +426,7 @@ pub fn coalesce_changelog_batches(base_view: &str, max_scopes_per_batch: i64) ->
             max_scopes_per_batch, safe_bv
         );
         Ok::<Vec<Vec<String>>, spi::Error>(
-            client
+            clien
                 .select(&sql, None, &[])?
                 .map(|r| r.get::<Vec<String>>(1).unwrap().unwrap_or_default())
                 .collect(),
@@ -536,7 +536,7 @@ pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
             view_name.replace("'", "''")
         );
         Ok::<Vec<OffsetColumn>, spi::Error>(
-            client
+            clien
                 .select(&sql, None, &[])?
                 .map(|r| OffsetColumn {
                     mat_column: r.get::<String>(1).unwrap().unwrap(),
@@ -566,9 +566,9 @@ pub fn remove_table_from_spiral(table_name: &str) {
     // Cancel any Spiral Worker currently processing this table so its transaction
     // aborts immediately before we touch the catalog or drop hierarchy tables.
     let _ = Spi::run(&format!(
-        "SELECT pg_cancel_backend(pid) \
-         FROM pg_stat_activity \
-         WHERE backend_type LIKE 'Spiral Worker%' \
+        "SELECT pg_cancel_backend(pid)
+         FROM pg_stat_activity
+         WHERE backend_type LIKE 'Spiral Worker%'
            AND query LIKE '%{name}%'"
     ));
 
@@ -577,10 +577,10 @@ pub fn remove_table_from_spiral(table_name: &str) {
     // on the base table, so DROP TABLE base CASCADE won't reach them.
     let hierarchy_tables: Vec<String> = Spi::connect_mut(|client| {
         Ok::<Vec<String>, spi::Error>(
-            client
+            clien
                 .select(
                     &format!(
-                        "SELECT view_name FROM spiral.metadata \
+                        "SELECT view_name FROM spiral.metadata
                      WHERE base_view = '{name}' AND view_name <> '{name}'"
                     ),
                     None,
@@ -600,8 +600,8 @@ pub fn remove_table_from_spiral(table_name: &str) {
     }
 
     let _ = Spi::run(&format!(
-        "DELETE FROM spiral.sources   WHERE view_name = '{name}' OR base_view = '{name}'; \
-         DELETE FROM spiral.metadata  WHERE view_name = '{name}' OR base_view = '{name}'; \
+        "DELETE FROM spiral.sources   WHERE view_name = '{name}' OR base_view = '{name}';
+         DELETE FROM spiral.metadata  WHERE view_name = '{name}' OR base_view = '{name}';
          DELETE FROM spiral.changelog WHERE base_view = '{name}';"
     ));
 
@@ -614,8 +614,8 @@ pub fn remove_table_from_spiral(table_name: &str) {
 
     if remaining == 0 {
         let _ = Spi::run(
-            "SELECT pg_cancel_backend(pid) \
-             FROM pg_stat_activity \
+            "SELECT pg_cancel_backend(pid)
+             FROM pg_stat_activity
              WHERE backend_type LIKE 'Spiral Worker%'",
         );
     }
@@ -624,7 +624,6 @@ pub fn remove_table_from_spiral(table_name: &str) {
 }
 
 pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
-    
     let cached = LANE_MAPPING_CACHE.with(|c| c.borrow().get(&(table_oid, tenant_id)).cloned());
     if let Some(lane_id) = cached {
         return lane_id;
@@ -660,7 +659,7 @@ pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
         };
 
         let _ = client.update(&format!("INSERT INTO spiral.lane_mapping (table_oid, tenant_id, lane_id) VALUES ({}, {}, {}) ON CONFLICT (table_oid, tenant_id) DO NOTHING", table_oid, tenant_id, lane_id), None, &[]);
-        
+
         Ok::<i32, spi::Error>(lane_id)
     }).unwrap_or(0);
 
@@ -670,14 +669,16 @@ pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
 }
 
 pub fn get_tenant_id_for_lane(table_oid: u32, lane_id: i32) -> Option<i32> {
-    
     let cached = LANE_REVERSE_CACHE.with(|c| c.borrow().get(&(table_oid, lane_id)).cloned());
     if cached.is_some() {
         return cached;
     }
 
     let tenant_id = Spi::connect_mut(|client| {
-        let sql = format!("SELECT tenant_id FROM spiral.lane_mapping WHERE table_oid = {} AND lane_id = {}", table_oid, lane_id);
+        let sql = format!(
+            "SELECT tenant_id FROM spiral.lane_mapping WHERE table_oid = {} AND lane_id = {}",
+            table_oid, lane_id
+        );
         let table = client.select(&sql, None, &[])?;
         if !table.is_empty() {
             if let Some(tenant_id) = table.first().get::<i32>(1)? {
@@ -685,7 +686,11 @@ pub fn get_tenant_id_for_lane(table_oid: u32, lane_id: i32) -> Option<i32> {
             }
         }
         Ok::<Option<i32>, spi::Error>(None)
-    }).unwrap_or_else(|e| { pgrx::notice!("SPI ERROR in get_tenant_id_for_lane: {:?}", e); None });
+    })
+    .unwrap_or_else(|e| {
+        pgrx::notice!("SPI ERROR in get_tenant_id_for_lane: {:?}", e);
+        None
+    });
 
     if let Some(tid) = tenant_id {
         LANE_REVERSE_CACHE.with(|c| c.borrow_mut().insert((table_oid, lane_id), tid));
@@ -696,24 +701,30 @@ pub fn get_tenant_id_for_lane(table_oid: u32, lane_id: i32) -> Option<i32> {
 
 pub fn get_all_active_lanes(table_oid: u32) -> Vec<(i32, i32)> {
     Spi::connect_mut(|client| {
-        let sql = format!("SELECT tenant_id, lane_id FROM spiral.lane_mapping WHERE table_oid = {}", table_oid);
+        let sql = format!(
+            "SELECT tenant_id, lane_id FROM spiral.lane_mapping WHERE table_oid = {}",
+            table_oid
+        );
         let mut results = Vec::new();
         if let Ok(table) = client.select(&sql, None, &[]) {
             for row in table {
-                if let (Ok(Some(tenant_id)), Ok(Some(lane_id))) = (row.get::<i32>(1), row.get::<i32>(2)) {
+                if let (Ok(Some(tenant_id)), Ok(Some(lane_id))) =
+                    (row.get::<i32>(1), row.get::<i32>(2))
+                {
                     results.push((tenant_id, lane_id));
                 }
             }
         }
         Ok::<Vec<(i32, i32)>, spi::Error>(results)
-    }).unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 pub fn bulk_update_lane_mappings(table_oid: u32, updates: &[(i32, i32)]) {
     if updates.is_empty() {
         return;
     }
-    
+
     // Clear the cache for this table to avoid stale mappings
     LANE_MAPPING_CACHE.with(|c| c.borrow_mut().retain(|&(oid, _), _| oid != table_oid));
     LANE_REVERSE_CACHE.with(|c| c.borrow_mut().retain(|&(oid, _), _| oid != table_oid));
@@ -721,7 +732,7 @@ pub fn bulk_update_lane_mappings(table_oid: u32, updates: &[(i32, i32)]) {
     Spi::connect_mut(|client| {
         for &(tenant_id, new_lane_id) in updates {
             let _ = client.update(
-                &format!("UPDATE spiral.lane_mapping SET lane_id = {} WHERE table_oid = {} AND tenant_id = {}", 
+                &format!("UPDATE spiral.lane_mapping SET lane_id = {} WHERE table_oid = {} AND tenant_id = {}",
                          new_lane_id, table_oid, tenant_id),
                 None,
                 &[]
@@ -741,16 +752,16 @@ pub fn replace_timeline_epochs(table_name: &str, new_epoch: TimelineEpoch) {
         );
         let _ = client.update(
             &format!("INSERT INTO spiral.tenants_timeline (table_name, start_t, end_t, tenant_scale, base_offset) VALUES ('{}', {}, {}, {}, {})",
-                     safe_name, 
-                     new_epoch.start_t, 
-                     if new_epoch.end_t == i64::MAX { "NULL".to_string() } else { new_epoch.end_t.to_string() }, 
-                     new_epoch.tenant_scale, 
+                     safe_name,
+                     new_epoch.start_t,
+                     if new_epoch.end_t == i64::MAX { "NULL".to_string() } else { new_epoch.end_t.to_string() },
+                     new_epoch.tenant_scale,
                      new_epoch.base_offset),
             None,
             &[]
         );
         Ok::<(), spi::Error>(())
     }).unwrap_or(());
-    
+
     TIMELINE_CACHE.with(|c| c.borrow_mut().remove(table_name));
 }

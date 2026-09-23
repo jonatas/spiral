@@ -126,7 +126,6 @@ fn spiral_is_loaded() -> bool {
     true
 }
 
-
 pub const POSTGRES_EPOCH_JDATE: i64 = 946684800; // seconds between 1970-01-01 and 2000-01-01
 
 #[pg_extern(immutable, parallel_safe)]

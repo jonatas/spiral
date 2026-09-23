@@ -117,7 +117,9 @@ pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
     _allvisfrac: *mut f64,
 ) {
     let old_oid = (*_old_heap).rd_id.to_u32();
-    let rel_name = std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*_old_heap).rd_id)).to_string_lossy().into_owned();
+    let rel_name = std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*_old_heap).rd_id))
+        .to_string_lossy()
+        .into_owned();
     let mut fallback_scale = 1024;
     if let Some(m) = crate::catalog::get_metadata(&rel_name) {
         fallback_scale = crate::catalog::get_tenant_scale(&m);
@@ -147,7 +149,9 @@ pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
 
     for blkno in 0..nblocks_old {
         let buffer_old = pg_sys::ReadBuffer(_old_heap, blkno);
-        if buffer_old == 0 { continue; }
+        if buffer_old == 0 {
+            continue;
+        }
 
         pg_sys::LockBuffer(buffer_old, pg_sys::BUFFER_LOCK_SHARE as i32);
         let page_old = pg_sys::BufferGetPage(buffer_old);
@@ -159,19 +163,29 @@ pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
             while offset + crate::storage::TAM_SLOT_SIZE as u32 <= upper_bound {
                 let tam = crate::storage::tam_read_slot(page_old, offset);
                 if crate::storage::tam_slot_visible(&tam, std::ptr::null_mut()) {
-                    let old_idx = (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
-                    let (t_rel, old_lane) = crate::catalog::reverse_slot_index(old_idx, &epochs, fallback_scale);
+                    let old_idx = (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64)
+                        + (posid as i64 - 1);
+                    let (t_rel, old_lane) =
+                        crate::catalog::reverse_slot_index(old_idx, &epochs, fallback_scale);
 
                     if let Some(&new_lane) = old_to_new_lane.get(&(old_lane as i32)) {
                         let new_idx = (t_rel * new_tenant_scale) + (new_lane as i64);
-                        let (new_blkno, new_offset) = crate::storage::tam_logical_to_physical_offset(new_idx);
+                        let (new_blkno, new_offset) =
+                            crate::storage::tam_logical_to_physical_offset(new_idx);
 
-                        let mut nblocks_new = pg_sys::smgrnblocks((*_new_heap).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
+                        let mut nblocks_new = pg_sys::smgrnblocks(
+                            (*_new_heap).rd_smgr,
+                            pg_sys::ForkNumber::MAIN_FORKNUM,
+                        );
                         while nblocks_new <= new_blkno {
-                            let buffer_new = pg_sys::ReadBuffer(_new_heap, pg_sys::InvalidBlockNumber);
+                            let buffer_new =
+                                pg_sys::ReadBuffer(_new_heap, pg_sys::InvalidBlockNumber);
                             pg_sys::LockBuffer(buffer_new, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
                             let page_new = pg_sys::BufferGetPage(buffer_new);
-                            crate::storage::initialize_spiral_page(page_new, new_tenant_scale as i32);
+                            crate::storage::initialize_spiral_page(
+                                page_new,
+                                new_tenant_scale as i32,
+                            );
                             pg_sys::MarkBufferDirty(buffer_new);
                             pg_sys::LockBuffer(buffer_new, pg_sys::BUFFER_LOCK_UNLOCK as i32);
                             pg_sys::ReleaseBuffer(buffer_new);
@@ -212,7 +226,10 @@ pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
 
     let _ = pgrx::Spi::connect_mut(|client| {
         let _ = client.update(
-            &format!("DELETE FROM spiral.free_lanes WHERE table_oid = {}", old_oid),
+            &format!(
+                "DELETE FROM spiral.free_lanes WHERE table_oid = {}",
+                old_oid
+            ),
             None,
             &[],
         );
@@ -283,9 +300,10 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
 
             let idx =
                 (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
-            let (t_rel, lane_id) =
-                crate::catalog::reverse_slot_index(idx, &epochs, fallback_scale);
-            let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
+            let (t_rel, lane_id) = crate::catalog::reverse_slot_index(idx, &epochs, fallback_scale);
+            let tenant_id =
+                crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32)
+                    .unwrap_or(lane_id as i32);
             let t_abs = decode_t_abs(t_rel, kickoff, (*rel).rd_att);
 
             pg_sys::ExecClearTuple(slot);
@@ -815,14 +833,22 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
         }
     }
 
-    let rel_name = unsafe { std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*rel).rd_id)).to_string_lossy().into_owned() };
+    let rel_name = unsafe {
+        std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*rel).rd_id))
+            .to_string_lossy()
+            .into_owned()
+    };
     let mut fallback_scale = 1024;
     if let Some(m) = crate::catalog::get_metadata(&rel_name) {
         fallback_scale = crate::catalog::get_tenant_scale(&m);
     }
     let epochs = crate::catalog::get_timeline(&rel_name);
-    
-    let max_lanes = epochs.iter().map(|e| e.tenant_scale).max().unwrap_or(fallback_scale);
+
+    let max_lanes = epochs
+        .iter()
+        .map(|e| e.tenant_scale)
+        .max()
+        .unwrap_or(fallback_scale);
     let mut lane_active = vec![false; max_lanes as usize];
 
     for blkno in 0..n_pages {
@@ -843,8 +869,10 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
                     let tam = crate::storage::tam_read_slot(page, offset);
                     if crate::storage::tam_slot_visible(&tam, std::ptr::null_mut()) {
                         n_tuples += 1.0;
-                        let idx = (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
-                        let (_, lane_id) = crate::catalog::reverse_slot_index(idx, &epochs, fallback_scale);
+                        let idx = (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64)
+                            + (posid as i64 - 1);
+                        let (_, lane_id) =
+                            crate::catalog::reverse_slot_index(idx, &epochs, fallback_scale);
                         if lane_id >= 0 && lane_id < max_lanes {
                             lane_active[lane_id as usize] = true;
                         }
@@ -872,7 +900,10 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
         let table_exists = client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'free_lanes' LIMIT 1", Some(1), &[]).is_ok_and(|t| !t.is_empty());
         if table_exists {
             let _ = client.update(
-                &format!("DELETE FROM spiral.free_lanes WHERE table_oid = {}", rel_oid),
+                &format!(
+                    "DELETE FROM spiral.free_lanes WHERE table_oid = {}",
+                    rel_oid
+                ),
                 None,
                 &[],
             );
@@ -915,18 +946,20 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
         );
     }
 
-    let rel_name = unsafe { std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*rel).rd_id)).to_string_lossy().into_owned() };
+    let rel_name = unsafe {
+        std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*rel).rd_id))
+            .to_string_lossy()
+            .into_owned()
+    };
 
     info!(
         "Spiral: VACUUM finished for '{}'. Pages: {}, Tuples: {}",
-        rel_name,
-        n_pages,
-        n_tuples
+        rel_name, n_pages, n_tuples
     );
 
     let _ = pgrx::Spi::connect(|client| {
         let safe_bv = rel_name.replace('\'', "''");
-        
+
         let table_exists = !client
             .select(
                 "SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'changelog' LIMIT 1",
@@ -944,7 +977,7 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
             "SELECT scope_values::text FROM spiral.changelog WHERE base_view = '{}' GROUP BY scope_values",
             safe_bv
         );
-        
+
         if let Ok(results) = client.select(&query, None, &[]) {
             for row in results {
                 if let Ok(Some(sv)) = row.get::<String>(1) {
@@ -957,13 +990,17 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
             return Ok(());
         }
 
-        info!("Spiral: VACUUM refreshing {} scopes for '{}'", scopes.len(), rel_name);
+        info!(
+            "Spiral: VACUUM refreshing {} scopes for '{}'",
+            scopes.len(),
+            rel_name
+        );
 
         let json_array = serde_json::to_string(&scopes).unwrap_or_else(|_| "[]".to_string());
         let safe_json = json_array.replace('\'', "''");
 
         let _ = pgrx::Spi::run(&format!(
-            "SELECT spiral_refresh_scopes('{}', '{}'::jsonb)", 
+            "SELECT spiral_refresh_scopes('{}', '{}'::jsonb)",
             safe_bv, safe_json
         ));
 
@@ -1226,7 +1263,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                 };
                 let (t_rel, lane_id) =
                     crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
-                let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
+                let tenant_id =
+                    crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32)
+                        .unwrap_or(lane_id as i32);
                 let t_abs = decode_t_abs(
                     t_rel,
                     state.kickoff,
@@ -1398,7 +1437,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 };
                 let (t_rel, lane_id) =
                     crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
-                let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
+                let tenant_id =
+                    crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32)
+                        .unwrap_or(lane_id as i32);
                 let kickoff = crate::get_kickoff_epoch();
                 let t_abs = decode_t_abs(
                     t_rel,

@@ -1111,8 +1111,6 @@ pub unsafe extern "C-unwind" fn spiral_planner_hook(
     // Clear any stale time range from a previous query so non-spiral scans see None.
     crate::SCAN_TIME_RANGE.with(|r| r.set(None));
     PgTryBuilder::new(AssertUnwindSafe(|| {
-
-
         let mut tz_offset_cache = None;
         process_query_recursive(parse, &mut tz_offset_cache);
 
@@ -1898,8 +1896,6 @@ pub fn accelerate(
         anchor_col,
         offset_cols,
     );
-
-
 
     if initial_load {
         let bootstrap_sql = format!(
@@ -3853,7 +3849,10 @@ pub unsafe fn init_hooks() {
     pg_sys::planner_hook = Some(spiral_planner_hook);
 
     pg_sys::RegisterXactCallback(Some(spiral_xact_callback), std::ptr::null_mut());
-    pg_sys::CacheRegisterRelcacheCallback(Some(spiral_relcache_callback), pg_sys::Datum::from(0isize));
+    pg_sys::CacheRegisterRelcacheCallback(
+        Some(spiral_relcache_callback),
+        pg_sys::Datum::from(0isize),
+    );
 }
 
 #[pg_guard]
@@ -3861,16 +3860,14 @@ unsafe extern "C-unwind" fn spiral_xact_callback(
     event: pg_sys::XactEvent::Type,
     _arg: *mut std::ffi::c_void,
 ) {
-    if event == pg_sys::XactEvent::XACT_EVENT_ABORT || event == pg_sys::XactEvent::XACT_EVENT_COMMIT {
+    if event == pg_sys::XactEvent::XACT_EVENT_ABORT || event == pg_sys::XactEvent::XACT_EVENT_COMMIT
+    {
         crate::catalog::invalidate_catalog_cache(None);
     }
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn spiral_relcache_callback(
-    _arg: pg_sys::Datum,
-    relid: pg_sys::Oid,
-) {
+unsafe extern "C-unwind" fn spiral_relcache_callback(_arg: pg_sys::Datum, relid: pg_sys::Oid) {
     if relid.to_u32() != 0 {
         crate::catalog::invalidate_catalog_cache(Some(relid.to_u32()));
     } else {
