@@ -116,7 +116,108 @@ pub unsafe extern "C-unwind" fn spiral_relation_copy_for_cluster(
     _tuples: *mut f64,
     _allvisfrac: *mut f64,
 ) {
-    warning!("Spiral: CLUSTER is currently a no-op for Spiral TAM relations.");
+    let old_oid = (*_old_heap).rd_id.to_u32();
+    let rel_name = std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*_old_heap).rd_id)).to_string_lossy().into_owned();
+    let mut fallback_scale = 1024;
+    if let Some(m) = crate::catalog::get_metadata(&rel_name) {
+        fallback_scale = crate::catalog::get_tenant_scale(&m);
+    }
+    let epochs = crate::catalog::get_timeline(&rel_name);
+
+    let active_lanes = crate::catalog::get_all_active_lanes(old_oid);
+    let mut old_to_new_lane = std::collections::HashMap::new();
+    let mut tenant_to_new_lane = Vec::new();
+    for (i, (tenant_id, old_lane)) in active_lanes.iter().enumerate() {
+        old_to_new_lane.insert(*old_lane, i as i32);
+        tenant_to_new_lane.push((*tenant_id, i as i32));
+    }
+
+    let num_tenants = active_lanes.len() as u64;
+    let new_tenant_scale = if num_tenants > 0 {
+        num_tenants.next_power_of_two() as i64
+    } else {
+        1024
+    };
+
+    pg_sys::RelationGetSmgr(_old_heap);
+    pg_sys::RelationGetSmgr(_new_heap);
+    let nblocks_old = pg_sys::smgrnblocks((*_old_heap).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
+
+    let mut tuples_copied = 0.0;
+
+    for blkno in 0..nblocks_old {
+        let buffer_old = pg_sys::ReadBuffer(_old_heap, blkno);
+        if buffer_old == 0 { continue; }
+
+        pg_sys::LockBuffer(buffer_old, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page_old = pg_sys::BufferGetPage(buffer_old);
+
+        if crate::storage::is_valid_spiral_page(page_old) {
+            let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
+            let mut offset = crate::storage::HEADER_SIZE as u32;
+            let mut posid = 1;
+            while offset + crate::storage::TAM_SLOT_SIZE as u32 <= upper_bound {
+                let tam = crate::storage::tam_read_slot(page_old, offset);
+                if crate::storage::tam_slot_visible(&tam, std::ptr::null_mut()) {
+                    let old_idx = (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
+                    let (t_rel, old_lane) = crate::catalog::reverse_slot_index(old_idx, &epochs, fallback_scale);
+
+                    if let Some(&new_lane) = old_to_new_lane.get(&(old_lane as i32)) {
+                        let new_idx = (t_rel * new_tenant_scale) + (new_lane as i64);
+                        let (new_blkno, new_offset) = crate::storage::tam_logical_to_physical_offset(new_idx);
+
+                        let mut nblocks_new = pg_sys::smgrnblocks((*_new_heap).rd_smgr, pg_sys::ForkNumber::MAIN_FORKNUM);
+                        while nblocks_new <= new_blkno {
+                            let buffer_new = pg_sys::ReadBuffer(_new_heap, pg_sys::InvalidBlockNumber);
+                            pg_sys::LockBuffer(buffer_new, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+                            let page_new = pg_sys::BufferGetPage(buffer_new);
+                            crate::storage::initialize_spiral_page(page_new, new_tenant_scale as i32);
+                            pg_sys::MarkBufferDirty(buffer_new);
+                            pg_sys::LockBuffer(buffer_new, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                            pg_sys::ReleaseBuffer(buffer_new);
+                            nblocks_new += 1;
+                        }
+
+                        let buffer_new = pg_sys::ReadBuffer(_new_heap, new_blkno);
+                        pg_sys::LockBuffer(buffer_new, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+                        let page_new = pg_sys::BufferGetPage(buffer_new);
+                        crate::storage::tam_write_slot(page_new, new_offset, tam);
+                        pg_sys::MarkBufferDirty(buffer_new);
+                        pg_sys::LockBuffer(buffer_new, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                        pg_sys::ReleaseBuffer(buffer_new);
+
+                        tuples_copied += 1.0;
+                    }
+                }
+                offset += crate::storage::TAM_SLOT_SIZE as u32;
+                posid += 1;
+            }
+        }
+        pg_sys::LockBuffer(buffer_old, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+        pg_sys::ReleaseBuffer(buffer_old);
+    }
+
+    if !_tuples.is_null() {
+        *_tuples = tuples_copied;
+    }
+
+    let new_epoch = crate::catalog::TimelineEpoch {
+        start_t: 0,
+        end_t: i64::MAX,
+        tenant_scale: new_tenant_scale,
+        base_offset: 0,
+    };
+    crate::catalog::replace_timeline_epochs(&rel_name, new_epoch);
+    crate::catalog::bulk_update_lane_mappings(old_oid, &tenant_to_new_lane);
+
+    let _ = pgrx::Spi::connect_mut(|client| {
+        let _ = client.update(
+            &format!("DELETE FROM spiral.free_lanes WHERE table_oid = {}", old_oid),
+            None,
+            &[],
+        );
+        Ok::<(), pgrx::spi::Error>(())
+    });
 }
 
 unsafe fn decode_t_abs(t_rel: i64, kickoff: i64, tupdesc: pg_sys::TupleDesc) -> i64 {
@@ -182,9 +283,9 @@ pub unsafe extern "C-unwind" fn spiral_tuple_fetch_row_version(
 
             let idx =
                 (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
-            let (t_rel, computed_tid) =
+            let (t_rel, lane_id) =
                 crate::catalog::reverse_slot_index(idx, &epochs, fallback_scale);
-            let tenant_id = computed_tid as i32;
+            let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
             let t_abs = decode_t_abs(t_rel, kickoff, (*rel).rd_att);
 
             pg_sys::ExecClearTuple(slot);
@@ -431,9 +532,11 @@ pub unsafe extern "C-unwind" fn spiral_slot_insert(
             tenant_scale
         );
 
-        if t_rel >= 0 && (0..tenant_scale).contains(&(tid as i64)) {
+        let lane_id = crate::catalog::get_or_assign_lane_id(rel_oid.to_u32(), tid);
+
+        if t_rel >= 0 && (0..tenant_scale).contains(&(lane_id as i64)) {
             let slot_index =
-                crate::catalog::compute_slot_index(t_rel, tid as i64, &epochs, fallback_scale);
+                crate::catalog::compute_slot_index(t_rel, lane_id as i64, &epochs, fallback_scale);
             let (blkno, page_offset) = crate::storage::tam_logical_to_physical_offset(slot_index);
 
             pgrx::notice!(
@@ -712,6 +815,16 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
         }
     }
 
+    let rel_name = unsafe { std::ffi::CStr::from_ptr(pg_sys::get_rel_name((*rel).rd_id)).to_string_lossy().into_owned() };
+    let mut fallback_scale = 1024;
+    if let Some(m) = crate::catalog::get_metadata(&rel_name) {
+        fallback_scale = crate::catalog::get_tenant_scale(&m);
+    }
+    let epochs = crate::catalog::get_timeline(&rel_name);
+    
+    let max_lanes = epochs.iter().map(|e| e.tenant_scale).max().unwrap_or(fallback_scale);
+    let mut lane_active = vec![false; max_lanes as usize];
+
     for blkno in 0..n_pages {
         let buffer = unsafe { pg_sys::ReadBuffer(rel, blkno) };
         if buffer == 0 {
@@ -725,12 +838,19 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
             if crate::storage::is_valid_spiral_page(page) {
                 let upper_bound = (crate::storage::BLCKSZ - crate::storage::SPECIAL_SIZE) as u32;
                 let mut offset = crate::storage::HEADER_SIZE as u32;
+                let mut posid = 1;
                 while offset + crate::storage::TAM_SLOT_SIZE as u32 <= upper_bound {
                     let tam = crate::storage::tam_read_slot(page, offset);
                     if crate::storage::tam_slot_visible(&tam, std::ptr::null_mut()) {
                         n_tuples += 1.0;
+                        let idx = (blkno as i64 * crate::storage::TAM_DATA_PER_PAGE as i64) + (posid as i64 - 1);
+                        let (_, lane_id) = crate::catalog::reverse_slot_index(idx, &epochs, fallback_scale);
+                        if lane_id >= 0 && lane_id < max_lanes {
+                            lane_active[lane_id as usize] = true;
+                        }
                     }
                     offset += crate::storage::TAM_SLOT_SIZE as u32;
+                    posid += 1;
                 }
             }
 
@@ -738,6 +858,43 @@ pub unsafe extern "C-unwind" fn spiral_relation_vacuum(
             pg_sys::ReleaseBuffer(buffer);
         }
     }
+
+    let rel_oid = unsafe { (*rel).rd_id };
+    let mut free_lanes = Vec::new();
+    for (lane_id, active) in lane_active.iter().enumerate() {
+        if !active {
+            free_lanes.push(lane_id);
+        }
+    }
+
+    let _ = pgrx::Spi::connect_mut(|client| {
+        // Only run free lane cleanup if the free_lanes table exists
+        let table_exists = client.select("SELECT 1 FROM information_schema.tables WHERE table_schema = 'spiral' AND table_name = 'free_lanes' LIMIT 1", Some(1), &[]).is_ok_and(|t| !t.is_empty());
+        if table_exists {
+            let _ = client.update(
+                &format!("DELETE FROM spiral.free_lanes WHERE table_oid = {}", rel_oid),
+                None,
+                &[],
+            );
+            if !free_lanes.is_empty() {
+                // Batch insert using a single query
+                let values: String = free_lanes
+                    .iter()
+                    .map(|l| format!("({}, {})", rel_oid, l))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = client.update(
+                    &format!(
+                        "INSERT INTO spiral.free_lanes (table_oid, lane_id) VALUES {} ON CONFLICT DO NOTHING",
+                        values
+                    ),
+                    None,
+                    &[],
+                );
+            }
+        }
+        Ok::<(), pgrx::spi::Error>(())
+    });
 
     let mut frozenxid_updated = false;
     let mut minmulti_updated = false;
@@ -1067,9 +1224,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_getnextslot(
                 } else {
                     &[]
                 };
-                let (t_rel, tid) =
+                let (t_rel, lane_id) =
                     crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
-                let tenant_id = tid as i32;
+                let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
                 let t_abs = decode_t_abs(
                     t_rel,
                     state.kickoff,
@@ -1239,9 +1396,9 @@ pub unsafe extern "C-unwind" fn spiral_scan_analyze_next_tuple(
                 } else {
                     &[]
                 };
-                let (t_rel, tid) =
+                let (t_rel, lane_id) =
                     crate::catalog::reverse_slot_index(idx, epochs_slice, state.tenant_scale);
-                let tenant_id = tid as i32;
+                let tenant_id = crate::catalog::get_tenant_id_for_lane((*rel).rd_id.to_u32(), lane_id as i32).unwrap_or(lane_id as i32);
                 let kickoff = crate::get_kickoff_epoch();
                 let t_abs = decode_t_abs(
                     t_rel,

@@ -31,16 +31,27 @@ thread_local! {
     static OFFSET_COLS_CACHE: RefCell<HashMap<String, Vec<OffsetColumn>>> = RefCell::new(HashMap::new());
     /// table_name -> timeline epochs
     static TIMELINE_CACHE: RefCell<HashMap<String, Vec<TimelineEpoch>>> = RefCell::new(HashMap::new());
+    /// (table_oid, tenant_id) -> lane_id
+    static LANE_MAPPING_CACHE: RefCell<HashMap<(u32, i32), i32>> = RefCell::new(HashMap::new());
+    /// (table_oid, lane_id) -> tenant_id
+    static LANE_REVERSE_CACHE: RefCell<HashMap<(u32, i32), i32>> = RefCell::new(HashMap::new());
 }
 
 /// Invalidate all per-session catalog caches. Call after any DDL that touches
 /// spiral.metadata or the set of rollup views.
-pub fn invalidate_catalog_cache() {
-    METADATA_TABLE_EXISTS.with(|c| c.set(None));
-    HIERARCHY_CACHE.with(|c| c.borrow_mut().clear());
-    METADATA_CACHE.with(|c| c.borrow_mut().clear());
-    OFFSET_COLS_CACHE.with(|c| c.borrow_mut().clear());
-    TIMELINE_CACHE.with(|c| c.borrow_mut().clear());
+pub fn invalidate_catalog_cache(table_oid: Option<u32>) {
+    if let Some(oid) = table_oid {
+        LANE_MAPPING_CACHE.with(|c| c.borrow_mut().retain(|&(o, _), _| o != oid));
+        LANE_REVERSE_CACHE.with(|c| c.borrow_mut().retain(|&(o, _), _| o != oid));
+    } else {
+        METADATA_TABLE_EXISTS.with(|c| c.set(None));
+        HIERARCHY_CACHE.with(|c| c.borrow_mut().clear());
+        METADATA_CACHE.with(|c| c.borrow_mut().clear());
+        OFFSET_COLS_CACHE.with(|c| c.borrow_mut().clear());
+        TIMELINE_CACHE.with(|c| c.borrow_mut().clear());
+        LANE_MAPPING_CACHE.with(|c| c.borrow_mut().clear());
+        LANE_REVERSE_CACHE.with(|c| c.borrow_mut().clear());
+    }
 }
 
 pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
@@ -49,7 +60,7 @@ pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
         return v;
     }
 
-    let epochs = Spi::connect(|client| {
+    let epochs = Spi::connect_mut(|client| {
         let sql = format!(
             "SELECT start_t, COALESCE(end_t, 9223372036854775807), tenant_scale, base_offset 
              FROM spiral.tenants_timeline 
@@ -150,7 +161,7 @@ fn spiral_metadata_table_exists() -> bool {
     if let Some(cached) = METADATA_TABLE_EXISTS.with(|c| c.get()) {
         return cached;
     }
-    let exists = Spi::connect(|client| {
+    let exists = Spi::connect_mut(|client| {
         Ok::<bool, spi::Error>(
             !client
                 .select(
@@ -176,7 +187,7 @@ pub fn get_hierarchy(base_table: &str) -> Vec<String> {
     if !spiral_metadata_table_exists() {
         return vec![];
     }
-    let views = Spi::connect(|client| {
+    let views = Spi::connect_mut(|client| {
         let mut v = Vec::new();
         let table = client.select(
             &format!(
@@ -212,7 +223,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
         return entry;
     }
 
-    let result = Spi::connect(|client| {
+    let result = Spi::connect_mut(|client| {
         let table = client.select(
             &format!("SELECT parent_view, frame_seconds, base_view, scope_columns, columns_metadata FROM spiral.metadata WHERE view_name = '{}'", view_name.replace("'", "''")),
             None,
@@ -235,7 +246,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
 }
 
 pub fn get_children(view_name: &str) -> Vec<String> {
-    Spi::connect(|client| {
+    Spi::connect_mut(|client| {
         let mut children = Vec::new();
         let tuple_table = client.select(
             &format!("SELECT view_name FROM spiral.metadata WHERE parent_view = '{}' ORDER BY frame_seconds ASC", view_name.replace("'", "''")),
@@ -252,7 +263,7 @@ pub fn get_children(view_name: &str) -> Vec<String> {
 }
 
 pub fn is_spiral_relation(name: &str) -> bool {
-    Spi::connect(|client| {
+    Spi::connect_mut(|client| {
         let table = client.select(
             &format!(
                 "SELECT 1 FROM spiral.metadata WHERE view_name = '{}'",
@@ -292,7 +303,7 @@ pub fn insert_metadata(
     );
     let _ = Spi::run(&sql);
     // Inserted new metadata — invalidate so the next planner lookup picks it up.
-    invalidate_catalog_cache();
+    invalidate_catalog_cache(None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -404,7 +415,7 @@ pub fn unify_changelog(base_view: &str) {
 /// Call after `unify_changelog` so ranges are already merged per scope.
 pub fn coalesce_changelog_batches(base_view: &str, max_scopes_per_batch: i64) -> Vec<Vec<String>> {
     let safe_bv = base_view.replace('\'', "''");
-    Spi::connect(|client| {
+    Spi::connect_mut(|client| {
         let sql = format!(
             "SELECT array_agg(scope_values::text) FROM (
                 SELECT scope_values,
@@ -430,7 +441,7 @@ pub fn get_dirty_ranges(
     te: i64,
     scope_values: Option<pgrx::JsonB>,
 ) -> Vec<(i64, i64)> {
-    Spi::connect(|client| {
+    Spi::connect_mut(|client| {
         let mut ranges = Vec::new();
         let sql = if let Some(sv) = scope_values {
             let sv_json = serde_json::to_string(&sv.0).unwrap_or_else(|_| "{}".to_string());
@@ -518,7 +529,7 @@ pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
     if let Some(v) = cached {
         return v;
     }
-    let cols = Spi::connect(|client| {
+    let cols = Spi::connect_mut(|client| {
         let sql = format!(
             "SELECT mat_column, formula FROM spiral.sources
              WHERE view_name = '{}' AND formula IN ('range_max_end', 'range_merge')",
@@ -564,7 +575,7 @@ pub fn remove_table_from_spiral(table_name: &str) {
     // Collect hierarchy table names BEFORE deleting them from the catalog so we
     // can DROP the actual PG tables. The hierarchy tables have no PG dependency
     // on the base table, so DROP TABLE base CASCADE won't reach them.
-    let hierarchy_tables: Vec<String> = Spi::connect(|client| {
+    let hierarchy_tables: Vec<String> = Spi::connect_mut(|client| {
         Ok::<Vec<String>, spi::Error>(
             client
                 .select(
@@ -609,5 +620,137 @@ pub fn remove_table_from_spiral(table_name: &str) {
         );
     }
 
-    invalidate_catalog_cache();
+    invalidate_catalog_cache(None);
+}
+
+pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
+    
+    let cached = LANE_MAPPING_CACHE.with(|c| c.borrow().get(&(table_oid, tenant_id)).cloned());
+    if let Some(lane_id) = cached {
+        return lane_id;
+    }
+
+    let lane_id = Spi::connect_mut(|client| {
+        let sql = format!("SELECT lane_id FROM spiral.lane_mapping WHERE table_oid = {} AND tenant_id = {}", table_oid, tenant_id);
+        let table = client.select(&sql, None, &[])?;
+        if !table.is_empty() {
+            if let Some(lane_id) = table.first().get::<i32>(1)? {
+                return Ok::<i32, spi::Error>(lane_id);
+            }
+        }
+
+        // Lock the table to serialize lane assignment and prevent UNIQUE constraint violations on lane_id
+        client.update(&format!("SELECT pg_advisory_xact_lock({})", table_oid), None, &[])?;
+
+        let sql = format!("SELECT lane_id FROM spiral.free_lanes WHERE table_oid = {} LIMIT 1 FOR UPDATE SKIP LOCKED", table_oid);
+        let table = client.select(&sql, None, &[])?;
+        let recycled = if table.is_empty() {
+            None
+        } else {
+            table.first().get::<i32>(1)?
+        };
+
+        let lane_id = if let Some(free_lane) = recycled {
+            let _ = client.update(&format!("DELETE FROM spiral.free_lanes WHERE table_oid = {} AND lane_id = {}", table_oid, free_lane), None, &[]);
+            free_lane
+        } else {
+            let sql = format!("SELECT COALESCE(MAX(lane_id), -1) + 1 FROM spiral.lane_mapping WHERE table_oid = {}", table_oid);
+            let table = client.select(&sql, None, &[])?;
+            table.first().get::<i32>(1)?.unwrap_or(0)
+        };
+
+        let _ = client.update(&format!("INSERT INTO spiral.lane_mapping (table_oid, tenant_id, lane_id) VALUES ({}, {}, {}) ON CONFLICT (table_oid, tenant_id) DO NOTHING", table_oid, tenant_id, lane_id), None, &[]);
+        
+        Ok::<i32, spi::Error>(lane_id)
+    }).unwrap_or(0);
+
+    LANE_MAPPING_CACHE.with(|c| c.borrow_mut().insert((table_oid, tenant_id), lane_id));
+    LANE_REVERSE_CACHE.with(|c| c.borrow_mut().insert((table_oid, lane_id), tenant_id));
+    lane_id
+}
+
+pub fn get_tenant_id_for_lane(table_oid: u32, lane_id: i32) -> Option<i32> {
+    
+    let cached = LANE_REVERSE_CACHE.with(|c| c.borrow().get(&(table_oid, lane_id)).cloned());
+    if cached.is_some() {
+        return cached;
+    }
+
+    let tenant_id = Spi::connect_mut(|client| {
+        let sql = format!("SELECT tenant_id FROM spiral.lane_mapping WHERE table_oid = {} AND lane_id = {}", table_oid, lane_id);
+        let table = client.select(&sql, None, &[])?;
+        if !table.is_empty() {
+            if let Some(tenant_id) = table.first().get::<i32>(1)? {
+                return Ok::<Option<i32>, spi::Error>(Some(tenant_id));
+            }
+        }
+        Ok::<Option<i32>, spi::Error>(None)
+    }).unwrap_or_else(|e| { pgrx::notice!("SPI ERROR in get_tenant_id_for_lane: {:?}", e); None });
+
+    if let Some(tid) = tenant_id {
+        LANE_REVERSE_CACHE.with(|c| c.borrow_mut().insert((table_oid, lane_id), tid));
+        LANE_MAPPING_CACHE.with(|c| c.borrow_mut().insert((table_oid, tid), lane_id));
+    }
+    tenant_id
+}
+
+pub fn get_all_active_lanes(table_oid: u32) -> Vec<(i32, i32)> {
+    Spi::connect_mut(|client| {
+        let sql = format!("SELECT tenant_id, lane_id FROM spiral.lane_mapping WHERE table_oid = {}", table_oid);
+        let mut results = Vec::new();
+        if let Ok(table) = client.select(&sql, None, &[]) {
+            for row in table {
+                if let (Ok(Some(tenant_id)), Ok(Some(lane_id))) = (row.get::<i32>(1), row.get::<i32>(2)) {
+                    results.push((tenant_id, lane_id));
+                }
+            }
+        }
+        Ok::<Vec<(i32, i32)>, spi::Error>(results)
+    }).unwrap_or_default()
+}
+
+pub fn bulk_update_lane_mappings(table_oid: u32, updates: &[(i32, i32)]) {
+    if updates.is_empty() {
+        return;
+    }
+    
+    // Clear the cache for this table to avoid stale mappings
+    LANE_MAPPING_CACHE.with(|c| c.borrow_mut().retain(|&(oid, _), _| oid != table_oid));
+    LANE_REVERSE_CACHE.with(|c| c.borrow_mut().retain(|&(oid, _), _| oid != table_oid));
+
+    Spi::connect_mut(|client| {
+        for &(tenant_id, new_lane_id) in updates {
+            let _ = client.update(
+                &format!("UPDATE spiral.lane_mapping SET lane_id = {} WHERE table_oid = {} AND tenant_id = {}", 
+                         new_lane_id, table_oid, tenant_id),
+                None,
+                &[]
+            );
+        }
+        Ok::<(), spi::Error>(())
+    }).unwrap_or(());
+}
+
+pub fn replace_timeline_epochs(table_name: &str, new_epoch: TimelineEpoch) {
+    let safe_name = table_name.replace('\'', "''");
+    Spi::connect_mut(|client| {
+        let _ = client.update(
+            &format!("DELETE FROM spiral.tenants_timeline WHERE table_name = '{}'", safe_name),
+            None,
+            &[]
+        );
+        let _ = client.update(
+            &format!("INSERT INTO spiral.tenants_timeline (table_name, start_t, end_t, tenant_scale, base_offset) VALUES ('{}', {}, {}, {}, {})",
+                     safe_name, 
+                     new_epoch.start_t, 
+                     if new_epoch.end_t == i64::MAX { "NULL".to_string() } else { new_epoch.end_t.to_string() }, 
+                     new_epoch.tenant_scale, 
+                     new_epoch.base_offset),
+            None,
+            &[]
+        );
+        Ok::<(), spi::Error>(())
+    }).unwrap_or(());
+    
+    TIMELINE_CACHE.with(|c| c.borrow_mut().remove(table_name));
 }
