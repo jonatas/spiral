@@ -41,6 +41,19 @@ CREATE TABLE IF NOT EXISTS spiral.tenants_timeline (
 );
 CREATE INDEX IF NOT EXISTS idx_spiral_tenants_timeline_time ON spiral.tenants_timeline (table_name, start_t, end_t);
 
+CREATE TABLE IF NOT EXISTS spiral.lane_mapping (
+    table_oid OID NOT NULL,
+    tenant_id INTEGER NOT NULL,
+    lane_id INTEGER NOT NULL,
+    PRIMARY KEY (table_oid, tenant_id)
+);
+
+CREATE TABLE IF NOT EXISTS spiral.free_lanes (
+    table_oid OID NOT NULL,
+    lane_id INTEGER NOT NULL,
+    PRIMARY KEY (table_oid, lane_id)
+);
+
 
 -- Apply fillfactor to existing installations without a full VACUUM FULL.
 ALTER TABLE IF EXISTS spiral.changelog SET (fillfactor = 50);
