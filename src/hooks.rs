@@ -541,7 +541,7 @@ unsafe extern "C-unwind" fn spiral_process_utility_hook(
     .finally(|| {
         IN_UTILITY.with(|h| h.set(false));
         // DDL may have added/removed spiral relations — invalidate cached hierarchy.
-        catalog::invalidate_catalog_cache();
+        catalog::invalidate_catalog_cache(None);
     })
     .execute()
 }
@@ -3851,4 +3851,29 @@ pub unsafe fn init_hooks() {
     pg_sys::ProcessUtility_hook = Some(spiral_process_utility_hook);
     PREV_PLANNER_HOOK = pg_sys::planner_hook;
     pg_sys::planner_hook = Some(spiral_planner_hook);
+
+    pg_sys::RegisterXactCallback(Some(spiral_xact_callback), std::ptr::null_mut());
+    pg_sys::CacheRegisterRelcacheCallback(Some(spiral_relcache_callback), pg_sys::Datum::from(0isize));
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn spiral_xact_callback(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
+    if event == pg_sys::XactEvent::XACT_EVENT_ABORT || event == pg_sys::XactEvent::XACT_EVENT_COMMIT {
+        crate::catalog::invalidate_catalog_cache(None);
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn spiral_relcache_callback(
+    _arg: pg_sys::Datum,
+    relid: pg_sys::Oid,
+) {
+    if relid.to_u32() != 0 {
+        crate::catalog::invalidate_catalog_cache(Some(relid.to_u32()));
+    } else {
+        crate::catalog::invalidate_catalog_cache(None);
+    }
 }

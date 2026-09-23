@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS spiral.lane_mapping (
     table_oid OID NOT NULL,
     tenant_id INTEGER NOT NULL,
     lane_id INTEGER NOT NULL,
-    PRIMARY KEY (table_oid, tenant_id)
+    PRIMARY KEY (table_oid, tenant_id),
+    UNIQUE (table_oid, lane_id)
 );
 
 CREATE TABLE IF NOT EXISTS spiral.free_lanes (

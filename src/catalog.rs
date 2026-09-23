@@ -39,14 +39,19 @@ thread_local! {
 
 /// Invalidate all per-session catalog caches. Call after any DDL that touches
 /// spiral.metadata or the set of rollup views.
-pub fn invalidate_catalog_cache() {
-    METADATA_TABLE_EXISTS.with(|c| c.set(None));
-    HIERARCHY_CACHE.with(|c| c.borrow_mut().clear());
-    METADATA_CACHE.with(|c| c.borrow_mut().clear());
-    OFFSET_COLS_CACHE.with(|c| c.borrow_mut().clear());
-    TIMELINE_CACHE.with(|c| c.borrow_mut().clear());
-    LANE_MAPPING_CACHE.with(|c| c.borrow_mut().clear());
-    LANE_REVERSE_CACHE.with(|c| c.borrow_mut().clear());
+pub fn invalidate_catalog_cache(table_oid: Option<u32>) {
+    if let Some(oid) = table_oid {
+        LANE_MAPPING_CACHE.with(|c| c.borrow_mut().retain(|&(o, _), _| o != oid));
+        LANE_REVERSE_CACHE.with(|c| c.borrow_mut().retain(|&(o, _), _| o != oid));
+    } else {
+        METADATA_TABLE_EXISTS.with(|c| c.set(None));
+        HIERARCHY_CACHE.with(|c| c.borrow_mut().clear());
+        METADATA_CACHE.with(|c| c.borrow_mut().clear());
+        OFFSET_COLS_CACHE.with(|c| c.borrow_mut().clear());
+        TIMELINE_CACHE.with(|c| c.borrow_mut().clear());
+        LANE_MAPPING_CACHE.with(|c| c.borrow_mut().clear());
+        LANE_REVERSE_CACHE.with(|c| c.borrow_mut().clear());
+    }
 }
 
 pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
@@ -298,7 +303,7 @@ pub fn insert_metadata(
     );
     let _ = Spi::run(&sql);
     // Inserted new metadata — invalidate so the next planner lookup picks it up.
-    invalidate_catalog_cache();
+    invalidate_catalog_cache(None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -615,7 +620,7 @@ pub fn remove_table_from_spiral(table_name: &str) {
         );
     }
 
-    invalidate_catalog_cache();
+    invalidate_catalog_cache(None);
 }
 
 pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
@@ -634,7 +639,10 @@ pub fn get_or_assign_lane_id(table_oid: u32, tenant_id: i32) -> i32 {
             }
         }
 
-        let sql = format!("SELECT lane_id FROM spiral.free_lanes WHERE table_oid = {} LIMIT 1", table_oid);
+        // Lock the table to serialize lane assignment and prevent UNIQUE constraint violations on lane_id
+        client.update(&format!("SELECT pg_advisory_xact_lock({})", table_oid), None, &[])?;
+
+        let sql = format!("SELECT lane_id FROM spiral.free_lanes WHERE table_oid = {} LIMIT 1 FOR UPDATE SKIP LOCKED", table_oid);
         let table = client.select(&sql, None, &[])?;
         let recycled = if table.is_empty() {
             None
