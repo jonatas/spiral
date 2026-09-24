@@ -47,4 +47,4 @@ Standard PostgreSQL requires manual management of view refresh orders. Spiral's 
 *Note: Spiral views are larger because they store the `bytea` binary sketches required for hierarchical accuracy. This is a trade-off: more storage for significantly faster analytical queries.*
 
 ## 4. Conclusion
-Spiral transforms PostgreSQL from a general-purpose database into a high-performance time-series engine. By sacrificing a small amount of storage for T-Digest sketches, it enables **sub-millisecond** analytical queries that would otherwise take tens or hundreds of milliseconds on raw data.
+Spiral offers an alternative storage approach optimized specifically for high-frequency time-series data. By sacrificing a small amount of storage for T-Digest sketches, it enables **sub-millisecond** analytical queries that would otherwise take tens or hundreds of milliseconds on raw data.

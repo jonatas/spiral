@@ -41,7 +41,7 @@ Everything you see here is a **prototype**. It is an exploration of what becomes
 
 # The "Spiral" Concept: A Metaphor for Data Flow
 
-The central idea behind this project is to stop thinking of data as a flat, linear history. As datasets grow to billions of rows, the traditional model faces what I call **Data Gravity**—where the weight of the data makes every operation exponentially harder.
+The central idea behind this project is to stop thinking of data as a flat, linear history. As datasets grow to billions of rows, standard models face structural challenges—where the weight of the data makes every operation exponentially harder.
 
 In my experiments, I started imagining storage as a **Spiral**. 
 
@@ -414,9 +414,9 @@ In this advanced simulator, you can push the system to **100 concurrent tenants*
 })();
 </script>
 
-# The Engineering Problem: Entropy and Page Overhead
+# Understanding Page Architecture
 
-PostgreSQL organizes data into fixed-size **8KB Pages**. For analytical queries on massive time-series data, this creates a significant "IO Tax."
+PostgreSQL organizes data into fixed-size **8KB Pages**. For analytical queries on massive time-series data, this introduces structural trade-offs.
 
 {% mermaid %}
 graph TD
@@ -429,7 +429,7 @@ graph TD
     end
 {% endmermaid %}
 
-# The B-Tree Trap in Multidimensional Queries
+# Trade-offs in Multidimensional Indexing
 
 B-Trees are the workhorse of Postgres, but they are fundamentally one-dimensional. When you create a composite index on `(tenant_id, time)`, you are prioritizing one dimension over the other.
 
@@ -526,7 +526,7 @@ One of my experiments involved bypassing the standard heap and storing data dire
 $$ \text{PhysicalOffset} = \text{PageHeaderSize} + (\text{IndexInPage} \times \text{RowSize}) $$
 {: .math-formula}
 
-This allows for a prototype where data can be retrieved in constant time, effectively "short-circuiting" the traditional B-tree lookup while still benefiting from Postgres's crash safety and WAL logging.
+This allows for a prototype where data can be retrieved in constant time, providing an alternative path to standard B-tree lookups while still benefiting from Postgres's crash safety and WAL logging.
 
 ```rust
 // In src/storage.rs - O(1) buffer mapping
@@ -1019,9 +1019,9 @@ SELECT base_view, t_start, t_end, scope_values
 FROM spiral.changelog ORDER BY t_start;
 ```
 
-# Smart Query Slicing in Action
+# Query Slicing in Action
 
-Spiral's planner is smart enough to know about the dirty data. It slices the query: clean segments go to the rollup, dirty segments go to the raw table!
+Spiral's planner checks for dirty data. It slices the query: clean segments go to the rollup, dirty segments go to the raw table!
 
 ```sql
 EXPLAIN (VERBOSE)

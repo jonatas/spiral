@@ -2,7 +2,7 @@
 
 Spiral uses a custom Table Access Method (TAM) that organizes data into Z-ordered multidimensional arrays. Historically, tenants were directly mapped to physical lanes in the array using their logical `tenant_id`. 
 
-This direct mapping caused two major issues:
+This direct mapping presented a few challenges in certain workloads:
 1. **Sparsity:** If a system had `tenant_id = 1` and `tenant_id = 10000`, the array would allocate 10,000 lanes even if only two were used.
 2. **Fragmentation:** If a tenant was deleted, its physical lane would be permanently left empty.
 
