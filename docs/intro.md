@@ -39,11 +39,11 @@ I should start with a confession: I am not a math expert, nor am I a core Postgr
 
 Everything you see here is a **prototype**. It is an exploration of what becomes possible when we use Rust to extend the heart of the database. I'm sharing this as a research outcome, hoping to find other curious minds who might want to contribute or challenge these concepts.
 
-# The "Spiral" Concept: A Metaphor for Data Flow
+# Exploring the "Spiral" Concept Together
 
-The central idea behind this project is to stop thinking of data as a flat, linear history. As datasets grow to billions of rows, standard models face structural challenges—where the weight of the data makes every operation exponentially harder.
+One idea I wanted to explore with the community is what happens if we stop thinking of data as a flat, linear history. As datasets grow to billions of rows, standard models face structural challenges—where the weight of the data makes every operation exponentially harder.
 
-In my experiments, I started imagining storage as a **Spiral**. 
+Through recent experiments, I've been playing with the idea of imagining storage as a **Spiral**, and I'd love to hear your thoughts on this model. 
 
 <div id="cosmic-spiral-root" class="interactive-widget" style="margin: 2rem 0; background: #020617; padding: 3rem 2rem; border-radius: 12px; border: 1px solid #1e293b; display: flex; flex-direction: column; align-items: center; overflow: hidden; height: 450px; position: relative;">
   <svg id="spiral-svg" width="350" height="350" viewBox="0 0 400 400">
@@ -906,9 +906,9 @@ Select a time range on the timeline below, showing the last 3 days from past to 
 })();
 </script>
 
-# Live Demo: The Modern Spiral Setup
+# Testing the Setup Together
 
-Let's see this in action using PostgreSQL's native `WITH` syntax.
+Here's a quick look at how we're testing this using PostgreSQL's native `WITH` syntax. I'd love to hear how this API feels to you.
 
 ```sql
 DROP EXTENSION IF EXISTS spiral CASCADE;
@@ -1068,9 +1068,9 @@ In my local environment, with a **10 million row dataset**, I saw results that j
 | **Bulk Load** | 1,940,482 rows/s | 0.51s (1M sample) |
 | **Backfill** | 302,413 rows/s | 3.30s (1M sample) |
 
-# Open for Collaboration
+# Let's Build This Together
 
-Building Spiral has been a rewarding learning experience. This is a **work in progress**. If you are a PostgreSQL internals expert, a Rustacean, or someone who loves high-performance storage, I invite you to contribute.
+Building Spiral has been a rewarding learning experience, but it’s still very much an early prototype. I'm sharing this work now because I want to learn from the community's collective expertise. If you are a PostgreSQL internals expert, a Rustacean, or just someone who loves thinking about high-performance storage, I would love your feedback, ideas, or pull requests!
 
 ---
 *Spiral is open source. [Check it out on GitHub](https://github.com/jonatas/spiral) and let's explore the future of storage together.*
