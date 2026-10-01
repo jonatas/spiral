@@ -1244,6 +1244,31 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                 continue;
                             };
 
+                            // Tiers only carry `t`, the tenant columns and the aggregated
+                            // columns. A plain reference to anything else (a GROUP BY key
+                            // or a filter on a non-tenant column) would read NULLs from a
+                            // tier arm, so such a query has to be answered from the raw table.
+                            let tier_plain_cols: Vec<&str> = metadata_obj
+                                .as_ref()
+                                .map(|m| m.scope_columns.iter().map(|c| c.as_str()).collect())
+                                .unwrap_or_default();
+                            let target_cols_ok = query_cols.iter().all(|(name, agg)| {
+                                agg.is_some()
+                                    || name == "t"
+                                    || tier_plain_cols.contains(&name.as_str())
+                            });
+                            if !target_cols_ok
+                                || !where_cols_are_tier_columns(
+                                    query,
+                                    varno,
+                                    relid,
+                                    &tier_plain_cols,
+                                )
+                            {
+                                notice!("Spiral: query references non-tenant columns outside aggregates for '{}', falling back to RAW scan.", base_table);
+                                continue;
+                            }
+
                             let mut supported = true;
                             for seg in &segments {
                                 if seg.source != base_table
@@ -1399,6 +1424,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                 (*rte).subquery = new_query;
                                 (*rte).relid = pg_sys::InvalidOid;
                                 (*rte).perminfoindex = 0;
+                                ensure_eref_columns(rte, new_query);
 
                                 let mut column_formulas: std::collections::HashMap<
                                     String,
@@ -1449,8 +1475,22 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                     if let Some(node) = qc.end_node {
                                         neutralize_op_expr(node);
                                     }
-                                    for (_, node) in qc.scopes.values() {
-                                        neutralize_op_expr(*node);
+                                    // Only equalities on tenant columns are re-applied on
+                                    // every arm of the union; any other `col = const` must
+                                    // stay in the query or its filter would be lost.
+                                    for (col, (val, node)) in qc.scopes.iter() {
+                                        let is_scope_col = metadata_obj
+                                            .as_ref()
+                                            .map(|m| m.scope_columns.contains(col))
+                                            .unwrap_or(false);
+                                        let reapplied = matches!(
+                                            val,
+                                            serde_json::Value::Number(_)
+                                                | serde_json::Value::String(_)
+                                        );
+                                        if is_scope_col && reapplied {
+                                            neutralize_op_expr(*node);
+                                        }
                                     }
                                 }
 
@@ -1508,6 +1548,92 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                     }
                 }
             }
+        }
+    }
+}
+
+/// The planner sizes a subquery relation from `eref->colnames`, but the
+/// accelerated union can expose one more column than the table it replaces
+/// (the synthetic `count(*)` accumulator). Without matching names, a
+/// non-flattened union (raw + tier arms) is indexed past the end of the
+/// per-attribute arrays and the backend crashes while planning.
+unsafe fn ensure_eref_columns(rte: *mut pg_sys::RangeTblEntry, subquery: *mut pg_sys::Query) {
+    let eref = (*rte).eref;
+    if eref.is_null() || subquery.is_null() {
+        return;
+    }
+    let want = if (*subquery).targetList.is_null() {
+        0
+    } else {
+        (*(*subquery).targetList).length
+    };
+    loop {
+        let have = if (*eref).colnames.is_null() {
+            0
+        } else {
+            (*(*eref).colnames).length
+        };
+        if have >= want {
+            break;
+        }
+        let name = pg_sys::pstrdup(c"?column?".as_ptr());
+        (*eref).colnames = pg_sys::lappend(
+            (*eref).colnames,
+            pg_sys::makeString(name) as *mut std::ffi::c_void,
+        );
+    }
+}
+
+/// True when every column of range-table entry `varno` referenced by the
+/// query's FROM/WHERE tree and GROUP BY keys is `t` or one of `tenant_cols`, i.e. something a
+/// rollup tier can answer. Whole-row references and any other column force a
+/// raw scan.
+unsafe fn where_cols_are_tier_columns(
+    query: *mut pg_sys::Query,
+    varno: i32,
+    relid: pg_sys::Oid,
+    tenant_cols: &[&str],
+) -> bool {
+    let mut attnos: *mut pg_sys::Bitmapset = std::ptr::null_mut();
+    pg_sys::pull_varattnos(
+        (*query).jointree as *mut pg_sys::Node,
+        varno as pg_sys::Index,
+        &mut attnos,
+    );
+    // GROUP BY keys are only reachable through the RTE_GROUP entry on PG18+.
+    let rtable = (*query).rtable;
+    if !rtable.is_null() {
+        for i in 0..(*rtable).length {
+            let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
+            if !rte.is_null()
+                && (*rte).rtekind == pg_sys::RTEKind::RTE_GROUP
+                && !(*rte).groupexprs.is_null()
+            {
+                pg_sys::pull_varattnos(
+                    (*rte).groupexprs as *mut pg_sys::Node,
+                    varno as pg_sys::Index,
+                    &mut attnos,
+                );
+            }
+        }
+    }
+    let mut member = -1;
+    loop {
+        member = pg_sys::bms_next_member(attnos, member);
+        if member < 0 {
+            return true;
+        }
+        let attno = member + pg_sys::FirstLowInvalidHeapAttributeNumber;
+        if attno <= 0 {
+            return false;
+        }
+        let name_ptr = pg_sys::get_attname(relid, attno as i16, true);
+        if name_ptr.is_null() {
+            return false;
+        }
+        let name = CStr::from_ptr(name_ptr).to_string_lossy();
+        if name != "t" && !tenant_cols.contains(&name.as_ref()) {
+            return false;
         }
     }
 }
