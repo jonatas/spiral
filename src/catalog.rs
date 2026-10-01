@@ -435,6 +435,13 @@ pub fn coalesce_changelog_batches(base_view: &str, max_scopes_per_batch: i64) ->
     .unwrap_or_default()
 }
 
+/// Dirty time ranges overlapping [ts, te) that can affect a query.
+///
+/// `scope_values` holds the tenant columns the query pins with `=`. A
+/// changelog entry stores the FULL tenant tuple, so a query that pins only a
+/// subset of the tenant columns (e.g. `user_id = 7` on a `(project_id,
+/// user_id)` tenant) must match every entry that contains that subset;
+/// comparing for equality would silently ignore all of them.
 pub fn get_dirty_ranges(
     base_view: &str,
     ts: i64,
@@ -450,7 +457,7 @@ pub fn get_dirty_ranges(
                          WHERE base_view = '{}'
                            AND (t_end IS NULL OR t_end > {})
                            AND (t_start IS NULL OR t_start < {})
-                           AND (scope_values = '{{}}'::jsonb OR scope_values = '{}'::jsonb)
+                           AND (scope_values = '{{}}'::jsonb OR scope_values @> '{}'::jsonb)
                          ORDER BY t_start NULLS FIRST",
                 base_view.replace("'", "''"),
                 ts,

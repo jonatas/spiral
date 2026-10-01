@@ -2652,6 +2652,57 @@ mod tests {
         );
     }
 
+    // A query pinning only SOME tenant columns, or mixing raw dirty slices with
+    // tier slices, must still match the raw scan before any refresh.
+    #[pg_test]
+    fn test_scoped_query_with_dirty_slices_matches_raw() {
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run(
+            "CREATE TABLE scoped_dirty (
+                t          timestamptz NOT NULL,
+                project_id bigint NOT NULL,
+                user_id    bigint NOT NULL,
+                core       integer -- Spiral: sum
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'project_id,user_id')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO scoped_dirty
+             SELECT '2026-03-01 00:00+00'::timestamptz + d * interval '1 day' + s * interval '30 minutes',
+                    1 + u % 3, u, d + s + u
+             FROM generate_series(0, 2) d, generate_series(1, 6) u, generate_series(0, 47) s",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('scoped_dirty')").unwrap();
+
+        // Dirty write for (project 3, user 6) in a closed day, not refreshed.
+        Spi::run("INSERT INTO scoped_dirty VALUES ('2026-03-02 10:15+00', 1, 6, 1000)").unwrap();
+
+        let queries = [
+            // subset of the tenant tuple
+            "SELECT sum(core) FROM scoped_dirty WHERE user_id = 6",
+            "SELECT sum(core) FROM scoped_dirty WHERE project_id = 1",
+            "SELECT sum(core) FROM scoped_dirty
+              WHERE t >= '2026-03-01 00:00+00' AND t < '2026-03-04 00:00+00' AND user_id = 6",
+            // full tenant tuple: dirty slice is read from the raw arm, which must
+            // carry the tenant filter itself
+            "SELECT sum(core) FROM scoped_dirty
+              WHERE t >= '2026-03-01 00:00+00' AND t < '2026-03-04 00:00+00'
+                AND project_id = 1 AND user_id = 6",
+            // misaligned bounds: raw edge slices next to a tier slice
+            "SELECT sum(core) FROM scoped_dirty
+              WHERE t >= '2026-03-02 10:07+00' AND t < '2026-03-02 13:41+00' AND user_id = 6",
+        ];
+        for q in queries {
+            Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+            let accelerated: Option<i64> = Spi::get_one(q).unwrap();
+            Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+            let raw: Option<i64> = Spi::get_one(q).unwrap();
+            Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+            assert_eq!(accelerated, raw, "accelerated != raw for: {q}");
+        }
+    }
+
     // issue #68: dirty range [t, t+bucket) must not mark the next frame dirty
     #[pg_test]
     fn test_dirty_range_no_overexpansion() {

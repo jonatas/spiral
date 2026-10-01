@@ -3446,9 +3446,12 @@ fn construct_union_sql_hierarchical(
         } else {
             String::new()
         };
+        // The query's own `col = const` filters are neutralized once a rollup
+        // rewrite is applied, so every arm (including the raw base-table arm
+        // that serves dirty slices) must carry the scope filter itself.
         let scope_pred = scope_vals
             .iter()
-            .filter(|(col, _)| is_rollup && rollup_cols.contains(col))
+            .filter(|(col, _)| !is_rollup || rollup_cols.contains(col))
             .map(|(col, val)| {
                 format!(
                     " AND \"{}\" = '{}'",
