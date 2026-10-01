@@ -595,6 +595,86 @@ fn spiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL"))
     hooks::reactive_refresh(view_name, where_clause.map(|s| s.to_string()));
 }
 
+/// Load a large batch into a Spiral base table without paying for per-row
+/// change tracking, then bring every tier up to date with one set-based pass.
+///
+/// Runs in the caller's transaction:
+///   1. takes a SHARE ROW EXCLUSIVE lock (concurrent writers wait, so no change
+///      is missed while tracking is off),
+///   2. disables the change-tracking triggers,
+///   3. runs `load_sql` (typically an INSERT ... SELECT or COPY-equivalent),
+///   4. re-enables the triggers,
+///   5. records one changelog entry for `[t_from, t_to)` (the whole table when
+///      NULL) and refreshes all tiers from it.
+///
+/// If `load_sql` fails the transaction aborts and the triggers are restored.
+/// Changes made inside `[t_from, t_to)` but outside `load_sql` are picked up too,
+/// because the tiers for that range are rebuilt from the base table.
+/// Returns the number of rows touched by `load_sql`.
+#[pg_extern(name = "spiral_bulk_load")]
+fn spiral_bulk_load(
+    relation: &str,
+    load_sql: &str,
+    t_from: default!(Option<TimestampWithTimeZone>, "NULL"),
+    t_to: default!(Option<TimestampWithTimeZone>, "NULL"),
+) -> i64 {
+    let is_root = catalog::get_metadata(relation)
+        .map(|m| m.parent_view == m.base_view || m.parent_view == "BASE")
+        .unwrap_or(false);
+    if !is_root {
+        error!(
+            "spiral_bulk_load: '{}' is not a Spiral base table (tiers are filled from it)",
+            relation
+        );
+    }
+    let quoted = format!("\"{}\"", relation.replace('"', "\"\""));
+    let events = ["insert", "update", "delete"];
+
+    Spi::run(&format!(
+        "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+        quoted
+    ))
+    .unwrap_or_else(|e| error!("spiral_bulk_load: cannot lock '{}': {}", relation, e));
+
+    // Same unquoted naming as install_changelog_triggers, so identifier folding matches.
+    for ev in events {
+        Spi::run(&format!(
+            "ALTER TABLE {} DISABLE TRIGGER spiral_track_{}_{}",
+            quoted, relation, ev
+        ))
+        .unwrap_or_else(|e| error!("spiral_bulk_load: cannot disable tracking: {}", e));
+    }
+
+    let loaded =
+        Spi::connect_mut(|client| client.update(load_sql, None, &[]).map(|t| t.len() as i64))
+            .unwrap_or_else(|e| error!("spiral_bulk_load: load statement failed: {}", e));
+
+    for ev in events {
+        Spi::run(&format!(
+            "ALTER TABLE {} ENABLE TRIGGER spiral_track_{}_{}",
+            quoted, relation, ev
+        ))
+        .unwrap_or_else(|e| error!("spiral_bulk_load: cannot re-enable tracking: {}", e));
+    }
+
+    Spi::connect_mut(|client| {
+        client.update(
+            "INSERT INTO spiral.changelog (base_view, t_start, t_end)
+             VALUES ($1,
+                     CASE WHEN $2::timestamptz IS NULL THEN 0 ELSE spiral($2::timestamptz) END,
+                     CASE WHEN $3::timestamptz IS NULL THEN 2147483647 ELSE spiral($3::timestamptz) END)
+             ON CONFLICT DO NOTHING",
+            None,
+            &[relation.into(), t_from.into(), t_to.into()],
+        )?;
+        Ok::<(), spi::Error>(())
+    })
+    .unwrap_or_else(|e| error!("spiral_bulk_load: cannot record range: {}", e));
+
+    hooks::reactive_refresh(relation, None);
+    loaded
+}
+
 /// Refresh a single scope identified by its scope_values JSONB text.
 /// Building block for parallel dispatch: callers can invoke this concurrently
 /// across scopes (e.g. via pg_background) to achieve N-scope parallelism.
@@ -883,6 +963,100 @@ mod tests {
         Spi::run("SELECT spiral_refresh('ptr')").unwrap();
         assert_eq!(day_total(1), 600, "tenant move, source group");
         assert_eq!(day_total(2), 900, "tenant move, target group");
+    }
+
+    fn bulk_table() {
+        Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+        Spi::run(
+            "CREATE TABLE blk (
+                t timestamptz NOT NULL,
+                grp_id bigint NOT NULL,
+                val integer DEFAULT 0 -- Spiral: sum
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'grp_id');",
+        )
+        .unwrap();
+    }
+
+    fn blk_total(tier: &str, grp: i64) -> i64 {
+        Spi::get_one::<i64>(&format!(
+            "SELECT coalesce(sum(val), 0)::bigint FROM {tier} WHERE grp_id = {grp}"
+        ))
+        .unwrap()
+        .unwrap_or(0)
+    }
+
+    fn blk_changelog() -> i64 {
+        Spi::get_one::<i64>("SELECT count(*) FROM spiral.changelog WHERE base_view = 'blk'")
+            .unwrap()
+            .unwrap_or(0)
+    }
+
+    #[pg_test]
+    fn test_bulk_load_into_empty_table_builds_all_tiers() {
+        bulk_table();
+        let n = Spi::get_one::<i64>(
+            "SELECT spiral_bulk_load('blk', $q$
+                INSERT INTO blk
+                SELECT '2024-03-01 09:00+00'::timestamptz + interval '30 minutes' * s, g, 100
+                FROM generate_series(0, 7) s, generate_series(1, 2) g
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(blk_changelog(), 0, "changelog fully consumed");
+        for g in [1, 2] {
+            assert_eq!(blk_total("blk_30m", g), 800);
+            assert_eq!(blk_total("blk_1d", g), 800);
+        }
+    }
+
+    #[pg_test]
+    fn test_bulk_load_into_populated_range_and_incremental_after() {
+        bulk_table();
+        Spi::run(
+            "SELECT spiral_bulk_load('blk', $q$
+                INSERT INTO blk
+                SELECT '2024-03-01 09:00+00'::timestamptz + interval '30 minutes' * s, 1, 100
+                FROM generate_series(0, 7) s
+             $q$)",
+        )
+        .unwrap();
+        assert_eq!(blk_total("blk_1d", 1), 800);
+
+        // a second load into a later day, limited to that day, must not disturb the first
+        Spi::run(
+            "SELECT spiral_bulk_load('blk', $q$
+                INSERT INTO blk
+                SELECT '2024-03-02 09:00+00'::timestamptz + interval '30 minutes' * s, 1, 10
+                FROM generate_series(0, 7) s
+             $q$, '2024-03-02 00:00+00', '2024-03-03 00:00+00')",
+        )
+        .unwrap();
+        assert_eq!(blk_total("blk_1d", 1), 880);
+        assert_eq!(blk_changelog(), 0);
+
+        // tracking is back on: a normal change followed by a normal refresh is applied
+        Spi::run("UPDATE blk SET val = 500 WHERE grp_id = 1 AND t = '2024-03-01 09:00+00'")
+            .unwrap();
+        assert!(blk_changelog() > 0, "triggers re-enabled after bulk load");
+        Spi::run("SELECT spiral_refresh('blk')").unwrap();
+        assert_eq!(blk_total("blk_1d", 1), 1280);
+    }
+
+    #[pg_test(error = "division by zero")]
+    fn test_bulk_load_propagates_failing_load_statement() {
+        bulk_table();
+        Spi::run("SELECT spiral_bulk_load('blk', 'INSERT INTO blk SELECT now(), 1, 1/0')").unwrap();
+    }
+
+    #[pg_test]
+    fn test_bulk_load_rejects_non_base_relation() {
+        bulk_table();
+        let r = std::panic::catch_unwind(|| {
+            let _ = Spi::run("SELECT spiral_bulk_load('blk_1d', 'SELECT 1')");
+        });
+        assert!(r.is_err());
     }
 
     #[pg_test]
