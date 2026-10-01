@@ -409,7 +409,7 @@ fn refresh_incremental(
                  WHERE c.base_view = '{safe_key}'
                    AND {source_changelog_scope_match}
                    AND spiral(s.\"{source_time_col}\") >= (c.t_start/{frame_seconds})*{frame_seconds}
-                   AND spiral(s.\"{source_time_col}\") < c.t_end
+                   AND spiral(s.\"{source_time_col}\") < ((c.t_end + {frame_seconds} - 1)/{frame_seconds})*{frame_seconds}
              )
              {extra_filter}
              GROUP BY {group_by_clause}
@@ -832,6 +832,57 @@ mod tests {
 
         let res = Spi::run("SELECT date_trunc('day', t), user_id, sum(tracked) FROM acts3 WHERE t >= '2024-02-01' AND t < '2024-06-01' GROUP BY 1,2;");
         assert!(res.is_ok());
+    }
+
+    /// A change to one child bucket must re-aggregate the whole parent bucket,
+    /// not only the part of it up to the end of the dirty range. Covers update,
+    /// delete and tenant move on a non-final slot of a day.
+    #[pg_test]
+    fn test_parent_tier_refresh_covers_whole_bucket() {
+        Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+        Spi::run(
+            "CREATE TABLE ptr (
+                t timestamptz NOT NULL,
+                grp_id bigint NOT NULL,
+                val integer DEFAULT 0 -- Spiral: sum
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'grp_id');",
+        )
+        .unwrap();
+        // 2 groups x 8 half-hour slots in one UTC day, 100 per slot
+        Spi::run(
+            "INSERT INTO ptr
+             SELECT '2024-03-01 09:00+00'::timestamptz + interval '30 minutes' * s, g, 100
+             FROM generate_series(0, 7) s, generate_series(1, 2) g",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('ptr')").unwrap();
+
+        let day_total = |grp: i64| -> i64 {
+            Spi::get_one::<i64>(&format!(
+                "SELECT val::bigint FROM ptr_1d WHERE grp_id = {grp}"
+            ))
+            .unwrap()
+            .unwrap_or(0)
+        };
+        assert_eq!((day_total(1), day_total(2)), (800, 800));
+
+        // update the first slot of the day
+        Spi::run("UPDATE ptr SET val = 1000 WHERE grp_id = 1 AND t = '2024-03-01 09:00+00'")
+            .unwrap();
+        Spi::run("SELECT spiral_refresh('ptr')").unwrap();
+        assert_eq!(day_total(1), 1700, "update of first slot");
+
+        // delete the first slot of the day
+        Spi::run("DELETE FROM ptr WHERE grp_id = 1 AND t = '2024-03-01 09:00+00'").unwrap();
+        Spi::run("SELECT spiral_refresh('ptr')").unwrap();
+        assert_eq!(day_total(1), 700, "delete of first slot");
+
+        // move an early slot to the other group
+        Spi::run("UPDATE ptr SET grp_id = 2 WHERE grp_id = 1 AND t = '2024-03-01 09:30+00'")
+            .unwrap();
+        Spi::run("SELECT spiral_refresh('ptr')").unwrap();
+        assert_eq!(day_total(1), 600, "tenant move, source group");
+        assert_eq!(day_total(2), 900, "tenant move, target group");
     }
 
     #[pg_test]

@@ -62,7 +62,7 @@ pub fn get_timeline(table_name: &str) -> Vec<TimelineEpoch> {
 
     let epochs = Spi::connect_mut(|client| {
         let sql = format!(
-            "SELECT start_t, COALESCE(end_t, 9223372036854775807), tenant_scale, base_offse
+            "SELECT start_t, COALESCE(end_t, 9223372036854775807), tenant_scale, base_offset
              FROM spiral.tenants_timeline
              WHERE table_name = '{}'
              ORDER BY start_t ASC",
@@ -129,7 +129,7 @@ pub fn reverse_slot_index(
         return (slot_index / fallback_scale, slot_index % fallback_scale);
     }
 
-    // Since base_offset grows, we can find the epoch by finding the last one where slot_index >= base_offse
+    // Since base_offset grows, we can find the epoch by finding the last one where slot_index >= base_offset
     let mut target_epoch = &epochs[0];
     for epoch in epochs.iter().rev() {
         if slot_index >= epoch.base_offset {
@@ -163,7 +163,7 @@ fn spiral_metadata_table_exists() -> bool {
     }
     let exists = Spi::connect_mut(|client| {
         Ok::<bool, spi::Error>(
-            !clien
+            !client
                 .select(
                     "SELECT 1 FROM information_schema.tables
                  WHERE table_schema = 'spiral' AND table_name = 'metadata' LIMIT 1",
@@ -242,7 +242,7 @@ pub fn get_metadata(view_name: &str) -> Option<Metadata> {
         }))
     }).unwrap_or_default();
     METADATA_CACHE.with(|c| c.borrow_mut().insert(view_name.to_string(), result.clone()));
-    resul
+    result
 }
 
 pub fn get_children(view_name: &str) -> Vec<String> {
@@ -298,7 +298,7 @@ pub fn insert_metadata(
         parent_view.replace("'", "''"),
         frame_seconds,
         base_view.replace("'", "''"),
-        scope_cols_json.replace("[", "{").replace("]", "}"), // Simple array forma
+        scope_cols_json.replace("[", "{").replace("]", "}"), // Simple array format
         metadata_json.replace("'", "''")
     );
     let _ = Spi::run(&sql);
@@ -362,7 +362,7 @@ pub fn unify_changelog_scope(base_view: &str, scope_json: &str) {
                     COALESCE(t_start, -9223372036854775808) as ts_safe,
                     COALESCE(t_end, 9223372036854775807) as te_safe,
                     MAX(COALESCE(t_end, 9223372036854775807)) OVER (PARTITION BY base_view, scope_values ORDER BY COALESCE(t_start, -9223372036854775808) ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
-                FROM scope_cl_snapsho
+                FROM scope_cl_snapshot
             ) s1
          ) s2
          GROUP BY base_view, scope_values, grp");
@@ -394,7 +394,7 @@ pub fn unify_changelog(base_view: &str) {
                     COALESCE(t_start, -9223372036854775808) as ts_safe,
                     COALESCE(t_end, 9223372036854775807) as te_safe,
                     MAX(COALESCE(t_end, 9223372036854775807)) OVER (PARTITION BY base_view, scope_values ORDER BY COALESCE(t_start, -9223372036854775808) ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) as prev_end
-                FROM changelog_snapsho
+                FROM changelog_snapshot
             ) s1
          ) s2
          GROUP BY base_view, scope_values, grp").unwrap();
@@ -410,7 +410,7 @@ pub fn unify_changelog(base_view: &str) {
 
 /// Groups dirty changelog scopes sharing an identical (t_start, t_end) range
 /// into batches capped at `max_scopes_per_batch`, so a single wide bulk-load
-/// range touching thousands of scopes doesn't produce either a gian
+/// range touching thousands of scopes doesn't produce either a giant
 /// `scope_values IN (...)` clause or a one-scope-at-a-time refresh loop.
 /// Call after `unify_changelog` so ranges are already merged per scope.
 pub fn coalesce_changelog_batches(base_view: &str, max_scopes_per_batch: i64) -> Vec<Vec<String>> {
@@ -426,7 +426,7 @@ pub fn coalesce_changelog_batches(base_view: &str, max_scopes_per_batch: i64) ->
             max_scopes_per_batch, safe_bv
         );
         Ok::<Vec<Vec<String>>, spi::Error>(
-            clien
+            client
                 .select(&sql, None, &[])?
                 .map(|r| r.get::<Vec<String>>(1).unwrap().unwrap_or_default())
                 .collect(),
@@ -536,7 +536,7 @@ pub fn get_offset_columns(view_name: &str) -> Vec<OffsetColumn> {
             view_name.replace("'", "''")
         );
         Ok::<Vec<OffsetColumn>, spi::Error>(
-            clien
+            client
                 .select(&sql, None, &[])?
                 .map(|r| OffsetColumn {
                     mat_column: r.get::<String>(1).unwrap().unwrap(),
@@ -577,7 +577,7 @@ pub fn remove_table_from_spiral(table_name: &str) {
     // on the base table, so DROP TABLE base CASCADE won't reach them.
     let hierarchy_tables: Vec<String> = Spi::connect_mut(|client| {
         Ok::<Vec<String>, spi::Error>(
-            clien
+            client
                 .select(
                     &format!(
                         "SELECT view_name FROM spiral.metadata
