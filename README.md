@@ -318,6 +318,47 @@ CREATE TABLE ticks (
 -- SELECT spiral_refresh('ticks');
 ```
 
+### Bulk Loading
+
+Every row written to a Spiral table is tracked in `spiral.changelog` by a statement trigger, and `spiral_refresh` then replays that log. For a large backfill the log itself becomes the cost: one entry per `(scope, bucket)`, joined back against the base table.
+
+`spiral_bulk_load` skips the per-row tracking for one load and brings every tier up to date with a single set-based pass:
+
+```sql
+SELECT spiral_bulk_load(
+    'ticks',
+    $$ INSERT INTO ticks SELECT ... FROM staging $$,
+    t_from => '2026-03-01',   -- optional: limit the rebuild to [t_from, t_to)
+    t_to   => '2026-04-01'
+);
+```
+
+What it does, in the caller's transaction:
+
+1. Takes a `SHARE ROW EXCLUSIVE` lock, so concurrent writers wait and no change can be missed while tracking is off.
+2. Disables the change-tracking triggers.
+3. Runs `load_sql`.
+4. Re-enables the triggers.
+5. Records one changelog entry for `[t_from, t_to)` (the whole table when omitted) and refreshes all tiers from it, using the same tier logic as `spiral_refresh`, so every column kind (`sum`, `stats`, `ohlcv`, ...) is handled.
+
+If `load_sql` fails, the transaction aborts and the triggers are restored. It returns the number of rows processed by `load_sql`.
+
+Notes:
+
+- Pass `t_from`/`t_to` for incremental loads. Without them the whole table is rebuilt, which is correct but scans everything.
+- Rows changed inside the range by other statements in the same transaction are picked up too, because the range is rebuilt from the base table.
+- After the call tracking is back on, so ordinary inserts, updates and deletes followed by `spiral_refresh` work as usual.
+- It only accepts a base table (the one created with `spiral.frames`), not a tier.
+
+Indicative numbers on a synthetic multi-tenant table (8 half-hour slots per tenant per weekday, `spiral.frames = '30m,1d'`, composite tenant `(project_id, user_id)`):
+
+| Rows | Tenants | Insert + `spiral_refresh` | `spiral_bulk_load` |
+|---|---|---|---|
+| 1.44M | 30k | 126 s | 17 s |
+| 8M | 166k | > 1 h (did not finish) | 110 s |
+
+Tier contents were compared with a `GROUP BY` over the base table after each run and matched exactly.
+
 ## 🧪 Benchmarks & Examples
 
 - **[Examples](examples/)**: Hands-on walkthroughs from basic to advanced.
