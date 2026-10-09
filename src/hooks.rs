@@ -1269,6 +1269,11 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                 continue;
                             }
 
+                            if !blob_aggregate_args_are_plain(query, varno, relid, &base_table) {
+                                notice!("Spiral: aggregate over an expression of a stats-style column for '{}', falling back to RAW scan.", base_table);
+                                continue;
+                            }
+
                             let mut supported = true;
                             for seg in &segments {
                                 if seg.source != base_table
@@ -1636,6 +1641,116 @@ unsafe fn where_cols_are_tier_columns(
             return false;
         }
     }
+}
+
+/// Tiers keep stats/tdigest/sketch/ohlcv columns as opaque merge states that only the Spiral merge
+/// aggregates can read. An aggregate over an *expression* of such a column (`max(val * 2)`) would apply
+/// plain arithmetic to those bytes, so those queries have to be answered from the raw table. Plain
+/// columns (the `sum` formula) are unaffected: `sum(val * 2)` stays accelerated.
+unsafe fn blob_aggregate_args_are_plain(
+    query: *mut pg_sys::Query,
+    varno: i32,
+    relid: pg_sys::Oid,
+    base_table: &str,
+) -> bool {
+    let blob_cols: std::collections::HashSet<String> = Spi::connect(|client| {
+        let q = format!(
+            "SELECT base_column FROM spiral.sources \
+             WHERE formula IN ('stats', 'tdigest', 'sketch', 'ohlcv') \
+               AND view_name = (SELECT view_name FROM spiral.metadata \
+                                WHERE base_view = '{}' AND frame_seconds > 0 LIMIT 1)",
+            base_table.replace('\'', "''")
+        );
+        let mut cols = std::collections::HashSet::new();
+        for row in client.select(&q, None, &[])? {
+            if let Ok(Some(c)) = row.get::<String>(1) {
+                cols.insert(c);
+            }
+        }
+        Ok::<_, spi::Error>(cols)
+    })
+    .unwrap_or_default();
+    if blob_cols.is_empty() || (*query).targetList.is_null() {
+        return true;
+    }
+
+    unsafe fn visit(
+        node: *mut pg_sys::Node,
+        varno: i32,
+        relid: pg_sys::Oid,
+        blob_cols: &std::collections::HashSet<String>,
+    ) -> bool {
+        if node.is_null() {
+            return true;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_Aggref => {
+                let agg = node as *mut pg_sys::Aggref;
+                if (*agg).args.is_null() || (*(*agg).args).length < 1 {
+                    return true;
+                }
+                let te = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
+                let arg = strip_relabel((*te).expr as *mut pg_sys::Node);
+                if arg.is_null() || (*arg).type_ == pg_sys::NodeTag::T_Var {
+                    return true;
+                }
+                let mut attnos: *mut pg_sys::Bitmapset = std::ptr::null_mut();
+                pg_sys::pull_varattnos(arg, varno as pg_sys::Index, &mut attnos);
+                let mut member = -1;
+                loop {
+                    member = pg_sys::bms_next_member(attnos, member);
+                    if member < 0 {
+                        return true;
+                    }
+                    let attno = member + pg_sys::FirstLowInvalidHeapAttributeNumber;
+                    if attno <= 0 {
+                        continue;
+                    }
+                    let name_ptr = pg_sys::get_attname(relid, attno as i16, true);
+                    if !name_ptr.is_null()
+                        && blob_cols.contains(CStr::from_ptr(name_ptr).to_string_lossy().as_ref())
+                    {
+                        return false;
+                    }
+                }
+            }
+            pg_sys::NodeTag::T_OpExpr => {
+                let args = (*(node as *mut pg_sys::OpExpr)).args;
+                (0..if args.is_null() { 0 } else { (*args).length }).all(|i| {
+                    visit(
+                        pg_sys::list_nth(args, i) as *mut pg_sys::Node,
+                        varno,
+                        relid,
+                        blob_cols,
+                    )
+                })
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let args = (*(node as *mut pg_sys::FuncExpr)).args;
+                (0..if args.is_null() { 0 } else { (*args).length }).all(|i| {
+                    visit(
+                        pg_sys::list_nth(args, i) as *mut pg_sys::Node,
+                        varno,
+                        relid,
+                        blob_cols,
+                    )
+                })
+            }
+            pg_sys::NodeTag::T_RelabelType => visit(
+                (*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node,
+                varno,
+                relid,
+                blob_cols,
+            ),
+            _ => true,
+        }
+    }
+
+    let target_list = (*query).targetList;
+    (0..(*target_list).length).all(|i| {
+        let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+        visit((*tle).expr as *mut pg_sys::Node, varno, relid, &blob_cols)
+    })
 }
 
 #[derive(Debug)]
@@ -2634,7 +2749,11 @@ pub(crate) unsafe fn rewrite_query_aggregates(
                                         formula = f;
                                     }
                                 }
-                                pg_sys::pfree(varname_ptr as *mut std::ffi::c_void);
+                                // Not freed: for anything but a plain relation RTE (the hook has already
+                                // turned the base table into a subquery RTE) this points into the RTE's
+                                // own column-name list. Freeing it left the name to be overwritten by the
+                                // next allocation, so every aggregate after the first looked up the wrong
+                                // column and kept its stock implementation.
                             }
                         }
                         if (*var).vartype == pg_sys::BYTEAOID {
