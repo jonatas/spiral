@@ -1059,6 +1059,106 @@ mod tests {
         assert!(r.is_err());
     }
 
+    /// Result of `q` as text, with the planner hook on or off. Off is the raw-table ground truth.
+    fn rows_as_text(hook: bool, q: &str) -> String {
+        Spi::run(&format!(
+            "SET spiral.enable_planner_hook = {}",
+            if hook { "on" } else { "off" }
+        ))
+        .unwrap();
+        Spi::get_one::<String>(&format!(
+            "SELECT string_agg(x::text, ';' ORDER BY x::text) FROM ({q}) x"
+        ))
+        .unwrap()
+        .unwrap_or_default()
+    }
+
+    fn assert_same_with_and_without_hook(q: &str) {
+        let accelerated = rows_as_text(true, q);
+        let raw = rows_as_text(false, q);
+        assert_eq!(accelerated, raw, "hook on vs off differ for: {q}");
+    }
+
+    /// 3 users x 4 days x 8 half-hour slots with integral values, refreshed.
+    fn agg_table(name: &str, formula: &str) {
+        Spi::run(&format!(
+            "CREATE TABLE {name} (
+                t timestamptz NOT NULL,
+                user_id bigint NOT NULL,
+                val double precision -- Spiral: {formula}
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'user_id');"
+        ))
+        .unwrap();
+        Spi::run(&format!(
+            "INSERT INTO {name}
+             SELECT '2026-03-01 09:00+00'::timestamptz + d * interval '1 day' + s * interval '30 minutes',
+                    u, u * 100 + d * 10 + s
+             FROM generate_series(1, 3) u, generate_series(0, 3) d, generate_series(0, 7) s"
+        ))
+        .unwrap();
+        Spi::run(&format!("SELECT spiral_refresh('{name}')")).unwrap();
+    }
+
+    /// Every aggregate in a query has to be rewritten to its merge version. The rewrite used to free a
+    /// column name that still belonged to the range-table entry, so the second aggregate onwards looked
+    /// up the wrong column, kept its stock implementation and read the stored stats state as a double.
+    #[pg_test]
+    fn test_several_aggregates_on_a_stats_column_match_raw() {
+        agg_table("sdm", "stats");
+        for q in [
+            "SELECT min(val), max(val) FROM sdm",
+            "SELECT max(val), min(val) FROM sdm",
+            "SELECT sum(val), avg(val) FROM sdm",
+            "SELECT min(val), min(val) FROM sdm",
+            "SELECT min(val), max(val), sum(val) FROM sdm",
+            "SELECT max(val) - min(val) FROM sdm",
+            "SELECT user_id, min(val), max(val) FROM sdm GROUP BY user_id",
+            "SELECT 1 AS x, min(val), max(val) FROM sdm",
+            "SELECT sum(val), avg(val), min(val), max(val) FROM sdm WHERE user_id = 2",
+            "SELECT min(val), max(val), sum(val) FROM sdm \
+             WHERE t >= '2026-03-02' AND t < '2026-03-04'",
+        ] {
+            assert_same_with_and_without_hook(q);
+        }
+    }
+
+    /// An aggregate over an expression of a stats column cannot be computed from the stored state. It used
+    /// to apply float arithmetic to the state bytes and crash the backend; it must read the raw table.
+    #[pg_test]
+    fn test_aggregate_over_stats_expression_falls_back_to_raw() {
+        agg_table("sde", "stats");
+        for q in [
+            "SELECT max(val * 2) FROM sde",
+            "SELECT sum(val + 1) FROM sde",
+            "SELECT min(val), max(val * 2) FROM sde",
+            "SELECT max(val::numeric) FROM sde",
+        ] {
+            assert_same_with_and_without_hook(q);
+        }
+    }
+
+    /// The fallback above is only for stats-style columns: a plain sum column keeps being served from its tier.
+    #[pg_test]
+    fn test_aggregate_over_sum_expression_stays_accelerated() {
+        agg_table("sds", "sum");
+        assert_same_with_and_without_hook("SELECT sum(val * 3) FROM sds");
+        assert_same_with_and_without_hook("SELECT sum(val * 3), sum(val) FROM sds");
+        Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+        let plan = Spi::connect(|client| {
+            let mut text = String::new();
+            for row in client.select("EXPLAIN SELECT sum(val * 3) FROM sds", None, &[])? {
+                text.push_str(&row.get::<String>(1)?.unwrap_or_default());
+                text.push('\n');
+            }
+            Ok::<String, spi::Error>(text)
+        })
+        .unwrap();
+        assert!(
+            plan.contains("sds_1d"),
+            "expected the 1d tier in the plan, got:\n{plan}"
+        );
+    }
+
     #[pg_test]
     fn test_catalog_is_spiral_relation() {
         // Initially should be false for a random table
@@ -2650,6 +2750,133 @@ mod tests {
             has_unique,
             "scoped rollup must have UNIQUE index on (t, tenant)"
         );
+    }
+
+    // A query pinning only SOME tenant columns, or mixing raw dirty slices with
+    // tier slices, must still match the raw scan before any refresh.
+    #[pg_test]
+    fn test_scoped_query_with_dirty_slices_matches_raw() {
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run(
+            "CREATE TABLE scoped_dirty (
+                t          timestamptz NOT NULL,
+                project_id bigint NOT NULL,
+                user_id    bigint NOT NULL,
+                core       integer -- Spiral: sum
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'project_id,user_id')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO scoped_dirty
+             SELECT '2026-03-01 00:00+00'::timestamptz + d * interval '1 day' + s * interval '30 minutes',
+                    1 + u % 3, u, d + s + u
+             FROM generate_series(0, 2) d, generate_series(1, 6) u, generate_series(0, 47) s",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('scoped_dirty')").unwrap();
+
+        // Dirty write for (project 3, user 6) in a closed day, not refreshed.
+        Spi::run("INSERT INTO scoped_dirty VALUES ('2026-03-02 10:15+00', 1, 6, 1000)").unwrap();
+
+        let queries = [
+            // subset of the tenant tuple
+            "SELECT sum(core) FROM scoped_dirty WHERE user_id = 6",
+            "SELECT sum(core) FROM scoped_dirty WHERE project_id = 1",
+            "SELECT sum(core) FROM scoped_dirty
+              WHERE t >= '2026-03-01 00:00+00' AND t < '2026-03-04 00:00+00' AND user_id = 6",
+            // full tenant tuple: dirty slice is read from the raw arm, which must
+            // carry the tenant filter itself
+            "SELECT sum(core) FROM scoped_dirty
+              WHERE t >= '2026-03-01 00:00+00' AND t < '2026-03-04 00:00+00'
+                AND project_id = 1 AND user_id = 6",
+            // misaligned bounds: raw edge slices next to a tier slice
+            "SELECT sum(core) FROM scoped_dirty
+              WHERE t >= '2026-03-02 10:07+00' AND t < '2026-03-02 13:41+00' AND user_id = 6",
+        ];
+        for q in queries {
+            Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+            let accelerated: Option<i64> = Spi::get_one(q).unwrap();
+            Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+            let raw: Option<i64> = Spi::get_one(q).unwrap();
+            Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+            assert_eq!(accelerated, raw, "accelerated != raw for: {q}");
+        }
+    }
+
+    // Tiers keep only the time bucket, the tenant columns and the aggregated
+    // columns: filtering or grouping on any other column must read the raw table.
+    #[pg_test]
+    fn test_non_tenant_column_queries_match_raw() {
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run(
+            "CREATE TABLE non_tenant (
+                t          timestamptz NOT NULL,
+                project_id bigint NOT NULL,
+                user_id    bigint NOT NULL,
+                core       integer -- Spiral: sum
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'user_id')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO non_tenant
+             SELECT '2026-03-01 00:00+00'::timestamptz + d * interval '1 day' + s * interval '30 minutes',
+                    1 + u % 3, u, d + s + u
+             FROM generate_series(0, 2) d, generate_series(1, 6) u, generate_series(0, 47) s",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('non_tenant')").unwrap();
+
+        let queries = [
+            "SELECT sum(core)::text FROM non_tenant WHERE project_id = 2",
+            "SELECT sum(core)::text FROM non_tenant WHERE project_id IN (1, 3)",
+            "SELECT string_agg(project_id || ':' || s, ',' ORDER BY project_id)
+               FROM (SELECT project_id, sum(core) s FROM non_tenant GROUP BY 1) x",
+            "SELECT sum(core)::text FROM non_tenant
+              WHERE t >= '2026-03-02 00:00+00' AND t < '2026-03-03 00:00+00' AND project_id = 2",
+        ];
+        for q in queries {
+            Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+            let accelerated: Option<String> = Spi::get_one(q).unwrap();
+            Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+            let raw: Option<String> = Spi::get_one(q).unwrap();
+            Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+            assert_eq!(accelerated, raw, "accelerated != raw for: {q}");
+        }
+    }
+
+    // count(*) over a range with raw edge slices next to a tier slice builds a
+    // non-flattened union; the planner used to index past the relation's
+    // column list and crash the backend.
+    #[pg_test]
+    fn test_count_star_with_raw_edges_and_tier_slice() {
+        Spi::run("SET timezone = 'UTC'").unwrap();
+        Spi::run(
+            "CREATE TABLE count_edges (
+                t       timestamptz NOT NULL,
+                user_id bigint NOT NULL,
+                val     double precision -- Spiral: stats
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'user_id')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO count_edges
+             SELECT '2026-03-01 00:00+00'::timestamptz + d * interval '1 day'
+                      + s * interval '30 minutes' + r * interval '1 minute',
+                    u, d + s + u + r
+             FROM generate_series(0, 2) d, generate_series(1, 4) u,
+                  generate_series(0, 47) s, generate_series(0, 2) r",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('count_edges')").unwrap();
+
+        let q = "SELECT count(*) FROM count_edges
+                  WHERE t >= '2026-03-02 10:07+00' AND t < '2026-03-02 13:41+00'";
+        Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+        let accelerated: Option<i64> = Spi::get_one(q).unwrap();
+        Spi::run("SET spiral.enable_planner_hook = off").unwrap();
+        let raw: Option<i64> = Spi::get_one(q).unwrap();
+        Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+        assert_eq!(accelerated, raw);
     }
 
     // issue #68: dirty range [t, t+bucket) must not mark the next frame dirty
