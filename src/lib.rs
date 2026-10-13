@@ -1159,6 +1159,56 @@ mod tests {
         );
     }
 
+    /// Tiers hold per-bucket totals for a plain sum column. A constant added inside `sum()` would be
+    /// added once per bucket, and min/max/avg/count would see bucket totals, so those read the raw table.
+    #[pg_test]
+    fn test_non_linear_aggregates_on_a_sum_column_match_raw() {
+        agg_table("sdn", "sum");
+        for q in [
+            "SELECT sum(val + 1) FROM sdn",
+            "SELECT sum(1 + val) FROM sdn",
+            "SELECT sum(val - 5) FROM sdn",
+            "SELECT sum(val * val) FROM sdn",
+            "SELECT sum(-val) FROM sdn",
+            "SELECT sum(val * 3 - val) FROM sdn",
+            "SELECT sum(val), sum(val + 1) FROM sdn",
+            "SELECT min(val), max(val) FROM sdn",
+            "SELECT avg(val), count(val) FROM sdn",
+            "SELECT user_id, min(val), max(val) FROM sdn GROUP BY user_id",
+            "SELECT sum(val + 1) FROM sdn WHERE t >= '2026-03-02' AND t < '2026-03-04'",
+            "SELECT max(val) - min(val) FROM sdn",
+        ] {
+            assert_same_with_and_without_hook(q);
+        }
+    }
+
+    #[pg_test]
+    fn test_linear_aggregates_on_a_sum_column_stay_accelerated() {
+        agg_table("sdl", "sum");
+        for q in [
+            "SELECT sum(val) FROM sdl",
+            "SELECT sum(val * 3) FROM sdl",
+            "SELECT sum(3 * val) FROM sdl",
+            "SELECT sum(val / 2) FROM sdl",
+        ] {
+            assert_same_with_and_without_hook(q);
+            Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+            let plan = Spi::connect(|client| {
+                let mut text = String::new();
+                for row in client.select(&format!("EXPLAIN {q}"), None, &[])? {
+                    text.push_str(&row.get::<String>(1)?.unwrap_or_default());
+                    text.push('\n');
+                }
+                Ok::<String, spi::Error>(text)
+            })
+            .unwrap();
+            assert!(
+                plan.contains("sdl_1d"),
+                "expected the 1d tier in the plan for {q}, got:\n{plan}"
+            );
+        }
+    }
+
     #[pg_test]
     fn test_catalog_is_spiral_relation() {
         // Initially should be false for a random table

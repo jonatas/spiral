@@ -1269,8 +1269,8 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                                 continue;
                             }
 
-                            if !blob_aggregate_args_are_plain(query, varno, relid, &base_table) {
-                                notice!("Spiral: aggregate over an expression of a stats-style column for '{}', falling back to RAW scan.", base_table);
+                            if !aggregates_are_servable(query, varno, relid, &base_table) {
+                                notice!("Spiral: aggregate over '{}' cannot be answered from the tiers, falling back to RAW scan.", base_table);
                                 continue;
                             }
 
@@ -1643,22 +1643,18 @@ unsafe fn where_cols_are_tier_columns(
     }
 }
 
-/// Tiers keep stats/tdigest/sketch/ohlcv columns as opaque merge states that only the Spiral merge
-/// aggregates can read. An aggregate over an *expression* of such a column (`max(val * 2)`) would apply
-/// plain arithmetic to those bytes, so those queries have to be answered from the raw table. Plain
-/// columns (the `sum` formula) are unaffected: `sum(val * 2)` stays accelerated.
-unsafe fn blob_aggregate_args_are_plain(
-    query: *mut pg_sys::Query,
-    varno: i32,
-    relid: pg_sys::Oid,
+/// Names of the source columns of `base_table` stored with the given formulas.
+fn source_columns_with_formulas(
     base_table: &str,
-) -> bool {
-    let blob_cols: std::collections::HashSet<String> = Spi::connect(|client| {
+    formulas: &str,
+) -> std::collections::HashSet<String> {
+    Spi::connect(|client| {
         let q = format!(
             "SELECT base_column FROM spiral.sources \
-             WHERE formula IN ('stats', 'tdigest', 'sketch', 'ohlcv') \
+             WHERE formula IN ({}) \
                AND view_name = (SELECT view_name FROM spiral.metadata \
                                 WHERE base_view = '{}' AND frame_seconds > 0 LIMIT 1)",
+            formulas,
             base_table.replace('\'', "''")
         );
         let mut cols = std::collections::HashSet::new();
@@ -1669,8 +1665,122 @@ unsafe fn blob_aggregate_args_are_plain(
         }
         Ok::<_, spi::Error>(cols)
     })
-    .unwrap_or_default();
-    if blob_cols.is_empty() || (*query).targetList.is_null() {
+    .unwrap_or_default()
+}
+
+/// What the aggregate arguments say about a column set: does the expression read any of `cols`, and is
+/// it a linear function of them (so that summing the expression over buckets equals the bucket-wise sum)?
+struct ArgShape {
+    reads_cols: bool,
+    linear: bool,
+}
+
+/// `Var`, `-Var`, `Var * const`, `Var / const` and sums/differences of such terms are linear in the
+/// plain columns they read. Anything else (`Var + const`, casts that round, function calls, ...) is not.
+unsafe fn arg_shape(
+    node: *mut pg_sys::Node,
+    varno: i32,
+    relid: pg_sys::Oid,
+    cols: &std::collections::HashSet<String>,
+) -> ArgShape {
+    let none = ArgShape {
+        reads_cols: false,
+        linear: false,
+    };
+    let node = strip_relabel(node);
+    if node.is_null() {
+        return none;
+    }
+    match (*node).type_ {
+        pg_sys::NodeTag::T_Var => {
+            let var = node as *mut pg_sys::Var;
+            if (*var).varno != varno || (*var).varattno <= 0 {
+                return none;
+            }
+            let name_ptr = pg_sys::get_attname(relid, (*var).varattno, true);
+            let reads = !name_ptr.is_null()
+                && cols.contains(CStr::from_ptr(name_ptr).to_string_lossy().as_ref());
+            ArgShape {
+                reads_cols: reads,
+                linear: reads,
+            }
+        }
+        pg_sys::NodeTag::T_OpExpr => {
+            let op = node as *mut pg_sys::OpExpr;
+            let args = (*op).args;
+            let n = if args.is_null() { 0 } else { (*args).length };
+            let opname_ptr = pg_sys::get_opname((*op).opno);
+            if opname_ptr.is_null() || !(1..=2).contains(&n) {
+                return none;
+            }
+            let opname = CStr::from_ptr(opname_ptr).to_string_lossy().to_string();
+            let shapes: Vec<ArgShape> = (0..n)
+                .map(|i| {
+                    arg_shape(
+                        pg_sys::list_nth(args, i) as *mut pg_sys::Node,
+                        varno,
+                        relid,
+                        cols,
+                    )
+                })
+                .collect();
+            // A constant may be wrapped in an implicit cast, so test for "reads no column" instead.
+            let is_const = |i: i32| {
+                !pg_sys::contain_var_clause(pg_sys::list_nth(args, i) as *mut pg_sys::Node)
+            };
+            let reads_cols = shapes.iter().any(|s| s.reads_cols);
+            let linear = match (opname.as_str(), n) {
+                ("-", 1) => shapes[0].linear,
+                ("*", 2) => (shapes[0].linear && is_const(1)) || (shapes[1].linear && is_const(0)),
+                ("/", 2) => shapes[0].linear && is_const(1),
+                ("+", 2) | ("-", 2) => shapes[0].linear && shapes[1].linear,
+                _ => false,
+            };
+            ArgShape { reads_cols, linear }
+        }
+        pg_sys::NodeTag::T_FuncExpr => {
+            // Only the implicit widening casts the parser inserts keep linearity.
+            let f = node as *mut pg_sys::FuncExpr;
+            let args = (*f).args;
+            let n = if args.is_null() { 0 } else { (*args).length };
+            let shapes: Vec<ArgShape> = (0..n)
+                .map(|i| {
+                    arg_shape(
+                        pg_sys::list_nth(args, i) as *mut pg_sys::Node,
+                        varno,
+                        relid,
+                        cols,
+                    )
+                })
+                .collect();
+            let reads_cols = shapes.iter().any(|s| s.reads_cols);
+            let implicit_cast = (*f).funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+                && n == 1
+                && shapes[0].linear;
+            ArgShape {
+                reads_cols,
+                linear: implicit_cast,
+            }
+        }
+        _ => none,
+    }
+}
+
+/// Tiers do not hold the raw values, so only some aggregates can be answered from them:
+/// * stats/tdigest/sketch/ohlcv columns are opaque merge states that only the Spiral merge aggregates
+///   read, so an aggregate over an *expression* of one (`max(val * 2)`) has to use the raw table.
+/// * plain `sum` columns hold per-bucket totals. `sum()` of a linear expression of them is exact
+///   (`sum(val * 2)`), but `sum(val + 1)` would add the constant once per bucket, and `min`, `max`,
+///   `avg` or `count` of the column would see bucket totals instead of raw values.
+unsafe fn aggregates_are_servable(
+    query: *mut pg_sys::Query,
+    varno: i32,
+    relid: pg_sys::Oid,
+    base_table: &str,
+) -> bool {
+    let blob_cols = source_columns_with_formulas(base_table, "'stats','tdigest','sketch','ohlcv'");
+    let sum_cols = source_columns_with_formulas(base_table, "'sum'");
+    if (blob_cols.is_empty() && sum_cols.is_empty()) || (*query).targetList.is_null() {
         return true;
     }
 
@@ -1679,6 +1789,7 @@ unsafe fn blob_aggregate_args_are_plain(
         varno: i32,
         relid: pg_sys::Oid,
         blob_cols: &std::collections::HashSet<String>,
+        sum_cols: &std::collections::HashSet<String>,
     ) -> bool {
         if node.is_null() {
             return true;
@@ -1691,28 +1802,21 @@ unsafe fn blob_aggregate_args_are_plain(
                 }
                 let te = pg_sys::list_nth((*agg).args, 0) as *mut pg_sys::TargetEntry;
                 let arg = strip_relabel((*te).expr as *mut pg_sys::Node);
-                if arg.is_null() || (*arg).type_ == pg_sys::NodeTag::T_Var {
+                if arg.is_null() {
                     return true;
                 }
-                let mut attnos: *mut pg_sys::Bitmapset = std::ptr::null_mut();
-                pg_sys::pull_varattnos(arg, varno as pg_sys::Index, &mut attnos);
-                let mut member = -1;
-                loop {
-                    member = pg_sys::bms_next_member(attnos, member);
-                    if member < 0 {
-                        return true;
-                    }
-                    let attno = member + pg_sys::FirstLowInvalidHeapAttributeNumber;
-                    if attno <= 0 {
-                        continue;
-                    }
-                    let name_ptr = pg_sys::get_attname(relid, attno as i16, true);
-                    if !name_ptr.is_null()
-                        && blob_cols.contains(CStr::from_ptr(name_ptr).to_string_lossy().as_ref())
-                    {
-                        return false;
-                    }
+                if (*arg).type_ != pg_sys::NodeTag::T_Var
+                    && arg_shape(arg, varno, relid, blob_cols).reads_cols
+                {
+                    return false;
                 }
+                let on_sum = arg_shape(arg, varno, relid, sum_cols);
+                if !on_sum.reads_cols {
+                    return true;
+                }
+                let name_ptr = pg_sys::get_func_name((*agg).aggfnoid);
+                let is_sum = !name_ptr.is_null() && CStr::from_ptr(name_ptr).to_bytes() == b"sum";
+                is_sum && on_sum.linear
             }
             pg_sys::NodeTag::T_OpExpr => {
                 let args = (*(node as *mut pg_sys::OpExpr)).args;
@@ -1722,6 +1826,7 @@ unsafe fn blob_aggregate_args_are_plain(
                         varno,
                         relid,
                         blob_cols,
+                        sum_cols,
                     )
                 })
             }
@@ -1733,6 +1838,7 @@ unsafe fn blob_aggregate_args_are_plain(
                         varno,
                         relid,
                         blob_cols,
+                        sum_cols,
                     )
                 })
             }
@@ -1741,6 +1847,7 @@ unsafe fn blob_aggregate_args_are_plain(
                 varno,
                 relid,
                 blob_cols,
+                sum_cols,
             ),
             _ => true,
         }
@@ -1749,7 +1856,13 @@ unsafe fn blob_aggregate_args_are_plain(
     let target_list = (*query).targetList;
     (0..(*target_list).length).all(|i| {
         let tle = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
-        visit((*tle).expr as *mut pg_sys::Node, varno, relid, &blob_cols)
+        visit(
+            (*tle).expr as *mut pg_sys::Node,
+            varno,
+            relid,
+            &blob_cols,
+            &sum_cols,
+        )
     })
 }
 
