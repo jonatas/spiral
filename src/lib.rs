@@ -610,6 +610,7 @@ fn spiral_refresh(view_name: &str, where_clause: default!(Option<&str>, "NULL"))
 /// If `load_sql` fails the transaction aborts and the triggers are restored.
 /// Changes made inside `[t_from, t_to)` but outside `load_sql` are picked up too,
 /// because the tiers for that range are rebuilt from the base table.
+/// With `t_from`/`t_to`, a load that writes rows outside the range is rejected (and rolled back).
 /// Returns the number of rows touched by `load_sql`.
 #[pg_extern(name = "spiral_bulk_load")]
 fn spiral_bulk_load(
@@ -629,6 +630,9 @@ fn spiral_bulk_load(
     }
     let quoted = format!("\"{}\"", relation.replace('"', "\"\""));
     let events = ["insert", "update", "delete"];
+    // Command id of this call: rows written by it (not by earlier statements of the transaction) have
+    // cmin >= this value.
+    let first_cid = unsafe { pg_sys::GetCurrentCommandId(false) };
 
     Spi::run(&format!(
         "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
@@ -648,6 +652,38 @@ fn spiral_bulk_load(
     let loaded =
         Spi::connect_mut(|client| client.update(load_sql, None, &[]).map(|t| t.len() as i64))
             .unwrap_or_else(|e| error!("spiral_bulk_load: load statement failed: {}", e));
+
+    // Rows written outside [t_from, t_to) would never be refreshed, leaving the tiers silently stale.
+    // Rows written by this call carry this transaction's xid (a load run inside a
+    // subtransaction, e.g. a plpgsql EXCEPTION block, carries the subtransaction's xid and is not seen).
+    if t_from.is_some() || t_to.is_some() {
+        let time_col = catalog::get_metadata(relation)
+            .and_then(|m| {
+                m.columns_metadata
+                    .get("time_column")
+                    .and_then(|v| v.as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| "t".to_string());
+        let outside = Spi::get_one_with_args::<i64>(
+            &format!(
+                "SELECT count(*) FROM {quoted} WHERE xmin = pg_current_xact_id()::xid \
+                 AND cmin::text::bigint >= {first_cid} \
+                 AND (($1::timestamptz IS NOT NULL AND \"{col}\" < $1::timestamptz) \
+                   OR ($2::timestamptz IS NOT NULL AND \"{col}\" >= $2::timestamptz))",
+                col = time_col.replace('"', "\"\""),
+                first_cid = first_cid
+            ),
+            &[t_from.into(), t_to.into()],
+        )
+        .unwrap_or_else(|e| error!("spiral_bulk_load: cannot check the load range: {}", e))
+        .unwrap_or(0);
+        if outside > 0 {
+            error!(
+                "spiral_bulk_load: load wrote {} row(s) outside [t_from, t_to); widen the range or omit it",
+                outside
+            );
+        }
+    }
 
     for ev in events {
         Spi::run(&format!(
@@ -1042,6 +1078,41 @@ mod tests {
         assert!(blk_changelog() > 0, "triggers re-enabled after bulk load");
         Spi::run("SELECT spiral_refresh('blk')").unwrap();
         assert_eq!(blk_total("blk_1d", 1), 1280);
+    }
+
+    #[pg_test(
+        error = "spiral_bulk_load: load wrote 2 row(s) outside [t_from, t_to); widen the range or omit it"
+    )]
+    fn test_bulk_load_rejects_rows_outside_the_range() {
+        bulk_table();
+        Spi::run(
+            "SELECT spiral_bulk_load('blk', $q$
+                INSERT INTO blk
+                SELECT '2024-03-01 09:00+00'::timestamptz + interval '1 day' * d, 1, 10
+                FROM generate_series(0, 2) d
+             $q$, '2024-03-01 00:00+00', '2024-03-02 00:00+00')",
+        )
+        .unwrap();
+    }
+
+    /// Rows written earlier in the transaction, or by a previous load, are not the range check's business.
+    #[pg_test]
+    fn test_bulk_load_range_check_ignores_earlier_writes() {
+        bulk_table();
+        Spi::run("INSERT INTO blk VALUES ('2024-03-05 09:00+00', 1, 7)").unwrap();
+        Spi::run(
+            "SELECT spiral_bulk_load('blk', $q$
+                INSERT INTO blk VALUES ('2024-03-01 09:00+00', 1, 100)
+             $q$, '2024-03-01 00:00+00', '2024-03-02 00:00+00')",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT spiral_bulk_load('blk', $q$
+                INSERT INTO blk VALUES ('2024-03-02 09:00+00', 1, 10)
+             $q$, '2024-03-02 00:00+00', '2024-03-03 00:00+00')",
+        )
+        .unwrap();
+        assert_eq!(blk_total("blk_1d", 1), 117);
     }
 
     #[pg_test(error = "division by zero")]

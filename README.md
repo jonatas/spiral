@@ -345,6 +345,7 @@ If `load_sql` fails, the transaction aborts and the triggers are restored. It re
 
 Notes:
 
+- With `t_from`/`t_to`, a load that writes rows outside the range is rejected and rolled back, since those rows would never be refreshed. The check scans the table for rows written by the call, so it costs about one table scan. It does not see a load run inside a subtransaction (e.g. a plpgsql `EXCEPTION` block).
 - Pass `t_from`/`t_to` for incremental loads. Without them the whole table is rebuilt, which is correct but scans everything.
 - Rows changed inside the range by other statements in the same transaction are picked up too, because the range is rebuilt from the base table.
 - After the call tracking is back on, so ordinary inserts, updates and deletes followed by `spiral_refresh` work as usual.
