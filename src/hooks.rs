@@ -1219,7 +1219,7 @@ unsafe fn process_query_recursive(query: *mut pg_sys::Query, tz_offset_cache: &m
                             let dirty_ranges =
                                 catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
 
-                            resolve_segments_from_sorted(
+                            resolve_segments_capped(
                                 &base_table,
                                 ts,
                                 te,
@@ -1948,6 +1948,66 @@ fn filter_hierarchy(
 
     sorted_hierarchy.sort_by_key(|h| -h.1);
     sorted_hierarchy
+}
+
+/// Merges the closest dirty ranges until at most `target` remain. Raw is the ground truth, so widening
+/// a dirty range only trades a little tier benefit for fewer segments.
+fn coalesce_dirty_ranges(dirty: &[(i64, i64)], target: usize) -> Vec<(i64, i64)> {
+    let mut sorted: Vec<(i64, i64)> = dirty.to_vec();
+    sorted.sort();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(sorted.len());
+    for (s, e) in sorted {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    let target = target.max(1);
+    if merged.len() <= target {
+        return merged;
+    }
+    // Close the (len - target) smallest gaps in one pass.
+    let mut gaps: Vec<(i64, usize)> = merged
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| (w[1].0 - w[0].1, i))
+        .collect();
+    gaps.sort();
+    let close: std::collections::HashSet<usize> = gaps
+        .into_iter()
+        .take(merged.len() - target)
+        .map(|(_, i)| i)
+        .collect();
+    let mut out: Vec<(i64, i64)> = Vec::with_capacity(target);
+    for (i, r) in merged.iter().enumerate() {
+        if i > 0 && close.contains(&(i - 1)) {
+            out.last_mut().unwrap().1 = r.1;
+        } else {
+            out.push(*r);
+        }
+    }
+    out
+}
+
+/// Like `resolve_segments_from_sorted`, but when scattered dirty ranges push the segment count over
+/// `spiral.planner_max_segments` it merges the closest dirty ranges (read from the raw table) rather than
+/// giving up on every tier for the whole query.
+fn resolve_segments_capped(
+    base_table: &str,
+    ts: i64,
+    te: i64,
+    sorted_hierarchy: &[(String, i32, f64)],
+    dirty: &[(i64, i64)],
+) -> Vec<Segment> {
+    let cap = crate::PLANNER_MAX_SEGMENTS.get() as usize;
+    let mut segments = resolve_segments_from_sorted(base_table, ts, te, sorted_hierarchy, dirty);
+    let mut target = dirty.len();
+    while segments.len() > cap && target > 1 {
+        target /= 2;
+        let coalesced = coalesce_dirty_ranges(dirty, target);
+        segments = resolve_segments_from_sorted(base_table, ts, te, sorted_hierarchy, &coalesced);
+    }
+    segments
 }
 
 fn resolve_segments_from_sorted(
@@ -4149,13 +4209,7 @@ pub(crate) unsafe fn explain_query_recursive(
                     }]
                 } else {
                     let dirty_ranges = catalog::get_dirty_ranges(&base_table, ts, te, scope_values);
-                    resolve_segments_from_sorted(
-                        &base_table,
-                        ts,
-                        te,
-                        &sorted_hierarchy,
-                        &dirty_ranges,
-                    )
+                    resolve_segments_capped(&base_table, ts, te, &sorted_hierarchy, &dirty_ranges)
                 };
 
                 if !segments.is_empty() && (segments.len() > 1 || segments[0].source != base_table)

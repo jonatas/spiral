@@ -1280,6 +1280,48 @@ mod tests {
         }
     }
 
+    /// Many scattered dirty slices used to push the query past `spiral.planner_max_segments` and send
+    /// it to a full raw scan. The closest dirty ranges are merged instead, and the tiers still serve the rest.
+    #[pg_test]
+    fn test_scattered_dirty_slices_over_segment_cap_use_tiers() {
+        Spi::run(
+            "CREATE TABLE scat (
+                t timestamptz NOT NULL,
+                user_id bigint NOT NULL,
+                val double precision -- Spiral: sum
+            ) WITH (spiral.frames = '30m,1d', spiral.tenant = 'user_id')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO scat
+             SELECT '2026-01-01 09:00+00'::timestamptz + d * interval '1 day', 1, d
+             FROM generate_series(0, 239) d",
+        )
+        .unwrap();
+        Spi::run("SELECT spiral_refresh('scat')").unwrap();
+        // one dirty slice every second day, left unrefreshed
+        Spi::run("UPDATE scat SET val = val + 1000 WHERE val::int % 2 = 0").unwrap();
+        Spi::run("SET spiral.planner_max_segments = 100").unwrap();
+        assert_same_with_and_without_hook("SELECT sum(val) FROM scat");
+        assert_same_with_and_without_hook(
+            "SELECT sum(val) FROM scat WHERE t >= '2026-02-01' AND t < '2026-08-01'",
+        );
+        Spi::run("SET spiral.enable_planner_hook = on").unwrap();
+        let plan = Spi::connect(|client| {
+            let mut text = String::new();
+            for row in client.select("EXPLAIN SELECT sum(val) FROM scat", None, &[])? {
+                text.push_str(&row.get::<String>(1)?.unwrap_or_default());
+                text.push('\n');
+            }
+            Ok::<String, spi::Error>(text)
+        })
+        .unwrap();
+        assert!(
+            plan.contains("scat_1d"),
+            "expected a tier in the plan, got:\n{plan}"
+        );
+    }
+
     #[pg_test]
     fn test_catalog_is_spiral_relation() {
         // Initially should be false for a random table
